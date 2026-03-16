@@ -2,3 +2,11 @@ node_modules/
 dist/
 *.js.map
 .env
+__pycache__/
+*.pyc
+*.pyo
+assets/NotoSansJP-Regular.ttf
+assets/NotoSansJP-Bold.ttf
+assets/jissen_kun.png
+logs/
+*.egg-info/

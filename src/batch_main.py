@@ -1,0 +1,309 @@
+"""Batchモードのエントリポイント。400件一括処理用。"""
+
+import argparse
+import json
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+from src.utils import setup_logging, mask_email, ensure_fonts
+from src.config import LOGS_DIR
+from src import drive_client, sheets_client, gmail_client
+from src import pdf_reader, comment_generator, pdf_creator, pdf_merger
+from src.matcher import match_record
+
+
+def step1_prepare() -> list[dict]:
+    """Step 1: 準備 — PDF取得・テキスト抽出・マッチング。
+
+    Returns:
+        処理可能なアイテムのリスト
+    """
+    logger = setup_logging()
+    logger.info("=== Step 1: 準備 ===")
+
+    records = sheets_client.get_unprocessed_records()
+    pdf_files = drive_client.list_pdfs()
+
+    logger.info(f"PDF {len(pdf_files)}件, 未処理レコード {len(records)}件")
+
+    items = []
+    for i, pdf_file in enumerate(pdf_files, start=1):
+        file_id = pdf_file["id"]
+        file_name = pdf_file["name"]
+        logger.info(f"[{i}/{len(pdf_files)}] {file_name}")
+
+        try:
+            pdf_data = drive_client.download_pdf(file_id)
+            pdf_text = pdf_reader.extract_text(pdf_data)
+        except Exception as e:
+            logger.warning(f"PDF処理失敗: {file_name} - {e}")
+            continue
+
+        record = match_record(pdf_text, records, pdf_filename=file_name)
+        if not record:
+            logger.warning(f"マッチング失敗: {file_name}")
+            sheets_client.update_status(
+                record.row_number if record else 0,
+                f"スキップ: マッチング失敗",
+            ) if record else None
+            continue
+
+        items.append({
+            "custom_id": f"item_{i:04d}_{record.clinic_name}",
+            "clinic_name": record.clinic_name,
+            "person_name": record.person_name,
+            "email": record.email,
+            "row_number": record.row_number,
+            "pdf_text": pdf_text,
+            "pdf_data_id": file_id,  # 後でダウンロードし直す用
+        })
+        sheets_client.update_status(record.row_number, "処理中")
+
+    logger.info(f"Step 1完了: {len(items)}件が処理可能")
+
+    # 準備データをJSONに保存（Step 3/4で使用）
+    prep_file = LOGS_DIR / "batch_prep.json"
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    # pdf_textは大きいので保存しない（Step2用にはバッチリクエスト作成時に使う）
+    save_items = [{k: v for k, v in item.items() if k != "pdf_text"} for item in items]
+    prep_file.write_text(json.dumps(save_items, ensure_ascii=False, indent=2))
+    logger.info(f"準備データ保存: {prep_file}")
+
+    return items
+
+
+def step2_submit_batch(items: list[dict]) -> str:
+    """Step 2: Batch API送信。
+
+    Args:
+        items: step1_prepareの戻り値
+
+    Returns:
+        バッチID
+    """
+    logger = setup_logging()
+    logger.info("=== Step 2: Batch API送信 ===")
+
+    batch_id = comment_generator.submit_batch(items)
+
+    # バッチIDを保存
+    batch_id_file = LOGS_DIR / "batch_id.txt"
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    batch_id_file.write_text(batch_id)
+    logger.info(f"バッチID保存: {batch_id_file} → {batch_id}")
+
+    return batch_id
+
+
+def step3_wait_and_get_results(
+    batch_id: str,
+    poll_interval: int = 60,
+    max_wait: int = 86400,
+) -> dict[str, str]:
+    """Step 3: バッチ結果をポーリングで取得する。
+
+    Args:
+        batch_id: バッチID
+        poll_interval: ポーリング間隔（秒）
+        max_wait: 最大待機時間（秒）
+
+    Returns:
+        {custom_id: comment_text, ...}
+    """
+    logger = setup_logging()
+    logger.info(f"=== Step 3: バッチ結果取得 (ID: {batch_id}) ===")
+
+    elapsed = 0
+    while elapsed < max_wait:
+        status = comment_generator.get_batch_status(batch_id)
+        logger.info(f"バッチステータス: {status['status']} ({status['request_counts']})")
+
+        if status["status"] == "ended":
+            break
+
+        time.sleep(poll_interval)
+        elapsed += poll_interval
+
+    if elapsed >= max_wait:
+        logger.error(f"バッチ結果待機タイムアウト ({max_wait}秒)")
+        raise TimeoutError("Batch API結果の取得がタイムアウトしました")
+
+    results = comment_generator.get_batch_results(batch_id)
+    logger.info(f"Step 3完了: {len(results)}件のコメント取得")
+    return results
+
+
+def step4_generate_pdfs_and_drafts(
+    results: dict[str, str],
+    items: list[dict] | None = None,
+) -> None:
+    """Step 4: PDF生成 & Gmail下書き作成。
+
+    Args:
+        results: {custom_id: comment_text, ...}
+        items: 準備データ（Noneの場合はファイルから読み込み）
+    """
+    logger = setup_logging()
+    logger.info("=== Step 4: PDF生成 & メール下書き ===")
+
+    ensure_fonts()
+
+    # 準備データの読み込み
+    if items is None:
+        prep_file = LOGS_DIR / "batch_prep.json"
+        items = json.loads(prep_file.read_text())
+
+    stats = {"success": 0, "error": 0}
+
+    for item in items:
+        custom_id = item["custom_id"]
+        if custom_id not in results:
+            logger.warning(f"コメント未取得: {custom_id}")
+            stats["error"] += 1
+            continue
+
+        comment = results[custom_id]
+        clinic_name = item["clinic_name"]
+        person_name = item["person_name"]
+        email = item["email"]
+
+        try:
+            # PDFダウンロード
+            pdf_data = drive_client.download_pdf(item["pdf_data_id"])
+
+            with tempfile.TemporaryDirectory() as tmpdir:
+                # コメントページ生成
+                comment_page_path = Path(tmpdir) / "comment_page.pdf"
+                pdf_creator.create_comment_page(
+                    comment=comment,
+                    clinic_name=clinic_name,
+                    person_name=person_name,
+                    output_path=comment_page_path,
+                )
+
+                # PDF結合
+                output_filename = pdf_merger.make_output_filename(
+                    clinic_name, person_name
+                )
+                output_path = Path(tmpdir) / output_filename
+                pdf_merger.merge_pdfs(
+                    original_pdf_data=pdf_data,
+                    comment_page_path=comment_page_path,
+                    output_path=output_path,
+                )
+
+                # Gmail下書き
+                if email:
+                    gmail_client.create_draft(
+                        to_email=email,
+                        person_name=person_name,
+                        pdf_path=output_path,
+                    )
+
+            # ステータス更新
+            if "row_number" in item:
+                sheets_client.update_status(item["row_number"], "完了")
+            stats["success"] += 1
+
+        except Exception as e:
+            logger.error(f"処理エラー: {clinic_name} {person_name} - {e}")
+            stats["error"] += 1
+            if "row_number" in item:
+                try:
+                    sheets_client.update_status(
+                        item["row_number"], f"エラー: {str(e)[:50]}"
+                    )
+                except Exception:
+                    pass
+
+    logger.info(
+        f"Step 4完了: 成功 {stats['success']}件, エラー {stats['error']}件"
+    )
+
+
+def run(
+    batch_mode: bool = True,
+    test_count: int = 0,
+    batch_id: str | None = None,
+    step: str = "all",
+) -> None:
+    """Batchモードのメイン処理。
+
+    Args:
+        batch_mode: Batch API使用（Falseなら通常モードにフォールバック）
+        test_count: テスト件数（0=全件）
+        batch_id: 既存のバッチID（Step 3から再開する場合）
+        step: 実行するステップ ("all", "prepare", "submit", "results", "pdfs")
+    """
+    logger = setup_logging()
+    logger.info("=== じっせん君コメントシステム（Batchモード）開始 ===")
+
+    if not batch_mode:
+        from src.main import run as run_normal
+        run_normal(test_count=test_count)
+        return
+
+    items = None
+    results = None
+
+    if step in ("all", "prepare"):
+        items = step1_prepare()
+        if test_count > 0:
+            items = items[:test_count]
+
+    if step in ("all", "submit"):
+        if items is None:
+            prep_file = LOGS_DIR / "batch_prep.json"
+            items_data = json.loads(prep_file.read_text())
+            # pdf_textが必要なので再取得が必要 → step1からやり直し
+            raise RuntimeError("submit単独実行にはprepareが必要です")
+        bid = step2_submit_batch(items)
+        batch_id = bid
+
+    if step in ("all", "results"):
+        if batch_id is None:
+            batch_id_file = LOGS_DIR / "batch_id.txt"
+            batch_id = batch_id_file.read_text().strip()
+        results = step3_wait_and_get_results(batch_id)
+
+    if step in ("all", "pdfs"):
+        if results is None:
+            raise RuntimeError("results が未取得です。step=results を先に実行してください")
+        step4_generate_pdfs_and_drafts(results)
+
+    logger.info("=== Batchモード処理完了 ===")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="じっせん君コメントシステム（Batchモード）")
+    parser.add_argument(
+        "--no-batch", action="store_true",
+        help="通常モードで実行",
+    )
+    parser.add_argument(
+        "--test-count", type=int, default=0,
+        help="テスト件数（0=全件処理）",
+    )
+    parser.add_argument(
+        "--batch-id", type=str, default=None,
+        help="既存バッチID（結果取得から再開）",
+    )
+    parser.add_argument(
+        "--step", type=str, default="all",
+        choices=["all", "prepare", "submit", "results", "pdfs"],
+        help="実行するステップ",
+    )
+    args = parser.parse_args()
+
+    run(
+        batch_mode=not args.no_batch,
+        test_count=args.test_count,
+        batch_id=args.batch_id,
+        step=args.step,
+    )
+
+
+if __name__ == "__main__":
+    main()
