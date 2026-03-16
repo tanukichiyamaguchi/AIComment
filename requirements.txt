@@ -1,0 +1,16 @@
+# AI Comment Generation
+anthropic>=0.40.0
+
+# PDF Processing
+pdfplumber>=0.11.0
+reportlab>=4.1.0
+pypdf>=4.0.0
+
+# Google APIs
+google-api-python-client>=2.100.0
+google-auth>=2.25.0
+google-auth-oauthlib>=1.2.0
+google-auth-httplib2>=0.2.0
+
+# Font download
+requests>=2.31.0
