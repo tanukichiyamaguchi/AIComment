@@ -93,17 +93,22 @@ def run(test_count: int = 0) -> None:
                     output_path=output_path,
                 )
 
-                # 2.6 Gmail下書き作成
+                # 2.6 Gmail下書き作成（失敗しても処理続行）
                 if record.email:
-                    gmail_client.create_draft(
-                        to_email=record.email,
-                        person_name=record.person_name,
-                        pdf_path=output_path,
-                    )
-                    logger.info(
-                        f"下書き作成完了: {record.person_name}様 "
-                        f"→ {mask_email(record.email)}"
-                    )
+                    try:
+                        gmail_client.create_draft(
+                            to_email=record.email,
+                            person_name=record.person_name,
+                            pdf_path=output_path,
+                        )
+                        logger.info(
+                            f"下書き作成完了: {record.person_name}様 "
+                            f"→ {mask_email(record.email)}"
+                        )
+                    except Exception as gmail_err:
+                        logger.warning(
+                            f"Gmail下書き作成スキップ: {gmail_err}"
+                        )
                 else:
                     logger.warning(
                         f"メールアドレスなし: {record.clinic_name} {record.person_name}"
