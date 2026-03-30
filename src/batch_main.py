@@ -314,8 +314,11 @@ def run(
             items_data = json.loads(prep_file.read_text())
             # pdf_textが必要なので再取得が必要 → step1からやり直し
             raise RuntimeError("submit単独実行にはprepareが必要です")
-        bid = step2_submit_batch(items)
-        batch_id = bid
+        if not items:
+            logger.info("処理対象が0件のため、バッチ送信をスキップします")
+        else:
+            bid = step2_submit_batch(items)
+            batch_id = bid
 
     if step in ("all", "results"):
         if batch_id is None:
