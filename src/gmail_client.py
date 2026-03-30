@@ -64,6 +64,15 @@ def _get_gmail_credentials() -> Any:
         logger.info("Gmail認証: サービスアカウントを使用")
         return creds
 
+    # ADC（Workload Identity 連携 / gcloud auth）
+    try:
+        from google.auth import default
+        creds, _ = default(scopes=GOOGLE_SCOPES)
+        logger.info("Gmail認証: Application Default Credentialsを使用")
+        return creds
+    except Exception:
+        pass
+
     raise RuntimeError("Gmail認証情報が見つかりません")
 
 

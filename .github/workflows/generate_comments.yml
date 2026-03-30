@@ -12,6 +12,10 @@ on:
         type: number
         default: 0
 
+permissions:
+  contents: read
+  id-token: write  # Workload Identity 連携に必要
+
 jobs:
   generate:
     runs-on: ubuntu-latest
@@ -19,6 +23,12 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      # Google Cloud 認証（Workload Identity 連携）
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
 
       - uses: actions/setup-python@v5
         with:
@@ -38,10 +48,8 @@ jobs:
           fi
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
           DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          GMAIL_TOKEN_JSON: ${{ secrets.GMAIL_TOKEN_JSON }}
 
       - name: Upload logs
         if: always()

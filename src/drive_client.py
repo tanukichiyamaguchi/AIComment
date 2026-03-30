@@ -28,7 +28,7 @@ def _get_credentials() -> Any:
     except ImportError:
         pass
 
-    # サービスアカウント認証
+    # サービスアカウント認証（JSON直接指定）
     if GOOGLE_CREDENTIALS_JSON:
         from google.oauth2 import service_account
         info = json.loads(GOOGLE_CREDENTIALS_JSON)
@@ -38,9 +38,19 @@ def _get_credentials() -> Any:
         logger.info("Google認証: サービスアカウントを使用")
         return creds
 
+    # ADC（Workload Identity 連携 / gcloud auth）
+    try:
+        from google.auth import default
+        creds, _ = default(scopes=GOOGLE_SCOPES)
+        logger.info("Google認証: Application Default Credentialsを使用")
+        return creds
+    except Exception:
+        pass
+
     raise RuntimeError(
         "Google認証情報が見つかりません。"
-        "Colab環境またはGOOGLE_CREDENTIALS_JSON環境変数を設定してください。"
+        "Colab環境、GOOGLE_CREDENTIALS_JSON環境変数、"
+        "またはApplication Default Credentialsを設定してください。"
     )
 
 

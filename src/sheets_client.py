@@ -42,6 +42,14 @@ def _get_credentials() -> Any:
             info, scopes=GOOGLE_SCOPES
         )
 
+    # ADC（Workload Identity 連携 / gcloud auth）
+    try:
+        from google.auth import default
+        creds, _ = default(scopes=GOOGLE_SCOPES)
+        return creds
+    except Exception:
+        pass
+
     raise RuntimeError("Google認証情報が見つかりません")
 
 
