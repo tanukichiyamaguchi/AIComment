@@ -20,12 +20,11 @@ class TestCommentGenerator(unittest.TestCase):
         self.assertIn("白川蓮", prompt)
         self.assertIn("テスト事例テキスト", prompt)
 
-    def test_system_prompt_has_knowledge_base(self):
-        self.assertIn("業界ベンチマーク", SYSTEM_PROMPT)
-        self.assertIn("新患獲得", SYSTEM_PROMPT)
-        self.assertIn("自費率向上", SYSTEM_PROMPT)
-        self.assertIn("キャンセル削減", SYSTEM_PROMPT)
-        self.assertIn("スタッフ定着", SYSTEM_PROMPT)
+    def test_system_prompt_has_key_sections(self):
+        self.assertIn("あなたの役割", SYSTEM_PROMPT)
+        self.assertIn("やってほしいこと", SYSTEM_PROMPT)
+        self.assertIn("禁止事項", SYSTEM_PROMPT)
+        self.assertIn("人間味を出すヒント", SYSTEM_PROMPT)
 
     def test_system_prompt_has_rules(self):
         self.assertIn("毎回違う文章にする", SYSTEM_PROMPT)
