@@ -1,5 +1,7 @@
 """PDF結合モジュール。元PDFの末尾にコメントページを1ページ追加する。"""
 
+from __future__ import annotations
+
 import io
 import logging
 from pathlib import Path
@@ -54,4 +56,19 @@ def merge_pdfs(
 
 def make_output_filename(clinic_name: str, person_name: str) -> str:
     """出力PDFのファイル名を生成する。"""
-    return f"{clinic_name}_{person_name}_じっせん君コメント.pdf"
+    # Sanitize to prevent path traversal from spreadsheet-sourced data
+    safe_clinic = _sanitize_filename(clinic_name)
+    safe_person = _sanitize_filename(person_name)
+    return f"{safe_clinic}_{safe_person}_じっせん君コメント.pdf"
+
+
+def _sanitize_filename(name: str) -> str:
+    """ファイル名に使用できない文字を除去し、パストラバーサルを防止する。"""
+    import re
+    # Remove path separators and null bytes
+    name = name.replace("/", "").replace("\\", "").replace("\x00", "")
+    # Remove . and .. components
+    name = name.strip(".")
+    # Remove other OS-unsafe characters
+    name = re.sub(r'[<>:"|?*]', "", name)
+    return name or "unknown"

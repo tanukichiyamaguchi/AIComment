@@ -1,8 +1,11 @@
 """Claude APIコメント生成モジュール。通常モードとBatchモード両対応。"""
 
+from __future__ import annotations
+
 import json
 import logging
 import time
+from typing import Any
 
 import anthropic
 
@@ -128,9 +131,15 @@ def _build_user_prompt(clinic_name: str, person_name: str, pdf_text: str) -> str
     )
 
 
+_DEFAULT_TIMEOUT = 120  # seconds
+
+
 def _create_client() -> anthropic.Anthropic:
     """Anthropicクライアントを作成する。"""
-    return anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    return anthropic.Anthropic(
+        api_key=ANTHROPIC_API_KEY,
+        timeout=_DEFAULT_TIMEOUT,
+    )
 
 
 def generate_comment(
@@ -168,6 +177,19 @@ def generate_comment(
                 ],
                 messages=[{"role": "user", "content": user_prompt}],
             )
+            if not response.content or not response.content[0].text.strip():
+                logger.warning(
+                    f"API応答が空です: {clinic_name} {person_name} "
+                    f"(試行{attempt + 1}/{max_retries + 1})"
+                )
+                if attempt < max_retries:
+                    wait = 2 ** (attempt + 1)
+                    time.sleep(wait)
+                    continue
+                raise ValueError(
+                    f"API応答が空です: {clinic_name} {person_name}"
+                )
+
             comment = response.content[0].text.strip()
             logger.info(
                 f"コメント生成完了: {clinic_name} {person_name} "
@@ -175,7 +197,12 @@ def generate_comment(
             )
             return comment
 
-        except (anthropic.RateLimitError, anthropic.InternalServerError) as e:
+        except (
+            anthropic.RateLimitError,
+            anthropic.InternalServerError,
+            anthropic.APITimeoutError,
+            anthropic.APIConnectionError,
+        ) as e:
             if attempt < max_retries:
                 wait = 2 ** (attempt + 1)
                 logger.warning(
@@ -246,7 +273,7 @@ def submit_batch(items: list[dict]) -> str:
     return batch.id
 
 
-def get_batch_status(batch_id: str) -> dict:
+def get_batch_status(batch_id: str) -> dict[str, Any]:
     """バッチの処理ステータスを取得する。
 
     Returns:
@@ -268,25 +295,33 @@ def get_batch_status(batch_id: str) -> dict:
     }
 
 
-def get_batch_results(batch_id: str) -> dict[str, str]:
+def get_batch_results(batch_id: str) -> tuple[dict[str, str], list[str]]:
     """バッチの結果を取得する。
 
     Returns:
-        {custom_id: comment_text, ...}
+        (results, failed_ids) のタプル。
+        results: {custom_id: comment_text, ...}
+        failed_ids: 失敗したcustom_idのリスト
     """
     client = _create_client()
     results = {}
+    failed_ids: list[str] = []
 
     for result in client.messages.batches.results(batch_id):
         custom_id = result.custom_id
         if result.result.type == "succeeded":
             comment = result.result.message.content[0].text.strip()
-            results[custom_id] = comment
-            logger.info(f"Batch結果取得: {custom_id} ({len(comment)}文字)")
+            if comment:
+                results[custom_id] = comment
+                logger.info(f"Batch結果取得: {custom_id} ({len(comment)}文字)")
+            else:
+                logger.warning(f"Batch結果が空: {custom_id}")
+                failed_ids.append(custom_id)
         else:
             logger.error(f"Batch失敗: {custom_id} - {result.result.type}")
+            failed_ids.append(custom_id)
 
     logger.info(
-        f"Batch結果取得完了: {len(results)}件成功 / 全体未確認"
+        f"Batch結果取得完了: {len(results)}件成功, {len(failed_ids)}件失敗"
     )
-    return results
+    return results, failed_ids

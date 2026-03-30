@@ -1,5 +1,7 @@
 """Gmail APIクライアント。コメント付きPDFを添付した下書きを作成する。"""
 
+from __future__ import annotations
+
 import base64
 import json
 import logging
@@ -7,6 +9,7 @@ from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
+from typing import Any
 
 from googleapiclient.discovery import build
 
@@ -30,7 +33,7 @@ BODY_TEMPLATE = """\
 """
 
 
-def _get_gmail_credentials():
+def _get_gmail_credentials() -> Any:
     """Gmail API用の認証情報を取得する。"""
     # Colab認証を試行
     try:
@@ -64,7 +67,7 @@ def _get_gmail_credentials():
     raise RuntimeError("Gmail認証情報が見つかりません")
 
 
-def get_gmail_service():
+def get_gmail_service() -> Any:
     """Gmail APIサービスを構築する。"""
     creds = _get_gmail_credentials()
     return build("gmail", "v1", credentials=creds)

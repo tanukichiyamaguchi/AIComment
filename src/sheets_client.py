@@ -1,8 +1,11 @@
 """Google Sheets APIクライアント。読み書きとステータス管理。"""
 
+from __future__ import annotations
+
 import json
 import logging
 from dataclasses import dataclass
+from typing import Any
 
 from googleapiclient.discovery import build
 
@@ -21,7 +24,7 @@ class ClinicRecord:
     status: str  # D列: ステータス
 
 
-def _get_credentials():
+def _get_credentials() -> Any:
     """環境に応じた認証情報を取得する。"""
     try:
         import google.colab.auth  # type: ignore
@@ -42,7 +45,7 @@ def _get_credentials():
     raise RuntimeError("Google認証情報が見つかりません")
 
 
-def get_sheets_service():
+def get_sheets_service() -> Any:
     """Sheets APIサービスを構築する。"""
     creds = _get_credentials()
     return build("sheets", "v4", credentials=creds)
@@ -90,11 +93,16 @@ def read_records(
         if not clinic_name or not person_name:
             continue
 
+        email_clean = email.strip()
+        if email_clean and not _validate_email(email_clean):
+            logger.warning(f"Sheets: 行{i} メールアドレスの形式が不正のためスキップ")
+            email_clean = ""
+
         records.append(ClinicRecord(
             row_number=i,
             clinic_name=clinic_name.strip(),
             person_name=person_name.strip(),
-            email=email.strip(),
+            email=email_clean,
             status=status.strip(),
         ))
 

@@ -1,7 +1,10 @@
 """Google Drive APIクライアント。フォルダ内PDF一覧取得＆ダウンロード。"""
 
+from __future__ import annotations
+
 import json
 import logging
+from typing import Any
 
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
@@ -12,7 +15,7 @@ from src.config import DRIVE_FOLDER_ID, GOOGLE_CREDENTIALS_JSON, GOOGLE_SCOPES
 logger = logging.getLogger("jissen_comment")
 
 
-def _get_credentials():
+def _get_credentials() -> Any:
     """環境に応じた認証情報を取得する。Colab優先、次にサービスアカウント。"""
     # Colab認証を試行
     try:
@@ -41,7 +44,7 @@ def _get_credentials():
     )
 
 
-def get_drive_service():
+def get_drive_service() -> Any:
     """Drive APIサービスを構築する。"""
     creds = _get_credentials()
     return build("drive", "v3", credentials=creds)
