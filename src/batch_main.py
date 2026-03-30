@@ -56,7 +56,7 @@ def step1_prepare() -> list[dict]:
             continue
 
         items.append({
-            "custom_id": f"item_{i:04d}_{record.clinic_name}",
+            "custom_id": f"item_{i:04d}",
             "clinic_name": record.clinic_name,
             "person_name": record.person_name,
             "email": record.email,
