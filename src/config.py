@@ -1,5 +1,7 @@
 """設定値管理モジュール。環境変数またはColab Secretsから設定を読み込む。"""
 
+from __future__ import annotations
+
 import os
 from pathlib import Path
 

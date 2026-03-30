@@ -2,6 +2,7 @@ node_modules/
 dist/
 *.js.map
 .env
+.env.*
 __pycache__/
 *.pyc
 *.pyo
@@ -10,3 +11,9 @@ assets/NotoSansJP-Bold.ttf
 assets/jissen_kun.png
 logs/
 *.egg-info/
+
+# Credential files
+credentials.json
+token.json
+service-account*.json
+*-credentials.json

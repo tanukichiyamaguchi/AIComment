@@ -1,5 +1,7 @@
 """Batchモードのエントリポイント。400件一括処理用。"""
 
+from __future__ import annotations
+
 import argparse
 import json
 import sys
@@ -37,6 +39,9 @@ def step1_prepare() -> list[dict]:
         try:
             pdf_data = drive_client.download_pdf(file_id)
             pdf_text = pdf_reader.extract_text(pdf_data)
+            if not pdf_text:
+                logger.warning(f"テキスト抽出失敗（空テキスト）: {file_name}")
+                continue
         except Exception as e:
             logger.warning(f"PDF処理失敗: {file_name} - {e}")
             continue
@@ -99,15 +104,19 @@ def step2_submit_batch(items: list[dict]) -> str:
 
 def step3_wait_and_get_results(
     batch_id: str,
+    items: list[dict] | None = None,
     poll_interval: int = 60,
     max_wait: int = 86400,
+    max_retries: int = 2,
 ) -> dict[str, str]:
-    """Step 3: バッチ結果をポーリングで取得する。
+    """Step 3: バッチ結果をポーリングで取得する。失敗アイテムは個別リトライ。
 
     Args:
         batch_id: バッチID
+        items: 準備データ（リトライ用。Noneの場合はファイルから読み込み）
         poll_interval: ポーリング間隔（秒）
         max_wait: 最大待機時間（秒）
+        max_retries: 失敗アイテムのリトライ回数
 
     Returns:
         {custom_id: comment_text, ...}
@@ -130,8 +139,51 @@ def step3_wait_and_get_results(
         logger.error(f"バッチ結果待機タイムアウト ({max_wait}秒)")
         raise TimeoutError("Batch API結果の取得がタイムアウトしました")
 
-    results = comment_generator.get_batch_results(batch_id)
-    logger.info(f"Step 3完了: {len(results)}件のコメント取得")
+    results, failed_ids = comment_generator.get_batch_results(batch_id)
+
+    # 失敗アイテムを個別リトライ
+    if failed_ids and max_retries > 0:
+        logger.info(f"失敗アイテム {len(failed_ids)}件を個別リトライします (最大{max_retries}回)")
+
+        # items lookup用のマップを構築
+        if items is None:
+            prep_file = LOGS_DIR / "batch_prep.json"
+            if prep_file.exists():
+                items = json.loads(prep_file.read_text())
+
+        items_by_id = {item["custom_id"]: item for item in (items or [])}
+
+        for custom_id in failed_ids:
+            item = items_by_id.get(custom_id)
+            if not item:
+                logger.warning(f"リトライ用データが見つかりません: {custom_id}")
+                continue
+
+            # pdf_textが必要 — prep_fileには保存されていないためスキップ
+            if "pdf_text" not in item:
+                logger.warning(f"リトライにはpdf_textが必要です（スキップ）: {custom_id}")
+                continue
+
+            for attempt in range(1, max_retries + 1):
+                try:
+                    logger.info(f"リトライ {attempt}/{max_retries}: {custom_id}")
+                    comment = comment_generator.generate_comment(
+                        clinic_name=item["clinic_name"],
+                        person_name=item["person_name"],
+                        pdf_text=item["pdf_text"],
+                    )
+                    results[custom_id] = comment
+                    logger.info(f"リトライ成功: {custom_id}")
+                    break
+                except Exception as e:
+                    logger.warning(f"リトライ失敗 {attempt}/{max_retries}: {custom_id} - {e}")
+
+    # 最終サマリー
+    final_failed = [cid for cid in failed_ids if cid not in results]
+    logger.info(
+        f"Step 3完了: {len(results)}件成功"
+        + (f", {len(final_failed)}件失敗 ({', '.join(final_failed)})" if final_failed else "")
+    )
     return results
 
 
@@ -218,9 +270,12 @@ def step4_generate_pdfs_and_drafts(
                 except Exception:
                     pass
 
+    total = stats["success"] + stats["error"]
     logger.info(
-        f"Step 4完了: 成功 {stats['success']}件, エラー {stats['error']}件"
+        f"Step 4完了: 成功 {stats['success']}/{total}件, エラー {stats['error']}/{total}件"
     )
+    if stats["error"] > 0:
+        logger.warning(f"一部アイテムでエラーが発生しました（{stats['error']}件）。ログを確認してください。")
 
 
 def run(
@@ -266,7 +321,7 @@ def run(
         if batch_id is None:
             batch_id_file = LOGS_DIR / "batch_id.txt"
             batch_id = batch_id_file.read_text().strip()
-        results = step3_wait_and_get_results(batch_id)
+        results = step3_wait_and_get_results(batch_id, items=items)
 
     if step in ("all", "pdfs"):
         if results is None:
@@ -276,7 +331,7 @@ def run(
     logger.info("=== Batchモード処理完了 ===")
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="じっせん君コメントシステム（Batchモード）")
     parser.add_argument(
         "--no-batch", action="store_true",

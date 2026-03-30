@@ -1,5 +1,7 @@
 """コメントページPDF生成モジュール。reportlabで日本語対応のコメントページを作成する。"""
 
+from __future__ import annotations
+
 import logging
 from pathlib import Path
 

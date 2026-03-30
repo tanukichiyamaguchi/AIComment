@@ -1,0 +1,8 @@
+# 本番依存関係を含む
+-r requirements.txt
+
+# テストツール
+pytest
+
+# 型チェック
+mypy

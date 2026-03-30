@@ -1,5 +1,7 @@
 """通常モードのエントリポイント。1件ずつ処理する。"""
 
+from __future__ import annotations
+
 import argparse
 import sys
 import tempfile
@@ -47,10 +49,9 @@ def run(test_count: int = 0) -> None:
         try:
             # 2.1 PDFダウンロード & テキスト抽出
             pdf_data = drive_client.download_pdf(file_id)
-            try:
-                pdf_text = pdf_reader.extract_text(pdf_data)
-            except ValueError as e:
-                logger.warning(f"テキスト抽出失敗: {file_name} - {e}")
+            pdf_text = pdf_reader.extract_text(pdf_data)
+            if not pdf_text:
+                logger.warning(f"テキスト抽出失敗: {file_name}")
                 stats["skip"] += 1
                 continue
 
@@ -133,7 +134,7 @@ def run(test_count: int = 0) -> None:
     )
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="じっせん君コメントシステム（通常モード）")
     parser.add_argument(
         "--test-count", type=int, default=0,

@@ -1,0 +1,66 @@
+# CI パイプライン - プッシュとプルリクエストで自動テスト・リントを実行
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # Python テスト - pytest でユニットテストを実行
+  python-tests:
+    name: Python テスト
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 依存関係のインストール
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: テスト実行
+        run: python -m pytest tests/ -v
+
+  # Python 型チェック - mypy で静的型解析を実行
+  python-lint:
+    name: Python 型チェック
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 依存関係のインストール
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: mypy 型チェック実行
+        run: python -m mypy src/ --ignore-missing-imports
+
+  # TypeScript テスト - Node.js テストランナーで実行
+  typescript-tests:
+    name: TypeScript テスト
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: 依存関係のインストール
+        run: npm install
+
+      - name: テスト実行
+        run: npm test
+
+      - name: 型チェック実行
+        run: npm run lint
