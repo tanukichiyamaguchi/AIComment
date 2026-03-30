@@ -50,7 +50,7 @@ def _get_gmail_credentials() -> Any:
     if GMAIL_TOKEN_JSON:
         from google.oauth2.credentials import Credentials
         info = json.loads(GMAIL_TOKEN_JSON)
-        creds = Credentials.from_authorized_user_info(info, scopes=GOOGLE_SCOPES)
+        creds = Credentials.from_authorized_user_info(info)
         logger.info("Gmail認証: OAuthトークンを使用")
         return creds
 
