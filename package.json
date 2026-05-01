@@ -6,7 +6,7 @@
   "types": "dist/index.d.ts",
   "scripts": {
     "build": "tsc",
-    "test": "node --import tsx --test tests/**/*.test.ts",
+    "test": "node --import tsx --test tests/*.test.ts",
     "lint": "tsc --noEmit"
   },
   "keywords": [

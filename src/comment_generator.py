@@ -8,6 +8,8 @@ import time
 from typing import Any
 
 import anthropic
+from anthropic.types import TextBlock
+from anthropic.types.messages.batch_create_params import Request
 
 from src.config import (
     ANTHROPIC_API_KEY,
@@ -199,7 +201,10 @@ def generate_comment(
                 ],
                 messages=[{"role": "user", "content": user_prompt}],
             )
-            if not response.content or not response.content[0].text.strip():
+            text_blocks = [
+                b for b in response.content if isinstance(b, TextBlock)
+            ]
+            if not text_blocks or not text_blocks[0].text.strip():
                 logger.warning(
                     f"API応答が空です: {clinic_name} {person_name} "
                     f"(試行{attempt + 1}/{max_retries + 1})"
@@ -212,7 +217,7 @@ def generate_comment(
                     f"API応答が空です: {clinic_name} {person_name}"
                 )
 
-            comment = response.content[0].text.strip()
+            comment = text_blocks[0].text.strip()
             logger.info(
                 f"コメント生成完了: {clinic_name} {person_name} "
                 f"({len(comment)}文字)"
@@ -236,10 +241,12 @@ def generate_comment(
                 logger.error(f"API エラー: リトライ上限到達: {e}")
                 raise
 
+    raise RuntimeError("unreachable: retry loop exited without return or raise")
+
 
 def create_batch_requests(
     items: list[dict],
-) -> list[dict]:
+) -> list[Request]:
     """Batch API用のリクエストリストを作成する。
 
     Args:
@@ -249,15 +256,15 @@ def create_batch_requests(
     Returns:
         Batch API送信用のリクエストリスト
     """
-    requests = []
+    requests: list[Request] = []
     for item in items:
         user_prompt = _build_user_prompt(
             item["clinic_name"], item["person_name"], item["pdf_text"]
         )
         requests.append(
-            {
-                "custom_id": item["custom_id"],
-                "params": {
+            Request(
+                custom_id=item["custom_id"],
+                params={
                     "model": CLAUDE_MODEL,
                     "max_tokens": CLAUDE_MAX_TOKENS,
                     "temperature": CLAUDE_TEMPERATURE,
@@ -270,7 +277,7 @@ def create_batch_requests(
                     ],
                     "messages": [{"role": "user", "content": user_prompt}],
                 },
-            }
+            )
         )
     return requests
 
@@ -332,7 +339,12 @@ def get_batch_results(batch_id: str) -> tuple[dict[str, str], list[str]]:
     for result in client.messages.batches.results(batch_id):
         custom_id = result.custom_id
         if result.result.type == "succeeded":
-            comment = result.result.message.content[0].text.strip()
+            text_blocks = [
+                b
+                for b in result.result.message.content
+                if isinstance(b, TextBlock)
+            ]
+            comment = text_blocks[0].text.strip() if text_blocks else ""
             if comment:
                 results[custom_id] = comment
                 logger.info(f"Batch結果取得: {custom_id} ({len(comment)}文字)")

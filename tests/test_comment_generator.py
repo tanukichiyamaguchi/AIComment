@@ -4,6 +4,7 @@ import unittest
 from unittest.mock import patch, MagicMock
 
 import anthropic
+from anthropic.types import TextBlock
 
 from src.comment_generator import (
     _build_user_prompt,
@@ -57,7 +58,13 @@ class TestCommentGenerator(unittest.TestCase):
         mock_create_client.return_value = mock_client
 
         mock_response = MagicMock()
-        mock_response.content = [MagicMock(text="テストコメント（200文字以上の内容）")]
+        mock_response.content = [
+            TextBlock(
+                type="text",
+                text="テストコメント（200文字以上の内容）",
+                citations=None,
+            )
+        ]
         mock_client.messages.create.return_value = mock_response
 
         from src.comment_generator import generate_comment
@@ -91,7 +98,13 @@ class TestCommentGenerator(unittest.TestCase):
         mock_create_client.return_value = mock_client
 
         mock_response = MagicMock()
-        mock_response.content = [MagicMock(text="リトライ後の成功コメント")]
+        mock_response.content = [
+            TextBlock(
+                type="text",
+                text="リトライ後の成功コメント",
+                citations=None,
+            )
+        ]
 
         # 最初の2回はRateLimitError、3回目に成功
         mock_client.messages.create.side_effect = [
@@ -138,7 +151,9 @@ class TestCommentGenerator(unittest.TestCase):
         mock_create_client.return_value = mock_client
 
         mock_response = MagicMock()
-        mock_response.content = [MagicMock(text="")]
+        mock_response.content = [
+            TextBlock(type="text", text="", citations=None)
+        ]
         mock_client.messages.create.return_value = mock_response
 
         from src.comment_generator import generate_comment
