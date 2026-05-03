@@ -8,7 +8,7 @@ import tempfile
 from pathlib import Path
 
 from src.utils import setup_logging, mask_email, ensure_fonts
-from src.config import LOGS_DIR
+from src.config import DRIVE_OUTPUT_FOLDER_ID, LOGS_DIR
 from src import drive_client, sheets_client, gmail_client
 from src import pdf_reader, comment_generator, pdf_creator, pdf_merger
 from src.matcher import match_record
@@ -93,7 +93,29 @@ def run(test_count: int = 0) -> None:
                     output_path=output_path,
                 )
 
-                # 2.6 Gmail下書き作成（失敗しても処理続行）
+                # 2.6 Drive 階層保存 + 出力一覧シート追記
+                #     （DRIVE_OUTPUT_FOLDER_ID 未設定時はスキップして従来動作）
+                if DRIVE_OUTPUT_FOLDER_ID:
+                    try:
+                        upload_result = drive_client.upload_pdf_to_clinic_person(
+                            file_path=output_path,
+                            output_root_folder_id=DRIVE_OUTPUT_FOLDER_ID,
+                            clinic_name=record.clinic_name,
+                            person_name=record.person_name,
+                            file_name=file_name,
+                        )
+                        sheets_client.append_output_record(
+                            clinic_name=record.clinic_name,
+                            person_name=record.person_name,
+                            sample_name=file_name,
+                            drive_url=upload_result["webViewLink"],
+                        )
+                    except Exception as drive_err:
+                        logger.warning(
+                            f"Drive保存/出力一覧追記スキップ: {drive_err}"
+                        )
+
+                # 2.7 Gmail下書き作成（失敗しても処理続行）
                 if record.email:
                     try:
                         gmail_client.create_draft(
@@ -114,7 +136,7 @@ def run(test_count: int = 0) -> None:
                         f"メールアドレスなし: {record.clinic_name} {record.person_name}"
                     )
 
-            # 2.7 ステータス「完了」に更新
+            # 2.8 ステータス「完了」に更新
             sheets_client.update_status(record.row_number, "完了")
             stats["success"] += 1
 

@@ -5,11 +5,17 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 from googleapiclient.discovery import build
 
-from src.config import SPREADSHEET_ID, GOOGLE_CREDENTIALS_JSON, GOOGLE_SCOPES
+from src.config import (
+    GOOGLE_CREDENTIALS_JSON,
+    GOOGLE_SCOPES,
+    OUTPUT_SHEET_NAME,
+    SPREADSHEET_ID,
+)
 
 logger = logging.getLogger("jissen_comment")
 
@@ -165,3 +171,87 @@ def _validate_email(email: str) -> bool:
     import re
     pattern = r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$"
     return bool(re.match(pattern, email))
+
+
+_OUTPUT_HEADER = ["医院名", "個人名", "実践事例名", "Drive URL", "処理日時"]
+
+
+def _ensure_output_sheet(
+    service: Any,
+    spreadsheet_id: str,
+    sheet_name: str,
+) -> None:
+    """出力一覧シートが無ければ作成し、ヘッダー行を書き込む。"""
+    meta = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+    existing_titles = [s["properties"]["title"] for s in meta.get("sheets", [])]
+
+    if sheet_name not in existing_titles:
+        service.spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={
+                "requests": [
+                    {"addSheet": {"properties": {"title": sheet_name}}}
+                ]
+            },
+        ).execute()
+        logger.info(f"Sheets: 出力一覧シートを新規作成 ({sheet_name})")
+
+    header_range = f"{sheet_name}!A1:E1"
+    current = service.spreadsheets().values().get(
+        spreadsheetId=spreadsheet_id,
+        range=header_range,
+    ).execute()
+    if not current.get("values"):
+        service.spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id,
+            range=header_range,
+            valueInputOption="RAW",
+            body={"values": [_OUTPUT_HEADER]},
+        ).execute()
+        logger.info(f"Sheets: 出力一覧シートのヘッダーを書き込み ({sheet_name})")
+
+
+def append_output_record(
+    clinic_name: str,
+    person_name: str,
+    sample_name: str,
+    drive_url: str,
+    spreadsheet_id: str | None = None,
+    sheet_name: str | None = None,
+    processed_at: str | None = None,
+) -> None:
+    """出力一覧シートに1行追加する（医院名 / 個人名 / 実践事例名 / Drive URL / 処理日時）。
+
+    Args:
+        clinic_name: 医院名
+        person_name: 個人名
+        sample_name: 実践事例名（元PDFファイル名）
+        drive_url: アップロードしたPDFのDrive閲覧URL
+        spreadsheet_id: スプレッドシートID（省略時は設定値）
+        sheet_name: シート名（省略時は設定値 ``OUTPUT_SHEET_NAME``）
+        processed_at: 処理日時文字列（省略時は現在時刻 ISO形式）
+    """
+    spreadsheet_id = spreadsheet_id or SPREADSHEET_ID
+    if not spreadsheet_id:
+        raise ValueError("SPREADSHEET_IDが設定されていません")
+    sheet_name = sheet_name or OUTPUT_SHEET_NAME
+    processed_at = processed_at or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    service = get_sheets_service()
+    _ensure_output_sheet(service, spreadsheet_id, sheet_name)
+
+    service.spreadsheets().values().append(
+        spreadsheetId=spreadsheet_id,
+        range=f"{sheet_name}!A:E",
+        valueInputOption="USER_ENTERED",
+        insertDataOption="INSERT_ROWS",
+        body={
+            "values": [
+                [clinic_name, person_name, sample_name, drive_url, processed_at]
+            ]
+        },
+    ).execute()
+
+    logger.info(
+        f"Sheets: 出力一覧に追加 ({clinic_name} / {person_name} / {sample_name})"
+    )

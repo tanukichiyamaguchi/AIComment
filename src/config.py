@@ -31,15 +31,19 @@ CLAUDE_TEMPERATURE = 0.9
 
 # ── Google設定 ──
 DRIVE_FOLDER_ID = _get_secret("DRIVE_FOLDER_ID")
+DRIVE_OUTPUT_FOLDER_ID = _get_secret("DRIVE_OUTPUT_FOLDER_ID")
 SPREADSHEET_ID = _get_secret("SPREADSHEET_ID")
 GMAIL_TOKEN_JSON = _get_secret("GMAIL_TOKEN_JSON")
 GOOGLE_CREDENTIALS_JSON = _get_secret("GOOGLE_CREDENTIALS_JSON")
 
 GOOGLE_SCOPES = [
-    "https://www.googleapis.com/auth/drive.readonly",
+    "https://www.googleapis.com/auth/drive",
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/gmail.compose",
 ]
+
+# ── 出力一覧シート設定 ──
+OUTPUT_SHEET_NAME = "出力一覧"
 
 # ── フォント設定 ──
 FONT_REGULAR = ASSETS_DIR / "NotoSansJP-Regular.ttf"
