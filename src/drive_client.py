@@ -62,7 +62,7 @@ def get_drive_service() -> Any:
 
 
 def list_pdfs(folder_id: str | None = None) -> list[dict]:
-    """指定フォルダ内のPDFファイル一覧を取得する。
+    """指定フォルダ内のPDFファイル一覧を取得する。共有ドライブ対応。
 
     Args:
         folder_id: Google DriveフォルダID（Noneの場合は設定値を使用）
@@ -86,6 +86,8 @@ def list_pdfs(folder_id: str | None = None) -> list[dict]:
             fields="nextPageToken, files(id, name)",
             pageToken=page_token,
             pageSize=100,
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
         ).execute()
 
         files.extend(response.get("files", []))
@@ -98,7 +100,7 @@ def list_pdfs(folder_id: str | None = None) -> list[dict]:
 
 
 def download_pdf(file_id: str) -> bytes:
-    """PDFファイルをダウンロードする。
+    """PDFファイルをダウンロードする。共有ドライブ対応。
 
     Args:
         file_id: Google DriveファイルID
@@ -107,7 +109,10 @@ def download_pdf(file_id: str) -> bytes:
         PDFのバイナリデータ
     """
     service = get_drive_service()
-    request = service.files().get_media(fileId=file_id)
+    request = service.files().get_media(
+        fileId=file_id,
+        supportsAllDrives=True,
+    )
 
     buffer = io.BytesIO()
     downloader = MediaIoBaseDownload(buffer, request)
@@ -127,6 +132,7 @@ def find_or_create_folder(
     service: Any | None = None,
 ) -> str:
     """指定された親フォルダ配下に同名フォルダがあれば再利用、無ければ新規作成する。
+    共有ドライブ対応。
 
     Args:
         folder_name: フォルダ名
@@ -154,6 +160,8 @@ def find_or_create_folder(
         q=query,
         fields="files(id, name)",
         pageSize=1,
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True,
     ).execute()
 
     existing = response.get("files", [])
@@ -167,7 +175,11 @@ def find_or_create_folder(
         "mimeType": "application/vnd.google-apps.folder",
         "parents": [parent_id],
     }
-    created = service.files().create(body=metadata, fields="id").execute()
+    created = service.files().create(
+        body=metadata,
+        fields="id",
+        supportsAllDrives=True,
+    ).execute()
     new_id: str = created["id"]
     logger.info(f"Drive: フォルダ新規作成 ({folder_name}, ID: {new_id})")
     return new_id
@@ -179,7 +191,7 @@ def upload_pdf(
     file_name: str | None = None,
     service: Any | None = None,
 ) -> dict[str, str]:
-    """PDFをDriveにアップロードし、ファイルIDと閲覧URLを返す。
+    """PDFをDriveにアップロードし、ファイルIDと閲覧URLを返す。共有ドライブ対応。
 
     Args:
         file_path: アップロード元のローカルPDFパス
@@ -209,6 +221,7 @@ def upload_pdf(
             body=metadata,
             media_body=media,
             fields="id, webViewLink",
+            supportsAllDrives=True,
         ).execute()
 
     file_id: str = created["id"]
