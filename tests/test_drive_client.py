@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -243,6 +244,61 @@ class TestSharedDriveSupport(unittest.TestCase):
 
         get_media_kwargs = service.files.return_value.get_media.call_args.kwargs
         self.assertTrue(get_media_kwargs.get("supportsAllDrives"))
+
+
+class TestCredentialPriority(unittest.TestCase):
+    """認証情報の選択優先順位を検証する。
+
+    OAuth ユーザートークンが設定されているときは、サービスアカウント認証より優先
+    される必要がある。サービスアカウントは個人 My Drive にファイルを
+    アップロードできない（storageQuotaExceeded）ため、OAuth ユーザー認可で
+    実行することでファイル所有者をユーザーに固定し、アップロードを成立させる。
+    """
+
+    def _fake_user_token_json(self) -> str:
+        return json.dumps({
+            "client_id": "x",
+            "client_secret": "y",
+            "refresh_token": "z",
+            "token": "t",
+        })
+
+    def _fake_service_account_json(self) -> str:
+        return json.dumps({
+            "type": "service_account",
+            "client_email": "sa@proj.iam.gserviceaccount.com",
+            "private_key": "-----BEGIN PRIVATE KEY-----\nFAKE\n-----END PRIVATE KEY-----\n",
+            "token_uri": "https://oauth2.googleapis.com/token",
+        })
+
+    def test_prefers_oauth_user_token_over_service_account(self):
+        with patch.object(
+            drive_client, "GOOGLE_OAUTH_TOKEN_JSON", self._fake_user_token_json()
+        ), patch.object(
+            drive_client, "GOOGLE_CREDENTIALS_JSON", self._fake_service_account_json()
+        ), patch(
+            "google.oauth2.credentials.Credentials.from_authorized_user_info"
+        ) as mock_user_creds, patch(
+            "google.oauth2.service_account.Credentials.from_service_account_info"
+        ) as mock_sa_creds:
+            mock_user_creds.return_value = MagicMock(name="user_creds")
+            drive_client._get_credentials()
+
+            mock_user_creds.assert_called_once()
+            mock_sa_creds.assert_not_called()
+
+    def test_falls_back_to_service_account_when_no_oauth_token(self):
+        with patch.object(
+            drive_client, "GOOGLE_OAUTH_TOKEN_JSON", ""
+        ), patch.object(
+            drive_client, "GOOGLE_CREDENTIALS_JSON", self._fake_service_account_json()
+        ), patch(
+            "google.oauth2.service_account.Credentials.from_service_account_info"
+        ) as mock_sa_creds:
+            mock_sa_creds.return_value = MagicMock(name="sa_creds")
+            drive_client._get_credentials()
+
+            mock_sa_creds.assert_called_once()
 
 
 if __name__ == "__main__":

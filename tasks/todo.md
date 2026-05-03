@@ -84,3 +84,28 @@
 - [ ] テスト追加（`test_drive_client.py`, `test_sheets_client.py`）
 - [ ] mypy / pytest をパス
 - [ ] README に新Secret `DRIVE_OUTPUT_FOLDER_ID` の取得手順を追記
+
+## Phase 8: Drive書き込みのOAuthユーザー委任（2026-05-03）
+
+### 背景
+PR #8 で `supportsAllDrives=True` を追加したが、本番実行で `storageQuotaExceeded` 403 が発生。原因はサービスアカウントが My Drive 配下のファイル所有者になれないこと（クォータ 0GB）。詳細は `lessons.md` P-007。
+
+### 仕様
+- `GOOGLE_OAUTH_TOKEN_JSON` をDrive/Gmail認証で優先使用
+- 旧 `GMAIL_TOKEN_JSON` は後方互換でフォールバック
+- Sheets はサービスアカウントのまま（クォータ問題なし）
+
+### タスク
+- [x] `src/config.py` に `GOOGLE_OAUTH_TOKEN_JSON` 追加（`GMAIL_TOKEN_JSON` フォールバック付き）
+- [x] `src/drive_client._get_credentials()` でOAuthユーザートークン優先
+- [x] `src/gmail_client.py` を `GOOGLE_OAUTH_TOKEN_JSON` 経由に切替
+- [x] `.github/workflows/generate_comments.yml` で新Secretをパス
+- [x] `tests/test_drive_client.py` に認証優先順位の検証を追加
+- [x] README に `GOOGLE_OAUTH_TOKEN_JSON` の役割・取得手順を追記
+- [x] pytest / mypy / npm test をパス（Python 124件 / TypeScript 11件 全合格）
+
+### 受け入れ条件（次回本番実行時）
+- [ ] `GOOGLE_OAUTH_TOKEN_JSON` Secret に `drive` `spreadsheets` `gmail.compose` 3スコープを含むOAuthトークンを設定
+- [ ] PDFが `<DRIVE_OUTPUT_FOLDER_ID>/<医院名>/<個人名>/<タイトル>.pdf` でアップロードされる
+- [ ] 出力一覧シートに行が追記される
+- [ ] Driveログ：`Drive認証: OAuthユーザートークンを使用` が出ていること

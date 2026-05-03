@@ -17,11 +17,38 @@ pip install -r requirements.txt
 | 変数名 | 内容 | 必須 |
 |--------|------|------|
 | `ANTHROPIC_API_KEY` | Claude APIキー | ✅ |
-| `GOOGLE_CREDENTIALS_JSON` | GCPサービスアカウントJSON | ✅ |
+| `GOOGLE_CREDENTIALS_JSON` | GCPサービスアカウントJSON（読み取り・Sheets書き込み用） | ✅ |
+| `GOOGLE_OAUTH_TOKEN_JSON` | OAuthユーザートークン（Drive書き込み・Gmail下書き作成用） | ✅ |
 | `DRIVE_FOLDER_ID` | 入力PDFが格納されたGoogle DriveフォルダID | ✅ |
 | `DRIVE_OUTPUT_FOLDER_ID` | 出力PDFを保存するGoogle DriveフォルダID | ✅ |
 | `SPREADSHEET_ID` | 出力一覧を書き込むスプレッドシートID | ✅ |
-| `GMAIL_TOKEN_JSON` | Gmail OAuth認証トークン | （現状は未使用。将来Gmail送付対応時に必要） |
+| `GMAIL_TOKEN_JSON` | （旧称）`GOOGLE_OAUTH_TOKEN_JSON` の後方互換エイリアス | 旧Secret再利用可 |
+
+#### `GOOGLE_OAUTH_TOKEN_JSON` がなぜ必要か
+
+サービスアカウントは Google Drive の **マイドライブ** 配下に新規ファイルをアップロードできません（`storageQuotaExceeded` エラー）。これは Google の仕様で、サービスアカウントには 0GB の容量しか割り当てられていないためです。
+
+回避策は次の2つ：
+
+1. **OAuthユーザートークンを使う**（本実装の方針） — Driveアップロード時はユーザー認可で実行し、ファイル所有者をユーザー本人にする。本人の Drive 容量（個人/Workspace）を消費する
+2. 共有ドライブを使う（Google Workspace Business Standard 以上が必要）
+
+#### `GOOGLE_OAUTH_TOKEN_JSON` の取得手順
+
+OAuthユーザートークンは下記スコープを含む必要があります：
+
+```
+https://www.googleapis.com/auth/drive
+https://www.googleapis.com/auth/spreadsheets
+https://www.googleapis.com/auth/gmail.compose
+```
+
+トークンJSON生成手順（概要）：
+
+1. GCPコンソール → APIとサービス → 認証情報 → 「OAuth 2.0 クライアント ID」を作成（種類：デスクトップアプリ）
+2. クライアントID/シークレットをダウンロード
+3. ローカルマシンで OAuth フローを1回実行し、`token.json` を生成（[Google公式サンプル](https://developers.google.com/drive/api/quickstart/python)）。下記の3スコープを必ず指定すること
+4. 生成された `token.json` の内容（`refresh_token` を含む）を `GOOGLE_OAUTH_TOKEN_JSON` Secret に貼り付ける
 
 ### 3. アセットファイル
 
@@ -110,6 +137,8 @@ python -m src.batch_main --batch-id msgbatch_xxx --step results
 | 問題 | 対処 |
 |------|------|
 | 出力一覧シートが空のまま | `DRIVE_OUTPUT_FOLDER_ID` がSecretsに設定されているか確認 |
+| `Service Accounts do not have storage quota` 403エラー | `GOOGLE_OAUTH_TOKEN_JSON` が未設定。OAuthユーザートークンを設定すること（手順は「`GOOGLE_OAUTH_TOKEN_JSON` の取得手順」を参照） |
+| Driveアップロードで `insufficient permissions` / `invalid_scope` エラー | OAuthトークンに `drive` スコープが含まれていない。スコープ3点を含めて再生成 |
 | `unknown_clinic` / `unknown_person` フォルダに大量に入る | PDF本文からAIが判別できていない。PDFのフォーマットや書式を見直す |
 | フォントダウンロード失敗 | 手動で `assets/` にNotoSansJP-Regular.ttf / Bold.ttfを配置 |
 | PDFの文字が□ □ □ になる | フォントファイルが正しくダウンロードされているか確認 |
