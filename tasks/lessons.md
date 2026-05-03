@@ -27,6 +27,9 @@ PR #8 added `supportsAllDrives=True` to every Drive API call assuming that would
 ### P-008: クラウド完結が前提（ローカルPCは存在しないものとして設計せよ）
 ユーザーはローカルPCでの実行を一切しない。OAuthのようにブラウザ認証が必要な処理でも、Codespaces / Cloud Shell / GitHub Actions の範囲で完結する手段（手動URL貼付フロー、デバイスフロー、Webクライアント型OAuth + Codespaces転送URL登録など）を最初から検討すること。**Rule**: 「ローカルでこうしてください」という回答は、このプロジェクトでは誤りである。提案前に「これはクラウド環境で動くか？」を必ず確認する。クラウド環境で動かない場合は、動くようにスクリプト/設定を修正することが正しい解決策であり、ローカル実行への退避は禁止。
 
+### P-009: 同一性の判定は表示と分離せよ（外部ストレージでの重複防止）
+`drive_client.find_or_create_folder` は完全一致でフォルダを検索していたため、AIが抽出した医院名に軽微な表記揺れ（「医療法人 かがやき歯科」と「医療法人かがやき歯科」など）があると別フォルダが作成され、Drive 上で重複が発生した。LLM 生成の自由テキストをキー（フォルダ名／一意性判定子）として使うとき、**表示用の文字列と同一性判定用の文字列は別物として扱うべき**。**Rule**: 外部ストレージ（Drive・Sheets・DB等）でユーザー由来文字列を一意キーに使う場合、必ず正規化関数（NFKC＋空白除去など）を経由した形で比較すること。新規作成時は元の表記を保持して保存する（表示優先）。比較は正規化形・保存は元表記、という分離が壊れると重複が無声で増殖する。
+
 ## Session Log
 - **2026-03-16**: Project initialized with workflow orchestration architecture.
 - **2026-05-01**: Added 5-agent team and 3 deterministic check scripts to handle 1000+ PDF scale. Each agent owns one of the failure modes in P-001 through P-005. See `tasks/todo.md` Phase 6 for the standard operating sequence.

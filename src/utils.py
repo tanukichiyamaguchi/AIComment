@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import re
 import sys
+import unicodedata
 from pathlib import Path
 
 from src.config import LOG_LEVEL, LOG_FILE, LOGS_DIR, ASSETS_DIR, FONT_REGULAR, FONT_BOLD
@@ -83,6 +84,29 @@ def sanitize_filename(
     if not cleaned:
         return fallback
     return cleaned[:max_length]
+
+
+def normalize_name_for_match(name: str) -> str:
+    """医院名・氏名のマッチング用に正規化する。
+
+    AIが抽出する医院名・氏名は、同じ医院/人物でも軽微な表記揺れ
+    （半角/全角、空白の有無）が発生する。Driveフォルダの重複作成を防ぐため、
+    ルックアップ時のみこの正規化済み形で比較する。
+
+    変換内容:
+        - NFKC 正規化（全角英数字・記号を半角に統一）
+        - 全種類の空白文字（半角・全角・タブ等）をすべて除去
+
+    変換しないこと（保守的判定のため）:
+        - 大文字小文字（"WKWK" と "wkwk" は別物として扱う）
+        - 句読点・記号（"森本歯科" と "森本歯科クリニック" は別物）
+
+    マッチング比較**専用**で、表示・保存には使わない（元の表記を保持する）。
+    """
+    if not isinstance(name, str):
+        name = str(name)
+    nfkc = unicodedata.normalize("NFKC", name)
+    return re.sub(r"\s+", "", nfkc)
 
 
 def ensure_fonts() -> None:

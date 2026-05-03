@@ -46,19 +46,75 @@ class TestFindOrCreateFolder(unittest.TestCase):
         self.assertEqual(body["mimeType"], "application/vnd.google-apps.folder")
         self.assertEqual(body["parents"], ["parent_id"])
 
-    def test_escapes_single_quote_in_folder_name(self):
+    def test_reuses_folder_with_minor_whitespace_difference(self):
+        """半角空白の有無だけが違う表記揺れは既存フォルダを再利用する。"""
         service = MagicMock()
         service.files.return_value.list.return_value.execute.return_value = {
-            "files": [{"id": "id1", "name": "O'brien歯科"}]
+            "files": [
+                {"id": "existing_id", "name": "医療法人 かがやき歯科クリニック"}
+            ]
+        }
+
+        result = drive_client.find_or_create_folder(
+            "医療法人かがやき歯科クリニック", "parent_id", service=service
+        )
+
+        self.assertEqual(result, "existing_id")
+        service.files.return_value.create.assert_not_called()
+
+    def test_reuses_folder_with_fullwidth_alphanum_difference(self):
+        """全角英数字と半角英数字の表記揺れも同一視する。"""
+        service = MagicMock()
+        service.files.return_value.list.return_value.execute.return_value = {
+            "files": [
+                {"id": "existing_id", "name": "ｗｋｗｋ歯科クリニック"}
+            ]
+        }
+
+        result = drive_client.find_or_create_folder(
+            "wkwk歯科クリニック", "parent_id", service=service
+        )
+
+        self.assertEqual(result, "existing_id")
+        service.files.return_value.create.assert_not_called()
+
+    def test_creates_new_folder_when_genuinely_different_name(self):
+        """正規化しても異なる名前は別フォルダとして新規作成する。"""
+        service = MagicMock()
+        service.files.return_value.list.return_value.execute.return_value = {
+            "files": [
+                {"id": "other_id", "name": "森本歯科"}
+            ]
+        }
+        service.files.return_value.create.return_value.execute.return_value = {
+            "id": "new_id"
+        }
+
+        result = drive_client.find_or_create_folder(
+            "森本歯科クリニック", "parent_id", service=service
+        )
+
+        self.assertEqual(result, "new_id")
+        service.files.return_value.create.assert_called_once()
+
+    def test_creates_folder_with_original_name_not_normalized(self):
+        """新規フォルダは AI 抽出時の元の表記で作成する（正規化前）。"""
+        service = MagicMock()
+        service.files.return_value.list.return_value.execute.return_value = {
+            "files": []
+        }
+        service.files.return_value.create.return_value.execute.return_value = {
+            "id": "new_id"
         }
 
         drive_client.find_or_create_folder(
-            "O'brien歯科", "parent_id", service=service
+            "医療法人 かがやき歯科クリニック", "parent_id", service=service
         )
 
-        list_args = service.files.return_value.list.call_args
-        query = list_args.kwargs["q"]
-        self.assertIn("name='O\\'brien歯科'", query)
+        create_args = service.files.return_value.create.call_args
+        body = create_args.kwargs["body"]
+        # 半角空白を含む元の表記がそのままフォルダ名として使われる
+        self.assertEqual(body["name"], "医療法人 かがやき歯科クリニック")
 
     def test_raises_on_empty_folder_name(self):
         with self.assertRaises(ValueError):

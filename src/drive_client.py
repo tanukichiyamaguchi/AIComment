@@ -17,6 +17,7 @@ from src.config import (
     GOOGLE_OAUTH_TOKEN_JSON,
     GOOGLE_SCOPES,
 )
+from src.utils import normalize_name_for_match
 
 logger = logging.getLogger("jissen_comment")
 
@@ -172,26 +173,38 @@ def find_or_create_folder(
 
     service = service or get_drive_service()
 
-    escaped = folder_name.replace("\\", "\\\\").replace("'", "\\'")
+    # 親フォルダ配下のフォルダを全件取得し、正規化形で一致するものを再利用する。
+    # 完全一致検索だと「医療法人 かがやき」と「医療法人かがやき」のような表記揺れで
+    # 重複フォルダが作られてしまうため、Drive側のフィルタは緩めて Python 側で
+    # normalize_name_for_match() の結果を比較する。
     query = (
         f"'{parent_id}' in parents "
         f"and mimeType='application/vnd.google-apps.folder' "
-        f"and name='{escaped}' "
         f"and trashed=false"
     )
     response = service.files().list(
         q=query,
         fields="files(id, name)",
-        pageSize=1,
+        pageSize=1000,
         supportsAllDrives=True,
         includeItemsFromAllDrives=True,
     ).execute()
 
-    existing = response.get("files", [])
-    if existing:
-        folder_id: str = existing[0]["id"]
-        logger.info(f"Drive: 既存フォルダを再利用 ({folder_name}, ID: {folder_id})")
-        return folder_id
+    target_normalized = normalize_name_for_match(folder_name)
+    for existing_file in response.get("files", []):
+        existing_name = existing_file["name"]
+        if normalize_name_for_match(existing_name) == target_normalized:
+            folder_id: str = existing_file["id"]
+            if existing_name == folder_name:
+                logger.info(
+                    f"Drive: 既存フォルダを再利用 ({folder_name}, ID: {folder_id})"
+                )
+            else:
+                logger.info(
+                    f"Drive: 表記揺れを検知して既存フォルダを再利用 "
+                    f"(要求='{folder_name}', 既存='{existing_name}', ID: {folder_id})"
+                )
+            return folder_id
 
     metadata = {
         "name": folder_name,
