@@ -54,12 +54,16 @@ def merge_pdfs(
     return output_path
 
 
-def make_output_filename(clinic_name: str, person_name: str) -> str:
-    """出力PDFのファイル名を生成する。"""
-    # Sanitize to prevent path traversal from spreadsheet-sourced data
+def make_output_filename(clinic_name: str, person_name: str, sample_title: str) -> str:
+    """出力PDFのファイル名を生成する。
+
+    形式: ``<医院名>＿<個人名>＿<実践事例タイトル>.pdf``
+    （区切りは全角アンダースコア ``＿``）
+    """
     safe_clinic = _sanitize_filename(clinic_name)
     safe_person = _sanitize_filename(person_name)
-    return f"{safe_clinic}_{safe_person}_じっせん君コメント.pdf"
+    safe_title = _sanitize_filename(sample_title)
+    return f"{safe_clinic}＿{safe_person}＿{safe_title}.pdf"
 
 
 def _sanitize_filename(name: str) -> str:

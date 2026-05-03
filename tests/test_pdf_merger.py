@@ -78,8 +78,8 @@ class TestPdfMerger(unittest.TestCase):
             self.assertEqual(len(merged.pages), 3)
 
     def test_make_output_filename(self):
-        name = make_output_filename("三浦歯科医院", "白川蓮")
-        self.assertEqual(name, "三浦歯科医院_白川蓮_じっせん君コメント.pdf")
+        name = make_output_filename("三浦歯科医院", "白川蓮", "AI活用インプラント新患獲得")
+        self.assertEqual(name, "三浦歯科医院＿白川蓮＿AI活用インプラント新患獲得.pdf")
 
 
 class TestPdfMergerSingle(unittest.TestCase):
@@ -183,8 +183,8 @@ class TestPdfMergerEdgeCases(unittest.TestCase):
 
     def test_make_output_filename_special_chars(self):
         """特殊文字を含む名前でもファイル名が生成されること。"""
-        name = make_output_filename("テスト＆歯科", "山田（太郎）")
-        self.assertEqual(name, "テスト＆歯科_山田（太郎）_じっせん君コメント.pdf")
+        name = make_output_filename("テスト＆歯科", "山田（太郎）", "夏祭り/イベント")
+        self.assertEqual(name, "テスト＆歯科＿山田（太郎）＿夏祭りイベント.pdf")
 
 
 if __name__ == "__main__":

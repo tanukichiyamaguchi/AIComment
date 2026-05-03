@@ -12,7 +12,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from src.utils import setup_logging, ensure_fonts, sanitize_filename
+from src.utils import setup_logging, ensure_fonts
 from src.config import DRIVE_OUTPUT_FOLDER_ID
 from src import drive_client, sheets_client
 from src import pdf_reader, comment_generator, pdf_creator, pdf_merger
@@ -68,7 +68,9 @@ def run(test_count: int = 0) -> None:
             sample_title = metadata["sample_title"] or Path(file_name).stem
             comment = metadata["comment"]
 
-            output_filename = f"{sanitize_filename(sample_title)}.pdf"
+            output_filename = pdf_merger.make_output_filename(
+                clinic_name, person_name, sample_title
+            )
 
             with tempfile.TemporaryDirectory() as tmpdir:
                 comment_page_path = Path(tmpdir) / "comment_page.pdf"
