@@ -1,8 +1,9 @@
-"""ユーティリティモジュール。ログ設定とフォント自動ダウンロード。"""
+"""ユーティリティモジュール。ログ設定・フォント自動ダウンロード・ファイル名整形。"""
 
 from __future__ import annotations
 
 import logging
+import re
 import sys
 from pathlib import Path
 
@@ -44,6 +45,44 @@ def mask_email(email: str) -> str:
     else:
         masked_local = local[0] + "*" * (len(local) - 2) + local[-1]
     return f"{masked_local}@{domain}"
+
+
+# Forbidden chars: path separators, Windows-illegal chars, and non-whitespace
+# control characters. Whitespace controls (\t \n \r) are intentionally excluded
+# so that the subsequent whitespace-collapse step turns them into single spaces.
+_FORBIDDEN_FILENAME_CHARS = re.compile(
+    r'[\\/:*?"<>|\x00-\x08\x0b\x0c\x0e-\x1f]'
+)
+
+
+def sanitize_filename(
+    name: str,
+    fallback: str = "untitled",
+    max_length: int = 100,
+) -> str:
+    """ファイル名として安全な文字列に整形する。
+
+    - パス区切り（``/`` ``\\``）と Windows / Drive で問題を起こす特殊文字を除去
+    - タブ・改行などの空白制御文字は空白に変換し、連続する空白を1つにまとめる
+    - 先頭・末尾の空白とドットを除去
+    - 空になったら ``fallback`` を返す
+    - ``max_length`` で切り詰め
+
+    Args:
+        name: 元の文字列
+        fallback: 整形後に空になった場合の代替文字列
+        max_length: 上限文字数
+
+    Returns:
+        ファイル名として使える文字列
+    """
+    if not isinstance(name, str):
+        name = str(name)
+    cleaned = _FORBIDDEN_FILENAME_CHARS.sub("", name)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .")
+    if not cleaned:
+        return fallback
+    return cleaned[:max_length]
 
 
 def ensure_fonts() -> None:

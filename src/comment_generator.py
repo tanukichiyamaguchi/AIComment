@@ -9,6 +9,7 @@ from typing import Any
 
 import anthropic
 from anthropic.types import TextBlock
+from anthropic.types.message_create_params import MessageCreateParamsNonStreaming
 from anthropic.types.messages.batch_create_params import Request
 
 from src.config import (
@@ -142,20 +143,65 @@ SYSTEM_PROMPT = """\
 ・「〜じゃないですか」「〜ですよね」など、語りかける口調
 ・少しくだけた表現もOK
 
-#出力形式
-コメント本文のみを出力してください（200〜350文字）。
-タイトルや宛名は不要です。コメント文のみ。"""
+#出力タスク
+報告シートを読み、以下の4要素を構造化出力（JSON）で返してください：
+
+- `clinic_name` : PDF本文（タイトル・冒頭・最終ページなど）に明記されている歯科医院名（最も完全な表記を選ぶ）。判別不能なら空文字列。
+- `person_name` : 報告者の氏名（「報告者」「氏名」「Dr」などのラベル付近）。役職や肩書きは含めない。判別不能なら空文字列。
+- `sample_title` : この実践事例のタイトル / テーマ（「タイトル」「テーマ」「取り組み名」「冒頭の見出し」など）。判別不能なら空文字列。
+- `comment` : 報告者一人ひとりに向けた手書き調コメント本文（200〜350文字）。タイトルや宛名は不要。コメント文のみ。"""
 
 
-def _build_user_prompt(clinic_name: str, person_name: str, pdf_text: str) -> str:
+def _build_user_prompt(pdf_text: str, pdf_filename: str = "") -> str:
     """ユーザープロンプトを構築する。"""
+    file_note = f"\nファイル名: {pdf_filename}\n" if pdf_filename else ""
     return (
-        f"以下は{clinic_name}の{person_name}さんの実践事例報告シートです。"
-        f"コメントを書いてください。\n---\n{pdf_text}\n---"
+        "以下は歯科医院の実践事例報告シートです。"
+        "本文から医院名・報告者氏名・実践事例タイトルを抽出し、"
+        "本文に対する手書き調コメントも生成してください。"
+        f"{file_note}\n---\n{pdf_text}\n---"
     )
 
 
 _DEFAULT_TIMEOUT = 120  # seconds
+
+
+_EXTRACTED_FIELDS = ("clinic_name", "person_name", "sample_title", "comment")
+
+EXTRACTION_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "clinic_name": {
+            "type": "string",
+            "description": (
+                "歯科医院名。報告シート本文から抽出。"
+                "判別不能なら空文字列を返す。"
+            ),
+        },
+        "person_name": {
+            "type": "string",
+            "description": (
+                "報告者の氏名。役職・肩書きは含めない。"
+                "判別不能なら空文字列を返す。"
+            ),
+        },
+        "sample_title": {
+            "type": "string",
+            "description": (
+                "この実践事例のタイトル / テーマ。"
+                "判別不能なら空文字列を返す。"
+            ),
+        },
+        "comment": {
+            "type": "string",
+            "description": (
+                "報告者一人ひとりに向けた手書き調コメント本文（200〜350文字）。"
+            ),
+        },
+    },
+    "required": ["clinic_name", "person_name", "sample_title", "comment"],
+    "additionalProperties": False,
+}
 
 
 def _create_client() -> anthropic.Anthropic:
@@ -166,39 +212,63 @@ def _create_client() -> anthropic.Anthropic:
     )
 
 
-def generate_comment(
-    clinic_name: str,
-    person_name: str,
+def _build_extraction_request_params() -> dict[str, Any]:
+    """構造化出力リクエスト用の共通パラメータを生成する。"""
+    return {
+        "model": CLAUDE_MODEL,
+        "max_tokens": CLAUDE_MAX_TOKENS,
+        "temperature": CLAUDE_TEMPERATURE,
+        "system": [
+            {
+                "type": "text",
+                "text": SYSTEM_PROMPT,
+                "cache_control": {"type": "ephemeral"},
+            }
+        ],
+        "output_config": {
+            "format": {"type": "json_schema", "schema": EXTRACTION_SCHEMA},
+        },
+    }
+
+
+def _parse_extraction(text: str) -> dict[str, str]:
+    """JSONテキストをパースし、必須フィールドを文字列として補完する。"""
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise ValueError(
+            f"Claude応答のJSONパースに失敗: {e}: {text[:200]}"
+        ) from e
+    if not isinstance(data, dict):
+        raise ValueError(f"Claude応答がオブジェクトではありません: {text[:200]}")
+    return {field: str(data.get(field, "") or "").strip() for field in _EXTRACTED_FIELDS}
+
+
+def generate_comment_with_metadata(
     pdf_text: str,
+    pdf_filename: str = "",
     max_retries: int = 3,
-) -> str:
-    """通常モードでコメントを1件生成する。指数バックオフリトライ付き。
+) -> dict[str, str]:
+    """通常モードで医院名・氏名・実践事例タイトル・コメントを一括抽出/生成する。
 
     Args:
-        clinic_name: 医院名
-        person_name: 氏名
         pdf_text: PDFから抽出したテキスト全文
-        max_retries: 最大リトライ回数
+        pdf_filename: 元PDFのファイル名（プロンプトの補助情報として使用）
+        max_retries: APIエラー時の最大リトライ回数
 
     Returns:
-        生成されたコメントテキスト（200〜350文字）
+        ``{"clinic_name", "person_name", "sample_title", "comment"}`` を必ず含む辞書。
+        AIが判別できなかったフィールドは空文字列で返る。``comment`` のみ
+        空文字列の場合は ``ValueError`` を送出する。
     """
     client = _create_client()
-    user_prompt = _build_user_prompt(clinic_name, person_name, pdf_text)
+    user_prompt = _build_user_prompt(pdf_text, pdf_filename)
+    base_params = _build_extraction_request_params()
 
     for attempt in range(max_retries + 1):
         try:
             response = client.messages.create(
-                model=CLAUDE_MODEL,
-                max_tokens=CLAUDE_MAX_TOKENS,
-                temperature=CLAUDE_TEMPERATURE,
-                system=[
-                    {
-                        "type": "text",
-                        "text": SYSTEM_PROMPT,
-                        "cache_control": {"type": "ephemeral"},
-                    }
-                ],
+                **base_params,
                 messages=[{"role": "user", "content": user_prompt}],
             )
             text_blocks = [
@@ -206,23 +276,30 @@ def generate_comment(
             ]
             if not text_blocks or not text_blocks[0].text.strip():
                 logger.warning(
-                    f"API応答が空です: {clinic_name} {person_name} "
-                    f"(試行{attempt + 1}/{max_retries + 1})"
+                    f"API応答が空です (試行{attempt + 1}/{max_retries + 1})"
                 )
                 if attempt < max_retries:
-                    wait = 2 ** (attempt + 1)
-                    time.sleep(wait)
+                    time.sleep(2 ** (attempt + 1))
                     continue
-                raise ValueError(
-                    f"API応答が空です: {clinic_name} {person_name}"
-                )
+                raise ValueError("API応答が空です")
 
-            comment = text_blocks[0].text.strip()
+            data = _parse_extraction(text_blocks[0].text)
+            if not data["comment"]:
+                logger.warning(
+                    f"コメントが空です (試行{attempt + 1}/{max_retries + 1})"
+                )
+                if attempt < max_retries:
+                    time.sleep(2 ** (attempt + 1))
+                    continue
+                raise ValueError("コメントが空です")
+
             logger.info(
-                f"コメント生成完了: {clinic_name} {person_name} "
-                f"({len(comment)}文字)"
+                f"抽出完了: clinic='{data['clinic_name']}' "
+                f"person='{data['person_name']}' "
+                f"title='{data['sample_title']}' "
+                f"comment={len(data['comment'])}文字"
             )
-            return comment
+            return data
 
         except (
             anthropic.RateLimitError,
@@ -247,11 +324,11 @@ def generate_comment(
 def create_batch_requests(
     items: list[dict],
 ) -> list[Request]:
-    """Batch API用のリクエストリストを作成する。
+    """Batch API用のリクエストリストを作成する（構造化出力）。
 
     Args:
-        items: [{"custom_id": str, "clinic_name": str,
-                 "person_name": str, "pdf_text": str}, ...]
+        items: [{"custom_id": str, "pdf_text": str,
+                 "pdf_file_name": str (任意)}, ...]
 
     Returns:
         Batch API送信用のリクエストリスト
@@ -259,26 +336,26 @@ def create_batch_requests(
     requests: list[Request] = []
     for item in items:
         user_prompt = _build_user_prompt(
-            item["clinic_name"], item["person_name"], item["pdf_text"]
+            pdf_text=item["pdf_text"],
+            pdf_filename=item.get("pdf_file_name", ""),
         )
-        requests.append(
-            Request(
-                custom_id=item["custom_id"],
-                params={
-                    "model": CLAUDE_MODEL,
-                    "max_tokens": CLAUDE_MAX_TOKENS,
-                    "temperature": CLAUDE_TEMPERATURE,
-                    "system": [
-                        {
-                            "type": "text",
-                            "text": SYSTEM_PROMPT,
-                            "cache_control": {"type": "ephemeral"},
-                        }
-                    ],
-                    "messages": [{"role": "user", "content": user_prompt}],
-                },
-            )
+        params = MessageCreateParamsNonStreaming(
+            model=CLAUDE_MODEL,
+            max_tokens=CLAUDE_MAX_TOKENS,
+            temperature=CLAUDE_TEMPERATURE,
+            system=[
+                {
+                    "type": "text",
+                    "text": SYSTEM_PROMPT,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+            output_config={
+                "format": {"type": "json_schema", "schema": EXTRACTION_SCHEMA},
+            },
+            messages=[{"role": "user", "content": user_prompt}],
         )
+        requests.append(Request(custom_id=item["custom_id"], params=params))
     return requests
 
 
@@ -324,36 +401,55 @@ def get_batch_status(batch_id: str) -> dict[str, Any]:
     }
 
 
-def get_batch_results(batch_id: str) -> tuple[dict[str, str], list[str]]:
-    """バッチの結果を取得する。
+def get_batch_results(
+    batch_id: str,
+) -> tuple[dict[str, dict[str, str]], list[str]]:
+    """バッチの結果を取得し、構造化出力をパースする。
 
     Returns:
         (results, failed_ids) のタプル。
-        results: {custom_id: comment_text, ...}
-        failed_ids: 失敗したcustom_idのリスト
+        results: ``{custom_id: {clinic_name, person_name, sample_title, comment}}``
+        failed_ids: 失敗または空コメントのcustom_idのリスト
     """
     client = _create_client()
-    results = {}
+    results: dict[str, dict[str, str]] = {}
     failed_ids: list[str] = []
 
     for result in client.messages.batches.results(batch_id):
         custom_id = result.custom_id
-        if result.result.type == "succeeded":
-            text_blocks = [
-                b
-                for b in result.result.message.content
-                if isinstance(b, TextBlock)
-            ]
-            comment = text_blocks[0].text.strip() if text_blocks else ""
-            if comment:
-                results[custom_id] = comment
-                logger.info(f"Batch結果取得: {custom_id} ({len(comment)}文字)")
-            else:
-                logger.warning(f"Batch結果が空: {custom_id}")
-                failed_ids.append(custom_id)
-        else:
+        if result.result.type != "succeeded":
             logger.error(f"Batch失敗: {custom_id} - {result.result.type}")
             failed_ids.append(custom_id)
+            continue
+
+        text_blocks = [
+            b
+            for b in result.result.message.content
+            if isinstance(b, TextBlock)
+        ]
+        if not text_blocks or not text_blocks[0].text.strip():
+            logger.warning(f"Batch結果が空: {custom_id}")
+            failed_ids.append(custom_id)
+            continue
+
+        try:
+            data = _parse_extraction(text_blocks[0].text)
+        except ValueError as e:
+            logger.error(f"Batch結果のJSONパース失敗: {custom_id} - {e}")
+            failed_ids.append(custom_id)
+            continue
+
+        if not data["comment"]:
+            logger.warning(f"Batch結果のコメントが空: {custom_id}")
+            failed_ids.append(custom_id)
+            continue
+
+        results[custom_id] = data
+        logger.info(
+            f"Batch結果取得: {custom_id} "
+            f"clinic='{data['clinic_name']}' person='{data['person_name']}' "
+            f"title='{data['sample_title']}'"
+        )
 
     logger.info(
         f"Batch結果取得完了: {len(results)}件成功, {len(failed_ids)}件失敗"

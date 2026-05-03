@@ -1,4 +1,9 @@
-"""通常モードのエントリポイント。1件ずつ処理する。"""
+"""通常モードのエントリポイント。
+
+PDFを読み取り、Claude APIで医院名・氏名・実践事例タイトル・コメントを抽出/生成し、
+コメント付きPDFをDriveに「医院名/個人名/」階層で保存し、出力一覧シートに記録する。
+事前のスプレッドシート入力（Sheet1）は不要。
+"""
 
 from __future__ import annotations
 
@@ -7,11 +12,10 @@ import sys
 import tempfile
 from pathlib import Path
 
-from src.utils import setup_logging, mask_email, ensure_fonts
-from src.config import DRIVE_OUTPUT_FOLDER_ID, LOGS_DIR
-from src import drive_client, sheets_client, gmail_client
+from src.utils import setup_logging, ensure_fonts, sanitize_filename
+from src.config import DRIVE_OUTPUT_FOLDER_ID
+from src import drive_client, sheets_client
 from src import pdf_reader, comment_generator, pdf_creator, pdf_merger
-from src.matcher import match_record
 
 
 def run(test_count: int = 0) -> None:
@@ -23,31 +27,31 @@ def run(test_count: int = 0) -> None:
     logger = setup_logging()
     logger.info("=== じっせん君コメントシステム（通常モード）開始 ===")
 
-    # フォント準備
+    if not DRIVE_OUTPUT_FOLDER_ID:
+        raise RuntimeError(
+            "DRIVE_OUTPUT_FOLDER_ID が設定されていません。"
+            "GitHub Secrets またはローカル環境変数に設定してください。"
+        )
+
     ensure_fonts()
 
-    # 1. Google認証 & データ取得
-    logger.info("Step 1: データ取得")
-    records = sheets_client.get_unprocessed_records()
+    logger.info("Step 1: PDF一覧取得")
     pdf_files = drive_client.list_pdfs()
 
     if test_count > 0:
         pdf_files = pdf_files[:test_count]
         logger.info(f"テストモード: {test_count}件に制限")
 
-    logger.info(f"処理対象: PDF {len(pdf_files)}件, 未処理レコード {len(records)}件")
+    logger.info(f"処理対象: {len(pdf_files)}件のPDF")
 
-    # 統計
     stats = {"success": 0, "skip": 0, "error": 0}
 
-    # 2. 1件ずつ処理
     for i, pdf_file in enumerate(pdf_files, start=1):
         file_id = pdf_file["id"]
         file_name = pdf_file["name"]
         logger.info(f"--- [{i}/{len(pdf_files)}] {file_name} ---")
 
         try:
-            # 2.1 PDFダウンロード & テキスト抽出
             pdf_data = drive_client.download_pdf(file_id)
             pdf_text = pdf_reader.extract_text(pdf_data)
             if not pdf_text:
@@ -55,37 +59,26 @@ def run(test_count: int = 0) -> None:
                 stats["skip"] += 1
                 continue
 
-            # 2.2 スプレッドシートとマッチング
-            record = match_record(pdf_text, records, pdf_filename=file_name)
-            if not record:
-                logger.warning(f"マッチング失敗: {file_name}")
-                stats["skip"] += 1
-                continue
-
-            # ステータスを「処理中」に更新
-            sheets_client.update_status(record.row_number, "処理中")
-
-            # 2.3 Claude APIでコメント生成
-            comment = comment_generator.generate_comment(
-                clinic_name=record.clinic_name,
-                person_name=record.person_name,
+            metadata = comment_generator.generate_comment_with_metadata(
                 pdf_text=pdf_text,
+                pdf_filename=file_name,
             )
+            clinic_name = metadata["clinic_name"] or "unknown_clinic"
+            person_name = metadata["person_name"] or "unknown_person"
+            sample_title = metadata["sample_title"] or Path(file_name).stem
+            comment = metadata["comment"]
 
-            # 2.4 コメントページPDF生成
+            output_filename = f"{sanitize_filename(sample_title)}.pdf"
+
             with tempfile.TemporaryDirectory() as tmpdir:
                 comment_page_path = Path(tmpdir) / "comment_page.pdf"
                 pdf_creator.create_comment_page(
                     comment=comment,
-                    clinic_name=record.clinic_name,
-                    person_name=record.person_name,
+                    clinic_name=clinic_name,
+                    person_name=person_name,
                     output_path=comment_page_path,
                 )
 
-                # 2.5 PDF結合
-                output_filename = pdf_merger.make_output_filename(
-                    record.clinic_name, record.person_name
-                )
                 output_path = Path(tmpdir) / output_filename
                 pdf_merger.merge_pdfs(
                     original_pdf_data=pdf_data,
@@ -93,66 +86,30 @@ def run(test_count: int = 0) -> None:
                     output_path=output_path,
                 )
 
-                # 2.6 Drive 階層保存 + 出力一覧シート追記
-                #     （DRIVE_OUTPUT_FOLDER_ID 未設定時はスキップして従来動作）
-                if DRIVE_OUTPUT_FOLDER_ID:
-                    try:
-                        upload_result = drive_client.upload_pdf_to_clinic_person(
-                            file_path=output_path,
-                            output_root_folder_id=DRIVE_OUTPUT_FOLDER_ID,
-                            clinic_name=record.clinic_name,
-                            person_name=record.person_name,
-                            file_name=file_name,
-                        )
-                        sheets_client.append_output_record(
-                            clinic_name=record.clinic_name,
-                            person_name=record.person_name,
-                            sample_name=file_name,
-                            drive_url=upload_result["webViewLink"],
-                        )
-                    except Exception as drive_err:
-                        logger.warning(
-                            f"Drive保存/出力一覧追記スキップ: {drive_err}"
-                        )
+                upload_result = drive_client.upload_pdf_to_clinic_person(
+                    file_path=output_path,
+                    output_root_folder_id=DRIVE_OUTPUT_FOLDER_ID,
+                    clinic_name=clinic_name,
+                    person_name=person_name,
+                    file_name=output_filename,
+                )
 
-                # 2.7 Gmail下書き作成（失敗しても処理続行）
-                if record.email:
-                    try:
-                        gmail_client.create_draft(
-                            to_email=record.email,
-                            person_name=record.person_name,
-                            pdf_path=output_path,
-                        )
-                        logger.info(
-                            f"下書き作成完了: {record.person_name}様 "
-                            f"→ {mask_email(record.email)}"
-                        )
-                    except Exception as gmail_err:
-                        logger.warning(
-                            f"Gmail下書き作成スキップ: {gmail_err}"
-                        )
-                else:
-                    logger.warning(
-                        f"メールアドレスなし: {record.clinic_name} {record.person_name}"
-                    )
+            sheets_client.append_output_record(
+                clinic_name=clinic_name,
+                person_name=person_name,
+                sample_name=sample_title,
+                drive_url=upload_result["webViewLink"],
+            )
 
-            # 2.8 ステータス「完了」に更新
-            sheets_client.update_status(record.row_number, "完了")
+            logger.info(
+                f"完了: {clinic_name} / {person_name} / {sample_title}"
+            )
             stats["success"] += 1
 
         except Exception as e:
             logger.error(f"処理エラー: {file_name} - {e}", exc_info=True)
             stats["error"] += 1
-            # ステータスを「エラー」に更新（recordが取得できている場合）
-            try:
-                if record:
-                    sheets_client.update_status(
-                        record.row_number, f"エラー: {str(e)[:50]}"
-                    )
-            except Exception:
-                pass
 
-    # 結果サマリ
     logger.info("=== 処理完了 ===")
     logger.info(
         f"成功: {stats['success']}件, "

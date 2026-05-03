@@ -1,6 +1,8 @@
 # じっせん君コメントシステム
 
-歯科医院の実践事例PDF（400件以上）を読み取り、Claude Sonnet 4.6 APIでコンサルタント風コメントを生成し、元PDFの末尾にコメントページを追加した新PDFを作成、Gmail下書きとして保存するシステム。
+歯科医院の実践事例PDF（数百件）を読み取り、Claude Sonnet 4.6 API で **医院名・氏名・実践事例タイトル** を本文から自動抽出し、コンサルタント風コメントを生成、コメントページを末尾に追加した新PDFを **Google Drive に「医院名/個人名/」階層** で保存し、**スプレッドシート「出力一覧」** に履歴を記録するシステム。
+
+事前のスプレッドシート入力は不要。Drive にPDFを置けば自動で処理されます。
 
 ## セットアップ
 
@@ -12,72 +14,63 @@ pip install -r requirements.txt
 
 ### 2. 環境変数 / Secrets
 
-| 変数名 | 内容 |
-|--------|------|
-| `ANTHROPIC_API_KEY` | Claude APIキー |
-| `GOOGLE_CREDENTIALS_JSON` | GCPサービスアカウントJSON |
-| `DRIVE_FOLDER_ID` | 実践事例PDFのGoogle DriveフォルダID（入力） |
-| `DRIVE_OUTPUT_FOLDER_ID` | コメント付きPDFの出力先Google DriveフォルダID（任意。未設定時はDrive保存をスキップ） |
-| `SPREADSHEET_ID` | 医院名・氏名・メールのスプレッドシートID |
-| `GMAIL_TOKEN_JSON` | Gmail OAuth認証トークン |
+| 変数名 | 内容 | 必須 |
+|--------|------|------|
+| `ANTHROPIC_API_KEY` | Claude APIキー | ✅ |
+| `GOOGLE_CREDENTIALS_JSON` | GCPサービスアカウントJSON | ✅ |
+| `DRIVE_FOLDER_ID` | 入力PDFが格納されたGoogle DriveフォルダID | ✅ |
+| `DRIVE_OUTPUT_FOLDER_ID` | 出力PDFを保存するGoogle DriveフォルダID | ✅ |
+| `SPREADSHEET_ID` | 出力一覧を書き込むスプレッドシートID | ✅ |
+| `GMAIL_TOKEN_JSON` | Gmail OAuth認証トークン | （現状は未使用。将来Gmail送付対応時に必要） |
 
 ### 3. アセットファイル
 
 - `assets/jissen_kun.png` — じっせん君キャラクター画像（社内から取得）
 - フォント（NotoSansJP）は初回実行時に自動ダウンロードされます
 
-### 4. スプレッドシート構成
+### 4. スプレッドシート「出力一覧」シート
 
-**Sheet1（医院マスター）** — 入力用、1人1行
-
-| 列 | ヘッダー | 内容 |
-|----|---------|------|
-| A | 医院名 | 必須 |
-| B | 氏名 | 必須 |
-| C | メールアドレス | 必須 |
-| D | ステータス | システムが自動更新 |
-
-**出力一覧**シート — `DRIVE_OUTPUT_FOLDER_ID` 設定時に自動作成、1ファイル1行
+`DRIVE_OUTPUT_FOLDER_ID` 設定済みかつ初回実行時に自動作成されます。1ファイル1行で記録：
 
 | 列 | ヘッダー | 内容 |
 |----|---------|------|
-| A | 医院名 | システムが書き込み |
-| B | 個人名 | システムが書き込み |
-| C | 実践事例名 | 元PDFのファイル名 |
+| A | 医院名 | AIがPDFから自動抽出 |
+| B | 個人名 | AIがPDFから自動抽出 |
+| C | 実践事例タイトル | AIがPDFから自動抽出 |
 | D | Drive URL | 出力PDFの閲覧URL |
 | E | 処理日時 | システムが書き込み |
 
-### 5. Drive 出力構造（`DRIVE_OUTPUT_FOLDER_ID` 設定時）
+> 事前の入力（医院名や氏名のリスト）は **不要**。AIがPDF本文から判別できなかった場合は `unknown_clinic` / `unknown_person` として処理を続行します。
+
+### 5. Drive 出力構造
 
 ```
 <DRIVE_OUTPUT_FOLDER_ID>/
 ├── 三浦歯科医院/
 │   └── 白川 蓮/
-│       ├── 新患獲得.pdf       ← 元PDF＋コメントページ
-│       └── 自費率向上.pdf
-└── 山本歯科医院/
-    └── 田中 太郎/
-        └── キャンセル削減.pdf
+│       ├── AI活用インプラント新患獲得.pdf  ← 元PDF＋コメントページ
+│       └── 自費率向上の取り組み.pdf
+├── 山本歯科医院/
+│   └── 田中 太郎/
+│       └── 夏祭りイベント開催.pdf
+└── unknown_clinic/         ← 医院名抽出失敗時のフォールバック
+    └── unknown_person/
+        └── 名称不明事例.pdf
 ```
 
+ファイル名は AI が抽出した実践事例タイトルから特殊文字を除いて生成。
+
 ## 使い方
-
-### Google Colab（開発・テスト）
-
-`notebooks/jissen_comment.ipynb` を開き、セルを上から順に実行してください。
-Colab Secretsに環境変数を設定しておけば自動で読み込まれます。
 
 ### コマンドライン
 
 ```bash
-# 通常モード（1件ずつ処理）
+# 通常モード（1件ずつ処理、まずは少量で動作確認）
 python -m src.main --test-count 5
 
-# Batchモード（50%割引・400件一括）
-python -m src.batch_main
-
-# Batchモード（テスト）
-python -m src.batch_main --test-count 10
+# Batchモード（50%割引・大量一括処理）
+python -m src.batch_main --test-count 5      # まずテスト
+python -m src.batch_main                      # 本番（全件）
 
 # バッチ結果取得から再開
 python -m src.batch_main --batch-id msgbatch_xxx --step results
@@ -87,8 +80,22 @@ python -m src.batch_main --batch-id msgbatch_xxx --step results
 
 1. リポジトリの Settings → Secrets に環境変数を登録
 2. Actions タブ → 「Generate Jissen Comments」→ 「Run workflow」
-3. 2〜3時間後、Gmail下書きフォルダを確認
-4. コメント内容を確認後、手動で送信
+3. **`test_count: 5` でまずテスト実行** → Drive と出力一覧シートを目視確認
+4. 問題なければ `test_count: 0` で全件実行
+5. 完了後、Drive のフォルダ階層と出力一覧シートを確認
+
+## 処理フロー（v2）
+
+```
+1. Drive入力フォルダから全PDFを取得
+2. 各PDFについて：
+   a. テキスト抽出
+   b. Claude API（構造化出力）で 医院名・氏名・実践事例タイトル・コメントを一括取得
+   c. コメントページPDFを生成
+   d. 元PDF + コメントページを結合
+   e. Drive `<出力root>/<医院名>/<個人名>/<タイトル>.pdf` にアップロード
+   f. 出力一覧シートに 1 行追記
+```
 
 ## コスト目安（400件）
 
@@ -102,12 +109,13 @@ python -m src.batch_main --batch-id msgbatch_xxx --step results
 
 | 問題 | 対処 |
 |------|------|
+| 出力一覧シートが空のまま | `DRIVE_OUTPUT_FOLDER_ID` がSecretsに設定されているか確認 |
+| `unknown_clinic` / `unknown_person` フォルダに大量に入る | PDF本文からAIが判別できていない。PDFのフォーマットや書式を見直す |
 | フォントダウンロード失敗 | 手動で `assets/` にNotoSansJP-Regular.ttf / Bold.ttfを配置 |
-| PDF文字化けない | フォントファイルが正しくダウンロードされているか確認 |
-| マッチング失敗が多い | スプレッドシートの医院名がPDF内の表記と一致しているか確認 |
+| PDFの文字が□ □ □ になる | フォントファイルが正しくダウンロードされているか確認 |
 | Claude API 429エラー | 自動リトライあり。頻発する場合はBatchモード推奨 |
-| Gmail下書き作成失敗 | OAuth認証トークンの期限を確認。再認証が必要な場合あり |
 | GitHub Actions タイムアウト | Batchモードを使用して処理時間を短縮 |
+| 同じPDFを再実行すると重複出力される | v1時点で重複検知は未実装。再実行前にDrive出力フォルダと出力一覧シートを手動で整理してください |
 
 ## ディレクトリ構成
 
@@ -116,15 +124,15 @@ python -m src.batch_main --batch-id msgbatch_xxx --step results
 │   ├── main.py              # 通常モード エントリポイント
 │   ├── batch_main.py         # Batchモード エントリポイント
 │   ├── config.py             # 設定値管理
-│   ├── utils.py              # ログ設定・フォントダウンロード
+│   ├── utils.py              # ログ設定・フォントダウンロード・ファイル名整形
 │   ├── pdf_reader.py         # PDFテキスト抽出
-│   ├── comment_generator.py  # Claude APIコメント生成
+│   ├── comment_generator.py  # Claude API（構造化出力で医院名/氏名/タイトル/コメント取得）
 │   ├── pdf_creator.py        # コメントページPDF生成
 │   ├── pdf_merger.py         # PDF結合
-│   ├── drive_client.py       # Google Drive API
-│   ├── sheets_client.py      # Google Sheets API
-│   ├── gmail_client.py       # Gmail API
-│   └── matcher.py            # PDF↔スプレッドシート マッチング
+│   ├── drive_client.py       # Google Drive API（階層フォルダ作成 + アップロード）
+│   ├── sheets_client.py      # Google Sheets API（出力一覧シート追記）
+│   ├── gmail_client.py       # Gmail API（v2では未使用、将来Gmail送付時に再利用）
+│   └── matcher.py            # 旧マッチング（v2では未使用）
 ├── tests/                    # テストコード
 ├── notebooks/                # Google Colabノートブック
 ├── assets/                   # フォント・画像
