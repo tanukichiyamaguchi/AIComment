@@ -1,14 +1,15 @@
-"""Google Drive APIクライアント。フォルダ内PDF一覧取得＆ダウンロード。"""
+"""Google Drive APIクライアント。フォルダ内PDF一覧取得・ダウンロード・アップロード。"""
 
 from __future__ import annotations
 
+import io
 import json
 import logging
+from pathlib import Path
 from typing import Any
 
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload
-import io
+from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
 from src.config import DRIVE_FOLDER_ID, GOOGLE_CREDENTIALS_JSON, GOOGLE_SCOPES
 
@@ -118,3 +119,135 @@ def download_pdf(file_id: str) -> bytes:
     data = buffer.getvalue()
     logger.info(f"Drive: ダウンロード完了 (ID: {file_id}, {len(data)} bytes)")
     return data
+
+
+def find_or_create_folder(
+    folder_name: str,
+    parent_id: str,
+    service: Any | None = None,
+) -> str:
+    """指定された親フォルダ配下に同名フォルダがあれば再利用、無ければ新規作成する。
+
+    Args:
+        folder_name: フォルダ名
+        parent_id: 親フォルダのDrive ID
+        service: 既存のDrive APIサービス（指定されない場合は新規構築）
+
+    Returns:
+        フォルダのDrive ID
+    """
+    if not folder_name:
+        raise ValueError("folder_name が空です")
+    if not parent_id:
+        raise ValueError("parent_id が空です")
+
+    service = service or get_drive_service()
+
+    escaped = folder_name.replace("\\", "\\\\").replace("'", "\\'")
+    query = (
+        f"'{parent_id}' in parents "
+        f"and mimeType='application/vnd.google-apps.folder' "
+        f"and name='{escaped}' "
+        f"and trashed=false"
+    )
+    response = service.files().list(
+        q=query,
+        fields="files(id, name)",
+        pageSize=1,
+    ).execute()
+
+    existing = response.get("files", [])
+    if existing:
+        folder_id: str = existing[0]["id"]
+        logger.info(f"Drive: 既存フォルダを再利用 ({folder_name}, ID: {folder_id})")
+        return folder_id
+
+    metadata = {
+        "name": folder_name,
+        "mimeType": "application/vnd.google-apps.folder",
+        "parents": [parent_id],
+    }
+    created = service.files().create(body=metadata, fields="id").execute()
+    new_id: str = created["id"]
+    logger.info(f"Drive: フォルダ新規作成 ({folder_name}, ID: {new_id})")
+    return new_id
+
+
+def upload_pdf(
+    file_path: str | Path,
+    folder_id: str,
+    file_name: str | None = None,
+    service: Any | None = None,
+) -> dict[str, str]:
+    """PDFをDriveにアップロードし、ファイルIDと閲覧URLを返す。
+
+    Args:
+        file_path: アップロード元のローカルPDFパス
+        folder_id: アップロード先フォルダのDrive ID
+        file_name: Drive上のファイル名（省略時はローカルファイル名を使用）
+        service: 既存のDrive APIサービス（指定されない場合は新規構築）
+
+    Returns:
+        {"id": "<file_id>", "webViewLink": "<url>"}
+    """
+    file_path = Path(file_path)
+    if not file_path.exists():
+        raise FileNotFoundError(f"アップロード元ファイルが存在しません: {file_path}")
+    if not folder_id:
+        raise ValueError("folder_id が空です")
+
+    service = service or get_drive_service()
+
+    metadata = {
+        "name": file_name or file_path.name,
+        "parents": [folder_id],
+    }
+
+    with file_path.open("rb") as fh:
+        media = MediaIoBaseUpload(fh, mimetype="application/pdf", resumable=False)
+        created = service.files().create(
+            body=metadata,
+            media_body=media,
+            fields="id, webViewLink",
+        ).execute()
+
+    file_id: str = created["id"]
+    web_view_link: str = created.get("webViewLink", "")
+    logger.info(
+        f"Drive: アップロード完了 ({metadata['name']}, ID: {file_id})"
+    )
+    return {"id": file_id, "webViewLink": web_view_link}
+
+
+def upload_pdf_to_clinic_person(
+    file_path: str | Path,
+    output_root_folder_id: str,
+    clinic_name: str,
+    person_name: str,
+    file_name: str | None = None,
+) -> dict[str, str]:
+    """医院名/個人名 階層を作成（または再利用）し、その配下にPDFをアップロードする。
+
+    Args:
+        file_path: アップロード元PDFパス
+        output_root_folder_id: 出力ルートフォルダのDrive ID
+        clinic_name: 医院名（フォルダ名になる）
+        person_name: 個人名（サブフォルダ名になる）
+        file_name: Drive上のファイル名（省略時はローカルファイル名を使用）
+
+    Returns:
+        {"id": "<file_id>", "webViewLink": "<url>"}
+    """
+    service = get_drive_service()
+    clinic_folder_id = find_or_create_folder(
+        clinic_name, output_root_folder_id, service=service
+    )
+    person_folder_id = find_or_create_folder(
+        person_name, clinic_folder_id, service=service
+    )
+    return upload_pdf(
+        file_path=file_path,
+        folder_id=person_folder_id,
+        file_name=file_name,
+        service=service,
+    )

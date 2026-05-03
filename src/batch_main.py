@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 
 from src.utils import setup_logging, mask_email, ensure_fonts
-from src.config import LOGS_DIR
+from src.config import DRIVE_OUTPUT_FOLDER_ID, LOGS_DIR
 from src import drive_client, sheets_client, gmail_client
 from src import pdf_reader, comment_generator, pdf_creator, pdf_merger
 from src.matcher import match_record
@@ -63,6 +63,7 @@ def step1_prepare() -> list[dict]:
             "row_number": record.row_number,
             "pdf_text": pdf_text,
             "pdf_data_id": file_id,  # 後でダウンロードし直す用
+            "pdf_file_name": file_name,  # Drive保存時のファイル名
         })
         sheets_client.update_status(record.row_number, "処理中")
 
@@ -245,6 +246,29 @@ def step4_generate_pdfs_and_drafts(
                     comment_page_path=comment_page_path,
                     output_path=output_path,
                 )
+
+                # Drive 階層保存 + 出力一覧シート追記
+                #     （DRIVE_OUTPUT_FOLDER_ID 未設定時はスキップ）
+                pdf_file_name = item.get("pdf_file_name", output_filename)
+                if DRIVE_OUTPUT_FOLDER_ID:
+                    try:
+                        upload_result = drive_client.upload_pdf_to_clinic_person(
+                            file_path=output_path,
+                            output_root_folder_id=DRIVE_OUTPUT_FOLDER_ID,
+                            clinic_name=clinic_name,
+                            person_name=person_name,
+                            file_name=pdf_file_name,
+                        )
+                        sheets_client.append_output_record(
+                            clinic_name=clinic_name,
+                            person_name=person_name,
+                            sample_name=pdf_file_name,
+                            drive_url=upload_result["webViewLink"],
+                        )
+                    except Exception as drive_err:
+                        logger.warning(
+                            f"Drive保存/出力一覧追記スキップ: {drive_err}"
+                        )
 
                 # Gmail下書き
                 if email:

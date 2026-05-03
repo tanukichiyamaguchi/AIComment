@@ -16,7 +16,8 @@ pip install -r requirements.txt
 |--------|------|
 | `ANTHROPIC_API_KEY` | Claude APIキー |
 | `GOOGLE_CREDENTIALS_JSON` | GCPサービスアカウントJSON |
-| `DRIVE_FOLDER_ID` | 実践事例PDFのGoogle DriveフォルダID |
+| `DRIVE_FOLDER_ID` | 実践事例PDFのGoogle DriveフォルダID（入力） |
+| `DRIVE_OUTPUT_FOLDER_ID` | コメント付きPDFの出力先Google DriveフォルダID（任意。未設定時はDrive保存をスキップ） |
 | `SPREADSHEET_ID` | 医院名・氏名・メールのスプレッドシートID |
 | `GMAIL_TOKEN_JSON` | Gmail OAuth認証トークン |
 
@@ -27,12 +28,37 @@ pip install -r requirements.txt
 
 ### 4. スプレッドシート構成
 
+**Sheet1（医院マスター）** — 入力用、1人1行
+
 | 列 | ヘッダー | 内容 |
 |----|---------|------|
 | A | 医院名 | 必須 |
 | B | 氏名 | 必須 |
 | C | メールアドレス | 必須 |
 | D | ステータス | システムが自動更新 |
+
+**出力一覧**シート — `DRIVE_OUTPUT_FOLDER_ID` 設定時に自動作成、1ファイル1行
+
+| 列 | ヘッダー | 内容 |
+|----|---------|------|
+| A | 医院名 | システムが書き込み |
+| B | 個人名 | システムが書き込み |
+| C | 実践事例名 | 元PDFのファイル名 |
+| D | Drive URL | 出力PDFの閲覧URL |
+| E | 処理日時 | システムが書き込み |
+
+### 5. Drive 出力構造（`DRIVE_OUTPUT_FOLDER_ID` 設定時）
+
+```
+<DRIVE_OUTPUT_FOLDER_ID>/
+├── 三浦歯科医院/
+│   └── 白川 蓮/
+│       ├── 新患獲得.pdf       ← 元PDF＋コメントページ
+│       └── 自費率向上.pdf
+└── 山本歯科医院/
+    └── 田中 太郎/
+        └── キャンセル削減.pdf
+```
 
 ## 使い方
 

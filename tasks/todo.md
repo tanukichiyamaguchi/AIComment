@@ -63,3 +63,24 @@
 - [ ] `idempotency-guardian` を `batch_main.run()` の冒頭で自動呼び出し
 - [ ] `pdf-triage-officer` を `step1_prepare` の前段に統合
 - [ ] Anthropic Batch APIの実上限（256MB/100k req）に基づくシャーディング実装
+
+## Phase 7: Drive階層出力 + Sheets出力一覧（2026-05-01）
+
+### ゴール
+コメント付きPDFをDriveに「医院名/個人名/」階層で保存し、Sheetsの「出力一覧」シートに1ファイル1行で履歴を記録する。
+
+### 仕様
+- 出力Drive構造: `<DRIVE_OUTPUT_FOLDER_ID>/<医院名>/<個人名>/<元PDFファイル名>`
+- 出力ファイル名: 元PDFと同じ（複数事例対応のため）
+- 出力一覧シート: `医院名 | 個人名 | 実践事例名 | Drive URL | 処理日時`
+- 既存Sheet1（医院マスター）は変更なし
+
+### タスク
+- [ ] `src/config.py` に `DRIVE_OUTPUT_FOLDER_ID` を追加 / Driveスコープを書き込み可能に拡張
+- [ ] `src/drive_client.py` に `find_or_create_folder()` と `upload_pdf()` を追加
+- [ ] `src/sheets_client.py` に `append_output_record()` を追加
+- [ ] `src/main.py` に Drive アップロード + Sheets 追記を統合
+- [ ] `src/batch_main.py` step4 に同上の統合
+- [ ] テスト追加（`test_drive_client.py`, `test_sheets_client.py`）
+- [ ] mypy / pytest をパス
+- [ ] README に新Secret `DRIVE_OUTPUT_FOLDER_ID` の取得手順を追記
