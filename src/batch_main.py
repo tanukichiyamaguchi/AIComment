@@ -13,7 +13,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from src.utils import setup_logging, ensure_fonts, sanitize_filename
+from src.utils import setup_logging, ensure_fonts
 from src.config import DRIVE_OUTPUT_FOLDER_ID, LOGS_DIR
 from src import drive_client, sheets_client
 from src import pdf_reader, comment_generator, pdf_creator, pdf_merger
@@ -174,7 +174,9 @@ def step4_generate_pdfs(
         sample_title = meta["sample_title"] or Path(pdf_file_name).stem or "untitled"
         comment = meta["comment"]
 
-        output_filename = f"{sanitize_filename(sample_title)}.pdf"
+        output_filename = pdf_merger.make_output_filename(
+            clinic_name, person_name, sample_title
+        )
 
         try:
             pdf_data = drive_client.download_pdf(item["pdf_data_id"])
