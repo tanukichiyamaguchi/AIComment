@@ -1,4 +1,4 @@
-"""drive_client モジュールの新規追加関数のテスト。"""
+"""drive_client モジュールの新規追加関数のテスト（共有ドライブ対応含む）。"""
 
 from __future__ import annotations
 
@@ -166,6 +166,83 @@ class TestUploadPdfToClinicPerson(unittest.TestCase):
         upload_kwargs = mock_upload.call_args.kwargs
         self.assertEqual(upload_kwargs["folder_id"], "person_id")
         self.assertEqual(upload_kwargs["file_name"], "事例A.pdf")
+
+
+class TestSharedDriveSupport(unittest.TestCase):
+    """共有ドライブ対応：すべての Drive API 呼び出しに supportsAllDrives=True が
+    渡されていることを検証する。これが無いと共有ドライブのフォルダにアクセスできず、
+    個人 Drive ではサービスアカウントの容量制限で 403 storageQuotaExceeded になる。
+    """
+
+    @patch("src.drive_client.get_drive_service")
+    def test_list_pdfs_passes_shared_drive_flags(self, mock_get_service):
+        service = MagicMock()
+        mock_get_service.return_value = service
+        service.files.return_value.list.return_value.execute.return_value = {
+            "files": []
+        }
+
+        drive_client.list_pdfs(folder_id="folder_id")
+
+        list_kwargs = service.files.return_value.list.call_args.kwargs
+        self.assertTrue(list_kwargs.get("supportsAllDrives"))
+        self.assertTrue(list_kwargs.get("includeItemsFromAllDrives"))
+
+    def test_find_or_create_folder_list_passes_shared_drive_flags(self):
+        service = MagicMock()
+        service.files.return_value.list.return_value.execute.return_value = {
+            "files": [{"id": "id", "name": "X"}]
+        }
+
+        drive_client.find_or_create_folder("X", "parent_id", service=service)
+
+        list_kwargs = service.files.return_value.list.call_args.kwargs
+        self.assertTrue(list_kwargs.get("supportsAllDrives"))
+        self.assertTrue(list_kwargs.get("includeItemsFromAllDrives"))
+
+    def test_find_or_create_folder_create_passes_shared_drive_flag(self):
+        service = MagicMock()
+        service.files.return_value.list.return_value.execute.return_value = {
+            "files": []
+        }
+        service.files.return_value.create.return_value.execute.return_value = {
+            "id": "new_id"
+        }
+
+        drive_client.find_or_create_folder("Y", "parent_id", service=service)
+
+        create_kwargs = service.files.return_value.create.call_args.kwargs
+        self.assertTrue(create_kwargs.get("supportsAllDrives"))
+
+    def test_upload_pdf_create_passes_shared_drive_flag(self):
+        service = MagicMock()
+        service.files.return_value.create.return_value.execute.return_value = {
+            "id": "id", "webViewLink": "url",
+        }
+        with TemporaryDirectory() as tmp:
+            pdf_path = Path(tmp) / "x.pdf"
+            pdf_path.write_bytes(b"%PDF")
+            drive_client.upload_pdf(
+                file_path=pdf_path,
+                folder_id="folder_id",
+                service=service,
+            )
+
+        create_kwargs = service.files.return_value.create.call_args.kwargs
+        self.assertTrue(create_kwargs.get("supportsAllDrives"))
+
+    @patch("src.drive_client.get_drive_service")
+    def test_download_pdf_passes_shared_drive_flag(self, mock_get_service):
+        service = MagicMock()
+        mock_get_service.return_value = service
+        # MediaIoBaseDownload の next_chunk が即終了するようモック
+        chunk_mock = MagicMock()
+        chunk_mock.next_chunk.return_value = (None, True)
+        with patch("src.drive_client.MediaIoBaseDownload", return_value=chunk_mock):
+            drive_client.download_pdf("file_xxx")
+
+        get_media_kwargs = service.files.return_value.get_media.call_args.kwargs
+        self.assertTrue(get_media_kwargs.get("supportsAllDrives"))
 
 
 if __name__ == "__main__":
