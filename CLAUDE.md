@@ -3,6 +3,16 @@
 ## Project Overview
 AI-powered code comment generation with workflow orchestration.
 
+## 実行環境の制約（絶対遵守）
+
+このプロジェクトの作業は **すべてクラウド環境で完結させる**。
+- 開発: GitHub Codespaces
+- 本番実行: GitHub Actions
+- OAuth等のセットアップ: Codespaces / Cloud Shell
+- ローカルPC実行は前提にしない・提案しない・要求しない
+
+ブラウザ認証など「ローカル前提」に見える処理であっても、Codespaces 内で完結する代替手段（手動URL貼付フロー / デバイスフロー / Cloud Shell移行 等）を必ず提示すること。
+
 ## Build & Test
 - `npm run build` — compile TypeScript
 - `npm test` — run tests with Node.js test runner
