@@ -43,12 +43,21 @@ https://www.googleapis.com/auth/spreadsheets
 https://www.googleapis.com/auth/gmail.compose
 ```
 
-トークンJSON生成手順（概要）：
+トークンJSON生成手順（**Codespacesで完結**、ローカルPCは不要）：
 
-1. GCPコンソール → APIとサービス → 認証情報 → 「OAuth 2.0 クライアント ID」を作成（種類：デスクトップアプリ）
-2. クライアントID/シークレットをダウンロード
-3. ローカルマシンで OAuth フローを1回実行し、`token.json` を生成（[Google公式サンプル](https://developers.google.com/drive/api/quickstart/python)）。下記の3スコープを必ず指定すること
-4. 生成された `token.json` の内容（`refresh_token` を含む）を `GOOGLE_OAUTH_TOKEN_JSON` Secret に貼り付ける
+1. GCPコンソール → APIとサービス → OAuth同意画面：User Type を **External**、テストユーザーに自分のGmailを追加、スコープに上記3つを追加
+2. GCPコンソール → APIとサービス → 認証情報 → 「OAuth 2.0 クライアント ID」を作成（種類：**デスクトップアプリ**）
+3. JSONをダウンロード → Codespaces の `AIComment/` 直下にドラッグ&ドロップでアップロード → ファイル名を **`client_secret.json`** にリネーム（`.gitignore` で保護済み、誤コミットされません）
+4. Codespacesターミナルで実行:
+   ```bash
+   pip install -r requirements.txt
+   python scripts/generate_oauth_token.py
+   ```
+5. スクリプトが表示する認証URLをブラウザで開き、Google認証 → 3スコープすべてを許可
+6. 認証後、ブラウザは「このサイトにアクセスできません」エラーになる（**正常**）。アドレスバーのURLを全部コピー → スクリプトに貼り付けて Enter
+7. 生成された `token.json` の内容（`refresh_token` を含む）を `GOOGLE_OAUTH_TOKEN_JSON` Secret に貼り付ける
+
+> ⚠️ `client_secret.json` は **絶対に Git コミットしない**こと。Public リポジトリの場合は瞬時に漏洩します。`.gitignore` で保護されていますが、念のため `git status` でステージされていないことを確認してください。
 
 ### 3. アセットファイル
 
