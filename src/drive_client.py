@@ -11,23 +11,45 @@ from typing import Any
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
-from src.config import DRIVE_FOLDER_ID, GOOGLE_CREDENTIALS_JSON, GOOGLE_SCOPES
+from src.config import (
+    DRIVE_FOLDER_ID,
+    GOOGLE_CREDENTIALS_JSON,
+    GOOGLE_OAUTH_TOKEN_JSON,
+    GOOGLE_SCOPES,
+)
 
 logger = logging.getLogger("jissen_comment")
 
 
 def _get_credentials() -> Any:
-    """環境に応じた認証情報を取得する。Colab優先、次にサービスアカウント。"""
+    """Drive API用の認証情報を取得する。
+
+    優先順位：
+    1. Colab認証
+    2. OAuthユーザートークン — サービスアカウントは My Drive 配下に
+       アップロードすると storageQuotaExceeded になるため、ユーザー認可で
+       実行することでファイル所有者をユーザーに固定する。
+    3. サービスアカウント（共有ドライブ宛なら有効）
+    4. ADC（Workload Identity 連携 / gcloud auth）
+    """
     # Colab認証を試行
     try:
         import google.colab.auth  # type: ignore
         google.colab.auth.authenticate_user()
         from google.auth import default
         creds, _ = default(scopes=GOOGLE_SCOPES)
-        logger.info("Google認証: Colab認証を使用")
+        logger.info("Drive認証: Colab認証を使用")
         return creds
     except ImportError:
         pass
+
+    # OAuthユーザートークン（My Drive へのアップロードに必須）
+    if GOOGLE_OAUTH_TOKEN_JSON:
+        from google.oauth2.credentials import Credentials
+        info = json.loads(GOOGLE_OAUTH_TOKEN_JSON)
+        creds = Credentials.from_authorized_user_info(info)
+        logger.info("Drive認証: OAuthユーザートークンを使用")
+        return creds
 
     # サービスアカウント認証（JSON直接指定）
     if GOOGLE_CREDENTIALS_JSON:
@@ -36,21 +58,22 @@ def _get_credentials() -> Any:
         creds = service_account.Credentials.from_service_account_info(
             info, scopes=GOOGLE_SCOPES
         )
-        logger.info("Google認証: サービスアカウントを使用")
+        logger.info("Drive認証: サービスアカウントを使用")
         return creds
 
     # ADC（Workload Identity 連携 / gcloud auth）
     try:
         from google.auth import default
         creds, _ = default(scopes=GOOGLE_SCOPES)
-        logger.info("Google認証: Application Default Credentialsを使用")
+        logger.info("Drive認証: Application Default Credentialsを使用")
         return creds
     except Exception:
         pass
 
     raise RuntimeError(
         "Google認証情報が見つかりません。"
-        "Colab環境、GOOGLE_CREDENTIALS_JSON環境変数、"
+        "Colab環境、GOOGLE_OAUTH_TOKEN_JSON / GMAIL_TOKEN_JSON、"
+        "GOOGLE_CREDENTIALS_JSON、"
         "またはApplication Default Credentialsを設定してください。"
     )
 

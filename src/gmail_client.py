@@ -13,7 +13,11 @@ from typing import Any
 
 from googleapiclient.discovery import build
 
-from src.config import GOOGLE_CREDENTIALS_JSON, GMAIL_TOKEN_JSON, GOOGLE_SCOPES
+from src.config import (
+    GOOGLE_CREDENTIALS_JSON,
+    GOOGLE_OAUTH_TOKEN_JSON,
+    GOOGLE_SCOPES,
+)
 
 logger = logging.getLogger("jissen_comment")
 
@@ -46,10 +50,10 @@ def _get_gmail_credentials() -> Any:
     except ImportError:
         pass
 
-    # OAuthトークン（GitHub Actions用）
-    if GMAIL_TOKEN_JSON:
+    # OAuthトークン（GitHub Actions用 / GOOGLE_OAUTH_TOKEN_JSON または旧 GMAIL_TOKEN_JSON）
+    if GOOGLE_OAUTH_TOKEN_JSON:
         from google.oauth2.credentials import Credentials
-        info = json.loads(GMAIL_TOKEN_JSON)
+        info = json.loads(GOOGLE_OAUTH_TOKEN_JSON)
         creds = Credentials.from_authorized_user_info(info)
         logger.info("Gmail認証: OAuthトークンを使用")
         return creds

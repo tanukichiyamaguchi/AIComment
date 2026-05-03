@@ -36,6 +36,12 @@ SPREADSHEET_ID = _get_secret("SPREADSHEET_ID")
 GMAIL_TOKEN_JSON = _get_secret("GMAIL_TOKEN_JSON")
 GOOGLE_CREDENTIALS_JSON = _get_secret("GOOGLE_CREDENTIALS_JSON")
 
+# OAuthユーザートークン（Drive/Sheets/Gmail共通）。
+# サービスアカウントは My Drive 配下にファイルをアップロードできない（storageQuotaExceeded）
+# ため、Drive書き込み時はユーザー認可トークンを優先する。
+# 旧 GMAIL_TOKEN_JSON も後方互換でフォールバックとして使用する。
+GOOGLE_OAUTH_TOKEN_JSON = _get_secret("GOOGLE_OAUTH_TOKEN_JSON") or GMAIL_TOKEN_JSON
+
 GOOGLE_SCOPES = [
     "https://www.googleapis.com/auth/drive",
     "https://www.googleapis.com/auth/spreadsheets",
