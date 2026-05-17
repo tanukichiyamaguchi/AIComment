@@ -1,0 +1,12 @@
+display_name: "実践事例 2024年度 Q2"
+document_type: jissen_practice_case
+period: "2024_q2"
+
+input_folder_id_secret: DRIVE_FOLDER_JISSEN_2024_Q2
+output_folder_id_secret: DRIVE_OUTPUT_JISSEN_2024_Q2
+
+output_sheet_name: "実践事例_2024Q2_出力一覧"
+
+management_number_prefix: "J24Q2-"
+
+prompt_template: jissen_practice_case

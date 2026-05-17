@@ -3,6 +3,11 @@
 事前のスプレッドシート入力（Sheet1）は不要。Drive上の全PDFを取得し、
 Claude APIで医院名・氏名・実践事例タイトル・コメントを抽出/生成、
 コメント付きPDFをDriveに「医院名/個人名/」階層で保存し、出力一覧シートに記録する。
+
+プロファイル制度:
+    ``--profile <name>`` で profiles/<name>.yaml を読み込み、
+    入力フォルダ・出力フォルダ・出力シート名・管理番号 prefix を切り替える。
+    デフォルトの ``jissen_default`` は既存挙動を完全維持する。
 """
 
 from __future__ import annotations
@@ -14,15 +19,20 @@ import time
 from pathlib import Path
 
 from src.utils import setup_logging, ensure_fonts
-from src.config import DRIVE_OUTPUT_FOLDER_ID, LOGS_DIR
+from src.config import LOGS_DIR
 from src import drive_client, sheets_client
 from src import pdf_reader, comment_generator, pdf_creator, pdf_merger
+from src.profile import ProfileConfig, load_profile
 
 
-def step1_prepare(test_count: int = 0) -> list[dict]:
+def step1_prepare(
+    profile: ProfileConfig,
+    test_count: int = 0,
+) -> list[dict]:
     """Step 1: 準備 — PDF取得・テキスト抽出。
 
     Args:
+        profile: 実行時プロファイル
         test_count: テスト件数（0=全件処理）
 
     Returns:
@@ -31,7 +41,7 @@ def step1_prepare(test_count: int = 0) -> list[dict]:
     logger = setup_logging()
     logger.info("=== Step 1: 準備 ===")
 
-    pdf_files = drive_client.list_pdfs()
+    pdf_files = drive_client.list_pdfs(folder_id=profile.input_folder_id)
     if test_count > 0:
         pdf_files = pdf_files[:test_count]
         logger.info(f"テストモード: {test_count}件に制限")
@@ -137,20 +147,19 @@ def step3_wait_and_get_results(
 
 
 def step4_generate_pdfs(
+    profile: ProfileConfig,
     results: dict[str, dict[str, str]],
     items: list[dict] | None = None,
 ) -> None:
     """Step 4: PDF生成 → Drive保存 → 出力一覧シート追記。
 
     Args:
+        profile: 実行時プロファイル
         results: ``{custom_id: {clinic_name, person_name, sample_title, comment}}``
         items: 準備データ（Noneの場合はファイルから読み込み）
     """
     logger = setup_logging()
     logger.info("=== Step 4: PDF生成 & Drive保存 ===")
-
-    if not DRIVE_OUTPUT_FOLDER_ID:
-        raise RuntimeError("DRIVE_OUTPUT_FOLDER_ID が設定されていません")
 
     ensure_fonts()
 
@@ -159,8 +168,15 @@ def step4_generate_pdfs(
         items = json.loads(prep_file.read_text())
 
     # 管理番号の採番起点：既存シートの最大値を取得し、以降の連番はこの値+1から発行する
-    initial_max = sheets_client.get_max_management_number()
-    logger.info(f"管理番号 採番起点: {initial_max} (次の発行は {initial_max + 1:06d})")
+    initial_max = sheets_client.get_max_management_number(
+        sheet_name=profile.output_sheet_name,
+        prefix=profile.management_number_prefix or None,
+    )
+    prefix = profile.management_number_prefix
+    logger.info(
+        f"管理番号 採番起点: {initial_max} "
+        f"(次の発行は {prefix}{initial_max + 1:06d})"
+    )
 
     stats = {"success": 0, "error": 0, "missing": 0}
     processed = 0  # シートに書き込んだ件数（success と独立して管理番号採番に使う）
@@ -204,19 +220,20 @@ def step4_generate_pdfs(
 
                 upload_result = drive_client.upload_pdf_to_clinic_person(
                     file_path=output_path,
-                    output_root_folder_id=DRIVE_OUTPUT_FOLDER_ID,
+                    output_root_folder_id=profile.output_folder_id,
                     clinic_name=clinic_name,
                     person_name=person_name,
                     file_name=output_filename,
                 )
 
-            mgmt_num = f"{initial_max + processed + 1:06d}"
+            mgmt_num = f"{prefix}{initial_max + processed + 1:06d}"
             sheets_client.append_output_record(
                 management_number=mgmt_num,
                 clinic_name=clinic_name,
                 person_name=person_name,
                 sample_name=sample_title,
                 drive_url=upload_result["webViewLink"],
+                sheet_name=profile.output_sheet_name,
             )
             processed += 1
             logger.info(
@@ -244,6 +261,7 @@ def run(
     test_count: int = 0,
     batch_id: str | None = None,
     step: str = "all",
+    profile_name: str = "jissen_default",
 ) -> None:
     """Batchモードのメイン処理。
 
@@ -252,20 +270,27 @@ def run(
         test_count: テスト件数（0=全件）
         batch_id: 既存のバッチID（Step 3から再開する場合）
         step: 実行するステップ ("all", "prepare", "submit", "results", "pdfs")
+        profile_name: プロファイル名（``profiles/<name>.yaml``）
     """
     logger = setup_logging()
     logger.info("=== じっせん君コメントシステム（Batchモード）開始 ===")
 
     if not batch_mode:
         from src.main import run as run_normal
-        run_normal(test_count=test_count)
+        run_normal(test_count=test_count, profile_name=profile_name)
         return
+
+    profile = load_profile(profile_name)
+    logger.info(
+        f"プロファイル: {profile.display_name} ({profile.name}, "
+        f"document_type={profile.document_type}, period={profile.period})"
+    )
 
     items: list[dict] | None = None
     results: dict[str, dict[str, str]] | None = None
 
     if step in ("all", "prepare"):
-        items = step1_prepare(test_count=test_count)
+        items = step1_prepare(profile, test_count=test_count)
 
     if step in ("all", "submit"):
         if items is None:
@@ -284,7 +309,7 @@ def run(
     if step in ("all", "pdfs"):
         if results is None:
             raise RuntimeError("results が未取得です。step=results を先に実行してください")
-        step4_generate_pdfs(results, items=items)
+        step4_generate_pdfs(profile, results, items=items)
 
     logger.info("=== Batchモード処理完了 ===")
 
@@ -308,6 +333,13 @@ def main() -> None:
         choices=["all", "prepare", "submit", "results", "pdfs"],
         help="実行するステップ",
     )
+    parser.add_argument(
+        "--profile", type=str, default="jissen_default",
+        help=(
+            "プロファイル名（profiles/<name>.yaml）。"
+            "省略時は jissen_default（既存挙動）"
+        ),
+    )
     args = parser.parse_args()
 
     run(
@@ -315,6 +347,7 @@ def main() -> None:
         test_count=args.test_count,
         batch_id=args.batch_id,
         step=args.step,
+        profile_name=args.profile,
     )
 
 

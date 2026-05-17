@@ -254,5 +254,128 @@ class TestGetMaxManagementNumber(unittest.TestCase):
                 sheets_client.get_max_management_number()
 
 
+class TestGetMaxManagementNumberWithPrefix(unittest.TestCase):
+    """マルチプロファイル：管理番号 prefix（例 ``J24Q1-``）対応のテスト。"""
+
+    @patch("src.sheets_client.get_sheets_service")
+    def test_extracts_max_from_prefixed_rows(self, mock_get_service):
+        """prefix 指定時は prefix 付き行から数値部の最大値を取得する。"""
+        service = _build_service_with_sheets(["実践事例_2024Q1_出力一覧"])
+        service.spreadsheets.return_value.values.return_value.get.return_value.execute.side_effect = [
+            {"values": [["管理番号"]]},  # _ensure_output_sheet
+            {
+                "values": [
+                    ["管理番号"],  # ヘッダー
+                    ["J24Q1-000001"],
+                    ["J24Q1-000010"],
+                    ["J24Q1-000003"],
+                ]
+            },
+        ]
+        mock_get_service.return_value = service
+
+        result = sheets_client.get_max_management_number(
+            spreadsheet_id="sid",
+            sheet_name="実践事例_2024Q1_出力一覧",
+            prefix="J24Q1-",
+        )
+        self.assertEqual(result, 10)
+
+    @patch("src.sheets_client.get_sheets_service")
+    def test_ignores_rows_with_other_prefixes(self, mock_get_service):
+        """異なる prefix の行はカウントしない（プロファイル間の相互汚染防止）。"""
+        service = _build_service_with_sheets(["s"])
+        service.spreadsheets.return_value.values.return_value.get.return_value.execute.side_effect = [
+            {"values": [["管理番号"]]},
+            {
+                "values": [
+                    ["管理番号"],
+                    ["J24Q1-000001"],
+                    ["J24Q2-000999"],  # 別四半期 → 無視
+                    ["000888"],  # prefix なし → 無視
+                    ["J24Q1-000005"],
+                ]
+            },
+        ]
+        mock_get_service.return_value = service
+
+        result = sheets_client.get_max_management_number(
+            spreadsheet_id="sid",
+            sheet_name="s",
+            prefix="J24Q1-",
+        )
+        self.assertEqual(result, 5)
+
+    @patch("src.sheets_client.get_sheets_service")
+    def test_prefix_none_preserves_legacy_behavior(self, mock_get_service):
+        """prefix=None（既存挙動）：純粋数値セルのみを対象、prefix 付きは無視。"""
+        service = _build_service_with_sheets(["出力一覧"])
+        service.spreadsheets.return_value.values.return_value.get.return_value.execute.side_effect = [
+            {"values": [["管理番号"]]},
+            {
+                "values": [
+                    ["管理番号"],
+                    ["000001"],
+                    ["J24Q1-999999"],  # prefix 付きは prefix=None 時に無視されるべき
+                    ["000007"],
+                ]
+            },
+        ]
+        mock_get_service.return_value = service
+
+        result = sheets_client.get_max_management_number(
+            spreadsheet_id="sid",
+            sheet_name="出力一覧",
+            # prefix を渡さない＝既存挙動
+        )
+        self.assertEqual(result, 7)
+
+    @patch("src.sheets_client.get_sheets_service")
+    def test_prefix_empty_string_preserves_legacy_behavior(self, mock_get_service):
+        """prefix=""（jissen_default の値）は None と同じ既存挙動。"""
+        service = _build_service_with_sheets(["出力一覧"])
+        service.spreadsheets.return_value.values.return_value.get.return_value.execute.side_effect = [
+            {"values": [["管理番号"]]},
+            {
+                "values": [
+                    ["管理番号"],
+                    ["000003"],
+                    ["000012"],
+                ]
+            },
+        ]
+        mock_get_service.return_value = service
+
+        result = sheets_client.get_max_management_number(
+            spreadsheet_id="sid",
+            sheet_name="出力一覧",
+            prefix="",  # falsy → 既存挙動
+        )
+        self.assertEqual(result, 12)
+
+    @patch("src.sheets_client.get_sheets_service")
+    def test_returns_zero_when_no_prefix_match(self, mock_get_service):
+        """prefix に一致する行が一つもなければ 0。"""
+        service = _build_service_with_sheets(["s"])
+        service.spreadsheets.return_value.values.return_value.get.return_value.execute.side_effect = [
+            {"values": [["管理番号"]]},
+            {
+                "values": [
+                    ["管理番号"],
+                    ["J24Q2-000001"],
+                    ["000999"],
+                ]
+            },
+        ]
+        mock_get_service.return_value = service
+
+        result = sheets_client.get_max_management_number(
+            spreadsheet_id="sid",
+            sheet_name="s",
+            prefix="J24Q1-",
+        )
+        self.assertEqual(result, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

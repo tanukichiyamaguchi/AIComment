@@ -76,10 +76,21 @@ Apps Script が GitHub Actions を起動するための認証トークンを発�
      - `いいえ`
    - 右下「必須」を ON
    - 三点メニュー →「説明」→「通常はそのまま『はい』で OK。即時実行が必要なときだけ『いいえ』」と入力
-7. 上部の「**回答**」タブを開く → 緑色のスプレッドシートアイコン「**スプレッドシートにリンク**」を押す
+7. 右側ツールバーの「**＋**」で **質問 3 を追加**:
+   - 質問文: **「プロファイル（処理対象の四半期 / 文書種別）」**
+   - 回答形式: **「プルダウン」**（または「ラジオボタン」でも可）
+   - 選択肢（**スペル完全一致が必須** — Apps Script で素通しするため）:
+     - `jissen_default`
+     - `jissen_2024_q1`
+     - `jissen_2024_q2`
+     - `jissen_2024_q3`
+     - `jissen_2024_q4`
+   - 右下「必須」を ON
+   - 三点メニュー →「説明」→「通常は `jissen_default`（既存挙動）。期間別の出力を分けたいときだけ該当の四半期を選ぶ」と入力
+8. 上部の「**回答**」タブを開く → 緑色のスプレッドシートアイコン「**スプレッドシートにリンク**」を押す
    - 「**新しいスプレッドシートを作成**」→ 名前は **「じっせん君コメント生成 実行ログ」** など
    - 既存の出力一覧シートとは **別ファイル** にすること（混在させない）
-8. 上部「**プレビュー（目のアイコン）**」で動作確認
+9. 上部「**プレビュー（目のアイコン）**」で動作確認
 
 ---
 
@@ -155,7 +166,19 @@ PAT などの秘密値をコードに直書きしないため、スクリプト�
  * フォームの想定質問:
  *   1. 「件数（0なら全件）」 : 短文回答 / 数値
  *   2. 「Batch API を使う（50%割引、推奨）」 : ラジオボタン「はい」「いいえ」
+ *   3. 「プロファイル（処理対象の四半期 / 文書種別）」 : プルダウン
+ *        選択肢は jissen_default / jissen_2024_q1 〜 q4 のいずれか
  */
+
+// プロファイル名の許可リスト（ホワイトリスト）。
+// ここに無い値はフォームから送られても弾く（GitHub Actions に不正入力を流さない）。
+var ALLOWED_PROFILES = [
+  'jissen_default',
+  'jissen_2024_q1',
+  'jissen_2024_q2',
+  'jissen_2024_q3',
+  'jissen_2024_q4',
+];
 
 // ============================================================================
 // エントリポイント: フォーム送信時に Apps Script が自動実行
@@ -226,6 +249,7 @@ function parseFormResponse_(e) {
 
   let testCount = '0';
   let batchMode = 'true';
+  let profile = 'jissen_default';
 
   itemResponses.forEach(function (itemResponse) {
     const title = (itemResponse.getItem().getTitle() || '').trim();
@@ -247,12 +271,22 @@ function parseFormResponse_(e) {
       } else {
         throw new Error('「Batch API を使う」には「はい」「いいえ」のいずれかを選んでください。入力値: ' + answer);
       }
+    } else if (title.indexOf('プロファイル') !== -1 || title.toLowerCase().indexOf('profile') !== -1) {
+      // ホワイトリスト照合（タイポや未知の値は拒否）
+      if (ALLOWED_PROFILES.indexOf(answer) === -1) {
+        throw new Error(
+          '「プロファイル」には次のいずれかを選んでください: ' +
+          ALLOWED_PROFILES.join(', ') + '。入力値: ' + answer
+        );
+      }
+      profile = answer;
     }
   });
 
   return {
     test_count: testCount,
     batch_mode: batchMode,
+    profile: profile,
   };
 }
 
@@ -268,6 +302,7 @@ function dispatchWorkflow_(config, inputs) {
   const payload = {
     ref: config.WORKFLOW_REF,
     inputs: {
+      profile: inputs.profile,
       batch_mode: inputs.batch_mode,
       test_count: inputs.test_count,
     },
@@ -346,7 +381,7 @@ function writeStatusToSheet_(e, statusText) {
 // ============================================================================
 function testDispatch() {
   const config = loadConfig_();
-  const inputs = { test_count: '1', batch_mode: 'false' };
+  const inputs = { test_count: '1', batch_mode: 'false', profile: 'jissen_default' };
   const result = dispatchWorkflow_(config, inputs);
   console.log('testDispatch OK', result);
 }
@@ -387,7 +422,8 @@ function formatJst_(date) {
 | `GitHub 認証エラー (401)` | PAT を再発行し `GITHUB_PAT` を上書き |
 | `GitHub 権限エラー (403)` | PAT の「Repository permissions → Actions」が **Read and write** か |
 | `GitHub リソースが見つかりません (404)` | `GITHUB_OWNER` / `GITHUB_REPO` / `WORKFLOW_FILE` / `WORKFLOW_REF` のスペルを再確認 |
-| `バリデーションエラー (422)` | フォームの質問タイトル（「件数」「Batch」を含む）が変わっていないか |
+| `バリデーションエラー (422)` | フォームの質問タイトル（「件数」「Batch」「プロファイル」を含む）が変わっていないか |
+| `「プロファイル」には次のいずれかを選んでください` | 質問 3 の選択肢が `jissen_default` / `jissen_2024_q1` 〜 `q4` のスペル完全一致になっているか |
 | GitHub Actions が起動するが処理がエラー | これは Apps Script の責任範囲外。`Generate Jissen Comments` のログを直接確認 |
 
 ネットワーク一時エラー時のリトライ機構は入れていません。フォームを再送信してください。
