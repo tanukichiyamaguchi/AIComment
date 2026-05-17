@@ -177,3 +177,7 @@ python -m src.batch_main --batch-id msgbatch_xxx --step results
 ├── logs/                     # 実行ログ
 └── .github/workflows/        # GitHub Actions
 ```
+
+## 非開発者向けの実行方法
+
+GitHub アカウントを持たない事務スタッフ等にも `Generate Jissen Comments` ワークフローを起動してもらえます。Google フォーム → Apps Script → GitHub Actions の連携で、フォーム送信だけで実行できる仕組みです。セットアップ手順（PAT 作成、フォーム作成、Apps Script コード、テスト方法、共有時のセキュリティ注意点）は [`docs/google_form_setup.md`](docs/google_form_setup.md) を参照してください。
