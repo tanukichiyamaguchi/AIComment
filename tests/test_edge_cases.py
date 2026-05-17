@@ -607,29 +607,39 @@ class TestFindOrCreateFolderEdgeCases(unittest.TestCase):
         )
         self.assertEqual(result, "existing")
 
-    @pytest.mark.skip(
-        reason=(
-            "Bug found (severity=high): drive_client.find_or_create_folder は "
-            "pageSize=1000 のみで pageToken を辿らない。1001 件目以降に "
-            "ある既存フォルダは検出されず、重複フォルダ作成されるリスク。"
-            "後続 PR で list_pdfs と同様の pageToken ループ実装を検討。"
-        )
-    )
     def test_detects_duplicate_beyond_first_page(self):
-        """1001 件目以降の既存フォルダも見つかるべき（現状は見つからない）。"""
-        files = [{"id": f"id_{i}", "name": f"other_{i}"} for i in range(1001)]
-        files.append({"id": "existing_late", "name": "対象医院"})  # 1002 番目
+        """1001 件目以降の既存フォルダも見つかるべき。
+
+        pageSize=1000 を超える数のフォルダが親配下にある場合、Drive API は
+        1 ページに 1000 件 + nextPageToken を返す。``find_or_create_folder``
+        が nextPageToken をループせず最初の 1 ページしか見ないと、
+        2 ページ目以降にある既存フォルダを検出できず重複作成されてしまう。
+
+        本テストは page1 = 1000 件のダミー / page2 = 既存 1 件を返すモックで
+        pageToken のループが実装されていることを検証する。
+        """
+        page1_files = [
+            {"id": f"id_{i}", "name": f"other_{i}"} for i in range(1000)
+        ]
+        page2_files = [{"id": "existing_late", "name": "対象医院"}]
         service = MagicMock()
-        service.files.return_value.list.return_value.execute.return_value = {
-            "files": files,
-            "nextPageToken": "page2",
-        }
+        service.files.return_value.list.return_value.execute.side_effect = [
+            {"files": page1_files, "nextPageToken": "page2"},
+            {"files": page2_files},  # nextPageToken なしで終了
+        ]
         result = drive_client.find_or_create_folder(
             "対象医院", "parent_id", service=service
         )
-        # 期待：1001 件目以降の既存を再利用する
+        # 期待：page2 にある既存を再利用する
         self.assertEqual(result, "existing_late")
         service.files.return_value.create.assert_not_called()
+        # 2 回 list が呼ばれた（page1 → page2）ことを検証
+        self.assertEqual(
+            service.files.return_value.list.return_value.execute.call_count, 2
+        )
+        # 2 回目の呼び出しに pageToken="page2" が含まれること
+        second_list_kwargs = service.files.return_value.list.call_args_list[1].kwargs
+        self.assertEqual(second_list_kwargs.get("pageToken"), "page2")
 
     def test_raises_on_null_folder_name(self):
         """``None`` の folder_name → 現実装では ``if not folder_name:`` で ValueError。"""
