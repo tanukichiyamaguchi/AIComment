@@ -534,21 +534,31 @@ class TestMakeOutputFilenameEdgeCases(unittest.TestCase):
         self.assertGreater(len(person), 0)
         self.assertGreater(len(title), 0)
 
-    @pytest.mark.skip(
-        reason=(
-            "Bug found (severity=low): sample_title に既に '.pdf' が "
-            "含まれている場合、現実装は二重拡張子 '...＿xxx.pdf.pdf' を生成する。"
-            "comment_generator が拡張子ありで返す可能性は低いが、"
-            "防御的に _sanitize_filename で .pdf を 1 つだけ残す処理を入れる "
-            "ことを後続 PR で検討。"
-        )
-    )
     def test_double_extension_is_collapsed(self):
-        """``sample_title="x.pdf"`` の場合に ``.pdf.pdf`` にならない。"""
+        """``sample_title="x.pdf"`` の場合に ``.pdf.pdf`` にならない。
+
+        AI 抽出やファイル名直接渡しで sample_title に既に ``.pdf`` が含まれる
+        ケースがある（特に元ファイル名をそのまま title に転記する場合）。
+        二重拡張子 ``...x.pdf.pdf`` は OS / Drive 上で混乱を招くため、
+        合成前に末尾 ``.pdf`` を 1 回だけ削る。
+        """
         result = make_output_filename("A", "B", "x.pdf")
         # 期待: ".pdf" は 1 回だけ末尾に付く
         self.assertEqual(result.count(".pdf"), 1)
         self.assertTrue(result.endswith(".pdf"))
+        # 内部の "x" は保持される
+        self.assertIn("＿x.pdf", result)
+
+    def test_double_extension_case_insensitive(self):
+        """``.PDF`` ``.Pdf`` などの大小区別違いも畳まれる。"""
+        for suffix in (".PDF", ".Pdf", ".pDF"):
+            with self.subTest(suffix=suffix):
+                result = make_output_filename("A", "B", f"x{suffix}")
+                self.assertEqual(
+                    result.lower().count(".pdf"), 1,
+                    f"{suffix} で .pdf が複数残った: {result}",
+                )
+                self.assertTrue(result.endswith(".pdf"))
 
     def test_empty_strings_produce_unknown_fallback(self):
         """全要素が空文字なら ``unknown`` フォールバック x3 になる。"""

@@ -70,10 +70,19 @@ def make_output_filename(clinic_name: str, person_name: str, sample_title: str) 
 
     OS 制限の 255 バイトを超えないよう、UTF-8 バイト長ベースで各セクションを
     均等に切り詰める。短い名前はそのまま、長い名前だけが削られる。
+
+    また、``sample_title`` に既に ``.pdf``（大小区別なし）が含まれる場合は
+    取り除いてから合成し、``.pdf.pdf`` のような二重拡張子を防ぐ
+    （lessons.md P-012 参照）。
     """
     safe_clinic = _sanitize_filename(clinic_name)
     safe_person = _sanitize_filename(person_name)
     safe_title = _sanitize_filename(sample_title)
+
+    # 拡張子は make_output_filename が単一の付与責務を持つ。入力に含まれて
+    # いれば一度だけ取り除いて、最後に ``.pdf`` を 1 回だけ付与する。
+    if safe_title.lower().endswith(_FILENAME_EXTENSION):
+        safe_title = safe_title[: -len(_FILENAME_EXTENSION)] or "unknown"
 
     # 区切り文字 x 2 と拡張子の固定オーバーヘッドを差し引いた残りを
     # 3 セクションに割り当てる。
