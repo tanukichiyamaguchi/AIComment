@@ -44,7 +44,12 @@ def run(test_count: int = 0) -> None:
 
     logger.info(f"処理対象: {len(pdf_files)}件のPDF")
 
+    # 管理番号の採番起点：既存シートの最大値を取得し、以降の連番はこの値+1から発行する
+    initial_max = sheets_client.get_max_management_number()
+    logger.info(f"管理番号 採番起点: {initial_max} (次の発行は {initial_max + 1:06d})")
+
     stats = {"success": 0, "skip": 0, "error": 0}
+    processed = 0  # シートに書き込んだ件数（success と独立して管理番号採番に使う）
 
     for i, pdf_file in enumerate(pdf_files, start=1):
         file_id = pdf_file["id"]
@@ -96,15 +101,18 @@ def run(test_count: int = 0) -> None:
                     file_name=output_filename,
                 )
 
+            mgmt_num = f"{initial_max + processed + 1:06d}"
             sheets_client.append_output_record(
+                management_number=mgmt_num,
                 clinic_name=clinic_name,
                 person_name=person_name,
                 sample_name=sample_title,
                 drive_url=upload_result["webViewLink"],
             )
+            processed += 1
 
             logger.info(
-                f"完了: {clinic_name} / {person_name} / {sample_title}"
+                f"完了: {mgmt_num} / {clinic_name} / {person_name} / {sample_title}"
             )
             stats["success"] += 1
 

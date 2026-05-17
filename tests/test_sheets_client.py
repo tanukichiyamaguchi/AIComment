@@ -31,6 +31,7 @@ class TestAppendOutputRecord(unittest.TestCase):
         mock_get_service.return_value = service
 
         sheets_client.append_output_record(
+            management_number="000001",
             clinic_name="三浦歯科医院",
             person_name="白川 蓮",
             sample_name="新患獲得.pdf",
@@ -48,18 +49,20 @@ class TestAppendOutputRecord(unittest.TestCase):
 
         # ヘッダー書き込み + データ追加 の両方が values.update / values.append で呼ばれた
         update_call = service.spreadsheets.return_value.values.return_value.update.call_args
-        self.assertIn("出力一覧!A1:E1", update_call.kwargs["range"])
+        self.assertIn("出力一覧!A1:F1", update_call.kwargs["range"])
         header_values = update_call.kwargs["body"]["values"][0]
         self.assertEqual(
-            header_values, ["医院名", "個人名", "実践事例名", "Drive URL", "処理日時"]
+            header_values,
+            ["管理番号", "医院名", "個人名", "実践事例名", "Drive URL", "処理日時"],
         )
 
         append_call = service.spreadsheets.return_value.values.return_value.append.call_args
-        self.assertIn("出力一覧!A:E", append_call.kwargs["range"])
+        self.assertIn("出力一覧!A:F", append_call.kwargs["range"])
         appended_row = append_call.kwargs["body"]["values"][0]
         self.assertEqual(
             appended_row,
             [
+                "000001",
                 "三浦歯科医院",
                 "白川 蓮",
                 "新患獲得.pdf",
@@ -73,11 +76,14 @@ class TestAppendOutputRecord(unittest.TestCase):
         service = _build_service_with_sheets(["Sheet1", "出力一覧"])
         # ヘッダーが既にあると見せかける
         service.spreadsheets.return_value.values.return_value.get.return_value.execute.return_value = {
-            "values": [["医院名", "個人名", "実践事例名", "Drive URL", "処理日時"]]
+            "values": [
+                ["管理番号", "医院名", "個人名", "実践事例名", "Drive URL", "処理日時"]
+            ]
         }
         mock_get_service.return_value = service
 
         sheets_client.append_output_record(
+            management_number="000042",
             clinic_name="A",
             person_name="B",
             sample_name="x.pdf",
@@ -95,11 +101,12 @@ class TestAppendOutputRecord(unittest.TestCase):
     def test_uses_default_sheet_name_when_omitted(self, mock_get_service):
         service = _build_service_with_sheets(["出力一覧"])
         service.spreadsheets.return_value.values.return_value.get.return_value.execute.return_value = {
-            "values": [["医院名"]]
+            "values": [["管理番号"]]
         }
         mock_get_service.return_value = service
 
         sheets_client.append_output_record(
+            management_number="000001",
             clinic_name="A",
             person_name="B",
             sample_name="x.pdf",
@@ -115,11 +122,136 @@ class TestAppendOutputRecord(unittest.TestCase):
         with patch.object(sheets_client, "SPREADSHEET_ID", ""):
             with self.assertRaises(ValueError):
                 sheets_client.append_output_record(
+                    management_number="000001",
                     clinic_name="A",
                     person_name="B",
                     sample_name="x.pdf",
                     drive_url="url",
                 )
+
+    @patch("src.sheets_client.get_sheets_service")
+    def test_appends_six_columns_with_management_number(self, mock_get_service):
+        """append_output_record が 6 項目（管理番号含む）で書き込むことを検証。"""
+        service = _build_service_with_sheets(["出力一覧"])
+        service.spreadsheets.return_value.values.return_value.get.return_value.execute.return_value = {
+            "values": [["管理番号"]]
+        }
+        mock_get_service.return_value = service
+
+        sheets_client.append_output_record(
+            management_number="000123",
+            clinic_name="クリニック",
+            person_name="山田",
+            sample_name="title.pdf",
+            drive_url="https://drive.example/view",
+            spreadsheet_id="sid",
+            sheet_name="出力一覧",
+            processed_at="2026-05-17 10:00:00",
+        )
+
+        append_call = service.spreadsheets.return_value.values.return_value.append.call_args
+        appended_row = append_call.kwargs["body"]["values"][0]
+        self.assertEqual(len(appended_row), 6)
+        self.assertEqual(appended_row[0], "000123")
+        self.assertEqual(appended_row[1], "クリニック")
+        self.assertEqual(appended_row[2], "山田")
+        self.assertEqual(appended_row[3], "title.pdf")
+        self.assertEqual(appended_row[4], "https://drive.example/view")
+        self.assertEqual(appended_row[5], "2026-05-17 10:00:00")
+
+
+class TestGetMaxManagementNumber(unittest.TestCase):
+
+    @patch("src.sheets_client.get_sheets_service")
+    def test_returns_max_from_multiple_rows(self, mock_get_service):
+        """複数行から数値の最大値を返す。"""
+        service = _build_service_with_sheets(["出力一覧"])
+        # _ensure_output_sheet 内のヘッダー確認 → 既にあるとして空にしない値を返す
+        # その後 A:A の取得で実データを返す。
+        # MagicMock の get().execute() は同じインスタンスを返すので side_effect で順序制御。
+        service.spreadsheets.return_value.values.return_value.get.return_value.execute.side_effect = [
+            # _ensure_output_sheet のヘッダー読み取り（既存あり）
+            {"values": [["管理番号", "医院名", "個人名", "実践事例名", "Drive URL", "処理日時"]]},
+            # A列の読み取り
+            {
+                "values": [
+                    ["管理番号"],  # ヘッダー
+                    ["000001"],
+                    ["000005"],
+                    ["000003"],
+                ]
+            },
+        ]
+        mock_get_service.return_value = service
+
+        result = sheets_client.get_max_management_number(
+            spreadsheet_id="sid", sheet_name="出力一覧"
+        )
+        self.assertEqual(result, 5)
+
+    @patch("src.sheets_client.get_sheets_service")
+    def test_returns_zero_for_empty_sheet(self, mock_get_service):
+        """空シート（ヘッダーのみ or 完全に空）の場合は 0 を返す。"""
+        service = _build_service_with_sheets(["出力一覧"])
+        service.spreadsheets.return_value.values.return_value.get.return_value.execute.side_effect = [
+            # _ensure_output_sheet のヘッダー読み取り（既存あり）
+            {"values": [["管理番号", "医院名", "個人名", "実践事例名", "Drive URL", "処理日時"]]},
+            # A列の読み取り → ヘッダー行のみ
+            {"values": [["管理番号"]]},
+        ]
+        mock_get_service.return_value = service
+
+        result = sheets_client.get_max_management_number(
+            spreadsheet_id="sid", sheet_name="出力一覧"
+        )
+        self.assertEqual(result, 0)
+
+    @patch("src.sheets_client.get_sheets_service")
+    def test_returns_zero_for_fully_empty_sheet(self, mock_get_service):
+        """シートに values キーすら無い場合は 0 を返す。"""
+        service = _build_service_with_sheets(["出力一覧"])
+        service.spreadsheets.return_value.values.return_value.get.return_value.execute.side_effect = [
+            # _ensure_output_sheet のヘッダー読み取り（既存あり）
+            {"values": [["管理番号"]]},
+            # A列の読み取り → 完全に空
+            {},
+        ]
+        mock_get_service.return_value = service
+
+        result = sheets_client.get_max_management_number(
+            spreadsheet_id="sid", sheet_name="出力一覧"
+        )
+        self.assertEqual(result, 0)
+
+    @patch("src.sheets_client.get_sheets_service")
+    def test_skips_non_numeric_values(self, mock_get_service):
+        """非数値・空セルはスキップして数値の最大を返す。"""
+        service = _build_service_with_sheets(["出力一覧"])
+        service.spreadsheets.return_value.values.return_value.get.return_value.execute.side_effect = [
+            {"values": [["管理番号"]]},
+            {
+                "values": [
+                    ["管理番号"],  # ヘッダー（非数値）
+                    ["000010"],
+                    ["abc"],  # 非数値混入
+                    [""],  # 空
+                    [],  # 空行
+                    ["000007"],
+                    ["000099"],
+                ]
+            },
+        ]
+        mock_get_service.return_value = service
+
+        result = sheets_client.get_max_management_number(
+            spreadsheet_id="sid", sheet_name="出力一覧"
+        )
+        self.assertEqual(result, 99)
+
+    def test_raises_when_spreadsheet_id_missing(self):
+        with patch.object(sheets_client, "SPREADSHEET_ID", ""):
+            with self.assertRaises(ValueError):
+                sheets_client.get_max_management_number()
 
 
 if __name__ == "__main__":
