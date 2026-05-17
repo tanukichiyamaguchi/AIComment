@@ -21,6 +21,11 @@ from src.utils import normalize_name_for_match
 
 logger = logging.getLogger("jissen_comment")
 
+# Drive API ``files().list()`` の最大 pageSize。
+# Google の公式ドキュメント上の上限値であり、これを超えると API が 400 を返す。
+# 1 ページあたりの取得件数を最大化することで pageToken ループの回数を最小化する。
+DRIVE_PAGE_SIZE = 1000
+
 
 def _get_credentials() -> Any:
     """Drive API用の認証情報を取得する。
@@ -109,7 +114,7 @@ def list_pdfs(folder_id: str | None = None) -> list[dict]:
             q=query,
             fields="nextPageToken, files(id, name)",
             pageToken=page_token,
-            pageSize=100,
+            pageSize=DRIVE_PAGE_SIZE,
             supportsAllDrives=True,
             includeItemsFromAllDrives=True,
         ).execute()
@@ -177,34 +182,46 @@ def find_or_create_folder(
     # 完全一致検索だと「医療法人 かがやき」と「医療法人かがやき」のような表記揺れで
     # 重複フォルダが作られてしまうため、Drive側のフィルタは緩めて Python 側で
     # normalize_name_for_match() の結果を比較する。
+    #
+    # NOTE: Drive API は 1 ページ最大 1000 件しか返さないため、必ず
+    # nextPageToken をループで辿る。1 ページしか見ないと 1001 件目以降にある
+    # 既存フォルダを見落として重複作成してしまう（lessons.md P-010）。
     query = (
         f"'{parent_id}' in parents "
         f"and mimeType='application/vnd.google-apps.folder' "
         f"and trashed=false"
     )
-    response = service.files().list(
-        q=query,
-        fields="files(id, name)",
-        pageSize=1000,
-        supportsAllDrives=True,
-        includeItemsFromAllDrives=True,
-    ).execute()
 
     target_normalized = normalize_name_for_match(folder_name)
-    for existing_file in response.get("files", []):
-        existing_name = existing_file["name"]
-        if normalize_name_for_match(existing_name) == target_normalized:
-            folder_id: str = existing_file["id"]
-            if existing_name == folder_name:
-                logger.info(
-                    f"Drive: 既存フォルダを再利用 ({folder_name}, ID: {folder_id})"
-                )
-            else:
-                logger.info(
-                    f"Drive: 表記揺れを検知して既存フォルダを再利用 "
-                    f"(要求='{folder_name}', 既存='{existing_name}', ID: {folder_id})"
-                )
-            return folder_id
+    page_token: str | None = None
+    while True:
+        response = service.files().list(
+            q=query,
+            fields="nextPageToken, files(id, name)",
+            pageSize=DRIVE_PAGE_SIZE,
+            pageToken=page_token,
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+        ).execute()
+
+        for existing_file in response.get("files", []):
+            existing_name = existing_file["name"]
+            if normalize_name_for_match(existing_name) == target_normalized:
+                folder_id: str = existing_file["id"]
+                if existing_name == folder_name:
+                    logger.info(
+                        f"Drive: 既存フォルダを再利用 ({folder_name}, ID: {folder_id})"
+                    )
+                else:
+                    logger.info(
+                        f"Drive: 表記揺れを検知して既存フォルダを再利用 "
+                        f"(要求='{folder_name}', 既存='{existing_name}', ID: {folder_id})"
+                    )
+                return folder_id
+
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            break
 
     metadata = {
         "name": folder_name,

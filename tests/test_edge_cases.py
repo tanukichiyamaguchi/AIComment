@@ -510,18 +510,14 @@ class TestMakeOutputFilenameEdgeCases(unittest.TestCase):
         result = make_output_filename('a<b>c:d', 'e"f|g', 'h?i*j')
         self.assertEqual(result, "abcd＿efg＿hij.pdf")
 
-    @pytest.mark.skip(
-        reason=(
-            "Bug found (severity=medium): make_output_filename "
-            "は OS 制限の 255 バイト/文字を超えるファイル名を生成し得る。"
-            "現在は各セクションを切り詰めず単純結合しているため、長い "
-            "医院名 + 個人名 + 事例タイトル で 'File name too long' になる。"
-            "_sanitize_filename に max_length 引数を追加して各 100 字程度で "
-            "切り詰める方針を後続 PR で検討。"
-        )
-    )
     def test_total_length_exceeds_os_limit(self):
-        """3 要素合計が 255 バイトを超えるとき、ファイル名が切り詰められるべき。"""
+        """3 要素合計が 255 バイトを超えるとき、ファイル名が切り詰められるべき。
+
+        ``あ`` は UTF-8 で 3 バイト、100 文字で 300 バイト。3 要素 + 区切り
+        + 拡張子 で約 910 バイトになり、ext4 / FAT / NTFS の 255 バイト
+        制限を大幅に超える。``make_output_filename`` 側で UTF-8 バイト長
+        ベースで切り詰めることで、OS の "File name too long" エラーを防ぐ。
+        """
         result = make_output_filename("あ" * 100, "い" * 100, "う" * 100)
         # 期待: 255 バイト以下に収まる（UTF-8 バイト数で評価）
         self.assertLessEqual(
@@ -529,22 +525,40 @@ class TestMakeOutputFilenameEdgeCases(unittest.TestCase):
             255,
             f"OS 制限超過: {len(result.encode('utf-8'))} bytes",
         )
+        # 区切り文字 ＿ x 2 と拡張子 .pdf は必ず保持される
+        self.assertTrue(result.endswith(".pdf"))
+        self.assertEqual(result.count("＿"), 2)
+        # 各セクションは少なくとも 1 文字以上残る（極端な切り捨てを禁止）
+        clinic, person, title = result[:-4].split("＿")
+        self.assertGreater(len(clinic), 0)
+        self.assertGreater(len(person), 0)
+        self.assertGreater(len(title), 0)
 
-    @pytest.mark.skip(
-        reason=(
-            "Bug found (severity=low): sample_title に既に '.pdf' が "
-            "含まれている場合、現実装は二重拡張子 '...＿xxx.pdf.pdf' を生成する。"
-            "comment_generator が拡張子ありで返す可能性は低いが、"
-            "防御的に _sanitize_filename で .pdf を 1 つだけ残す処理を入れる "
-            "ことを後続 PR で検討。"
-        )
-    )
     def test_double_extension_is_collapsed(self):
-        """``sample_title="x.pdf"`` の場合に ``.pdf.pdf`` にならない。"""
+        """``sample_title="x.pdf"`` の場合に ``.pdf.pdf`` にならない。
+
+        AI 抽出やファイル名直接渡しで sample_title に既に ``.pdf`` が含まれる
+        ケースがある（特に元ファイル名をそのまま title に転記する場合）。
+        二重拡張子 ``...x.pdf.pdf`` は OS / Drive 上で混乱を招くため、
+        合成前に末尾 ``.pdf`` を 1 回だけ削る。
+        """
         result = make_output_filename("A", "B", "x.pdf")
         # 期待: ".pdf" は 1 回だけ末尾に付く
         self.assertEqual(result.count(".pdf"), 1)
         self.assertTrue(result.endswith(".pdf"))
+        # 内部の "x" は保持される
+        self.assertIn("＿x.pdf", result)
+
+    def test_double_extension_case_insensitive(self):
+        """``.PDF`` ``.Pdf`` などの大小区別違いも畳まれる。"""
+        for suffix in (".PDF", ".Pdf", ".pDF"):
+            with self.subTest(suffix=suffix):
+                result = make_output_filename("A", "B", f"x{suffix}")
+                self.assertEqual(
+                    result.lower().count(".pdf"), 1,
+                    f"{suffix} で .pdf が複数残った: {result}",
+                )
+                self.assertTrue(result.endswith(".pdf"))
 
     def test_empty_strings_produce_unknown_fallback(self):
         """全要素が空文字なら ``unknown`` フォールバック x3 になる。"""
@@ -607,29 +621,39 @@ class TestFindOrCreateFolderEdgeCases(unittest.TestCase):
         )
         self.assertEqual(result, "existing")
 
-    @pytest.mark.skip(
-        reason=(
-            "Bug found (severity=high): drive_client.find_or_create_folder は "
-            "pageSize=1000 のみで pageToken を辿らない。1001 件目以降に "
-            "ある既存フォルダは検出されず、重複フォルダ作成されるリスク。"
-            "後続 PR で list_pdfs と同様の pageToken ループ実装を検討。"
-        )
-    )
     def test_detects_duplicate_beyond_first_page(self):
-        """1001 件目以降の既存フォルダも見つかるべき（現状は見つからない）。"""
-        files = [{"id": f"id_{i}", "name": f"other_{i}"} for i in range(1001)]
-        files.append({"id": "existing_late", "name": "対象医院"})  # 1002 番目
+        """1001 件目以降の既存フォルダも見つかるべき。
+
+        pageSize=1000 を超える数のフォルダが親配下にある場合、Drive API は
+        1 ページに 1000 件 + nextPageToken を返す。``find_or_create_folder``
+        が nextPageToken をループせず最初の 1 ページしか見ないと、
+        2 ページ目以降にある既存フォルダを検出できず重複作成されてしまう。
+
+        本テストは page1 = 1000 件のダミー / page2 = 既存 1 件を返すモックで
+        pageToken のループが実装されていることを検証する。
+        """
+        page1_files = [
+            {"id": f"id_{i}", "name": f"other_{i}"} for i in range(1000)
+        ]
+        page2_files = [{"id": "existing_late", "name": "対象医院"}]
         service = MagicMock()
-        service.files.return_value.list.return_value.execute.return_value = {
-            "files": files,
-            "nextPageToken": "page2",
-        }
+        service.files.return_value.list.return_value.execute.side_effect = [
+            {"files": page1_files, "nextPageToken": "page2"},
+            {"files": page2_files},  # nextPageToken なしで終了
+        ]
         result = drive_client.find_or_create_folder(
             "対象医院", "parent_id", service=service
         )
-        # 期待：1001 件目以降の既存を再利用する
+        # 期待：page2 にある既存を再利用する
         self.assertEqual(result, "existing_late")
         service.files.return_value.create.assert_not_called()
+        # 2 回 list が呼ばれた（page1 → page2）ことを検証
+        self.assertEqual(
+            service.files.return_value.list.return_value.execute.call_count, 2
+        )
+        # 2 回目の呼び出しに pageToken="page2" が含まれること
+        second_list_kwargs = service.files.return_value.list.call_args_list[1].kwargs
+        self.assertEqual(second_list_kwargs.get("pageToken"), "page2")
 
     def test_raises_on_null_folder_name(self):
         """``None`` の folder_name → 現実装では ``if not folder_name:`` で ValueError。"""
