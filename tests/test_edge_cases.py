@@ -510,18 +510,14 @@ class TestMakeOutputFilenameEdgeCases(unittest.TestCase):
         result = make_output_filename('a<b>c:d', 'e"f|g', 'h?i*j')
         self.assertEqual(result, "abcd＿efg＿hij.pdf")
 
-    @pytest.mark.skip(
-        reason=(
-            "Bug found (severity=medium): make_output_filename "
-            "は OS 制限の 255 バイト/文字を超えるファイル名を生成し得る。"
-            "現在は各セクションを切り詰めず単純結合しているため、長い "
-            "医院名 + 個人名 + 事例タイトル で 'File name too long' になる。"
-            "_sanitize_filename に max_length 引数を追加して各 100 字程度で "
-            "切り詰める方針を後続 PR で検討。"
-        )
-    )
     def test_total_length_exceeds_os_limit(self):
-        """3 要素合計が 255 バイトを超えるとき、ファイル名が切り詰められるべき。"""
+        """3 要素合計が 255 バイトを超えるとき、ファイル名が切り詰められるべき。
+
+        ``あ`` は UTF-8 で 3 バイト、100 文字で 300 バイト。3 要素 + 区切り
+        + 拡張子 で約 910 バイトになり、ext4 / FAT / NTFS の 255 バイト
+        制限を大幅に超える。``make_output_filename`` 側で UTF-8 バイト長
+        ベースで切り詰めることで、OS の "File name too long" エラーを防ぐ。
+        """
         result = make_output_filename("あ" * 100, "い" * 100, "う" * 100)
         # 期待: 255 バイト以下に収まる（UTF-8 バイト数で評価）
         self.assertLessEqual(
@@ -529,6 +525,14 @@ class TestMakeOutputFilenameEdgeCases(unittest.TestCase):
             255,
             f"OS 制限超過: {len(result.encode('utf-8'))} bytes",
         )
+        # 区切り文字 ＿ x 2 と拡張子 .pdf は必ず保持される
+        self.assertTrue(result.endswith(".pdf"))
+        self.assertEqual(result.count("＿"), 2)
+        # 各セクションは少なくとも 1 文字以上残る（極端な切り捨てを禁止）
+        clinic, person, title = result[:-4].split("＿")
+        self.assertGreater(len(clinic), 0)
+        self.assertGreater(len(person), 0)
+        self.assertGreater(len(title), 0)
 
     @pytest.mark.skip(
         reason=(
