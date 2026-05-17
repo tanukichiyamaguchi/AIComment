@@ -21,6 +21,11 @@ from src.utils import normalize_name_for_match
 
 logger = logging.getLogger("jissen_comment")
 
+# Drive API ``files().list()`` の最大 pageSize。
+# Google の公式ドキュメント上の上限値であり、これを超えると API が 400 を返す。
+# 1 ページあたりの取得件数を最大化することで pageToken ループの回数を最小化する。
+DRIVE_PAGE_SIZE = 1000
+
 
 def _get_credentials() -> Any:
     """Drive API用の認証情報を取得する。
@@ -109,7 +114,7 @@ def list_pdfs(folder_id: str | None = None) -> list[dict]:
             q=query,
             fields="nextPageToken, files(id, name)",
             pageToken=page_token,
-            pageSize=100,
+            pageSize=DRIVE_PAGE_SIZE,
             supportsAllDrives=True,
             includeItemsFromAllDrives=True,
         ).execute()
@@ -193,7 +198,7 @@ def find_or_create_folder(
         response = service.files().list(
             q=query,
             fields="nextPageToken, files(id, name)",
-            pageSize=1000,
+            pageSize=DRIVE_PAGE_SIZE,
             pageToken=page_token,
             supportsAllDrives=True,
             includeItemsFromAllDrives=True,

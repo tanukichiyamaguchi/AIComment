@@ -6,7 +6,6 @@ import logging
 import re
 import sys
 import unicodedata
-from pathlib import Path
 
 from src.config import LOG_LEVEL, LOG_FILE, LOGS_DIR, ASSETS_DIR, FONT_REGULAR, FONT_BOLD
 
