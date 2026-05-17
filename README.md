@@ -17,11 +17,15 @@ pip install -r requirements.txt
 | 変数名 | 内容 | 必須 |
 |--------|------|------|
 | `ANTHROPIC_API_KEY` | Claude APIキー | ✅ |
-| `GOOGLE_CREDENTIALS_JSON` | GCPサービスアカウントJSON（読み取り・Sheets書き込み用） | ✅ |
+| `GOOGLE_CREDENTIALS_JSON` | GCPサービスアカウントJSON（Sheets書き込み用、ローカル/Colab実行時） | ✅（GitHub Actions 以外） |
+| `GCP_WORKLOAD_IDENTITY_PROVIDER` | Workload Identity 連携プロバイダ（GitHub Actions の Sheets認証用） | ✅（GitHub Actions） |
+| `GCP_SERVICE_ACCOUNT` | Workload Identity 連携で借用するサービスアカウントのメールアドレス | ✅（GitHub Actions） |
 | `GOOGLE_OAUTH_TOKEN_JSON` | OAuthユーザートークン（Drive書き込み・Gmail下書き作成用） | ✅ |
-| `DRIVE_FOLDER_ID` | 入力PDFが格納されたGoogle DriveフォルダID | ✅ |
-| `DRIVE_OUTPUT_FOLDER_ID` | 出力PDFを保存するGoogle DriveフォルダID | ✅ |
-| `SPREADSHEET_ID` | 出力一覧を書き込むスプレッドシートID | ✅ |
+| `DRIVE_FOLDER_ID` | 入力PDFが格納されたGoogle DriveフォルダID（`jissen_default` プロファイル用） | ✅（既定プロファイル使用時） |
+| `DRIVE_OUTPUT_FOLDER_ID` | 出力PDFを保存するGoogle DriveフォルダID（`jissen_default` プロファイル用） | ✅（既定プロファイル使用時） |
+| `DRIVE_FOLDER_JISSEN_2024_Q1`〜`Q4` | 2024 年度 Q1〜Q4 プロファイル用の入力フォルダ ID | プロファイル使用時 |
+| `DRIVE_OUTPUT_JISSEN_2024_Q1`〜`Q4` | 2024 年度 Q1〜Q4 プロファイル用の出力フォルダ ID | プロファイル使用時 |
+| `SPREADSHEET_ID` | 出力一覧を書き込むスプレッドシートID（全プロファイル共通） | ✅ |
 | `GMAIL_TOKEN_JSON` | （旧称）`GOOGLE_OAUTH_TOKEN_JSON` の後方互換エイリアス | 旧Secret再利用可 |
 
 #### `GOOGLE_OAUTH_TOKEN_JSON` がなぜ必要か
@@ -66,15 +70,16 @@ https://www.googleapis.com/auth/gmail.compose
 
 ### 4. スプレッドシート「出力一覧」シート
 
-`DRIVE_OUTPUT_FOLDER_ID` 設定済みかつ初回実行時に自動作成されます。1ファイル1行で記録：
+プロファイル定義の `output_sheet_name`（既定は `出力一覧`）に該当するシートが存在しなければ初回実行時に自動作成されます。1ファイル1行で記録：
 
 | 列 | ヘッダー | 内容 |
 |----|---------|------|
-| A | 医院名 | AIがPDFから自動抽出 |
-| B | 個人名 | AIがPDFから自動抽出 |
-| C | 実践事例タイトル | AIがPDFから自動抽出 |
-| D | Drive URL | 出力PDFの閲覧URL |
-| E | 処理日時 | システムが書き込み |
+| A | 管理番号 | プロファイルの `management_number_prefix` + 6桁ゼロパディング連番（例: `J24Q1-000001`、prefix 空なら `000001`） |
+| B | 医院名 | AIがPDFから自動抽出 |
+| C | 個人名 | AIがPDFから自動抽出 |
+| D | 実践事例名 | AIがPDFから自動抽出 |
+| E | Drive URL | 出力PDFの閲覧URL |
+| F | 処理日時 | システムが書き込み |
 
 > 事前の入力（医院名や氏名のリスト）は **不要**。AIがPDF本文から判別できなかった場合は `unknown_clinic` / `unknown_person` として処理を続行します。
 
