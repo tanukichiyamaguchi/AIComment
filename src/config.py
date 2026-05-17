@@ -67,3 +67,17 @@ PDF_PAGE_SIZE = "A4"
 # ── ログ設定 ──
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
 LOG_FILE = LOGS_DIR / "jissen_comment.log"
+
+
+# ── プロファイル経由で設定を取得するヘルパー ──
+# 既存定数（``DRIVE_FOLDER_ID`` など）は維持しつつ、プロファイル制度を
+# 使うコードからは ``get_profile_config(name)`` 一本で必要な値を取れる。
+def get_profile_config(profile_name: str = "jissen_default"):
+    """プロファイル名から ``ProfileConfig`` を取得する薄いラッパー。
+
+    ``src.profile.load_profile`` への循環インポートを避けるため、関数内で
+    遅延 import している。既存コードを ``profile.load_profile`` 直呼び出し
+    から段階的に移行したい場合のエイリアスとして使う。
+    """
+    from src.profile import load_profile
+    return load_profile(profile_name)

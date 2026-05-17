@@ -3,40 +3,45 @@
 PDFを読み取り、Claude APIで医院名・氏名・実践事例タイトル・コメントを抽出/生成し、
 コメント付きPDFをDriveに「医院名/個人名/」階層で保存し、出力一覧シートに記録する。
 事前のスプレッドシート入力（Sheet1）は不要。
+
+プロファイル制度:
+    ``--profile <name>`` で profiles/<name>.yaml を読み込み、
+    入力フォルダ・出力フォルダ・出力シート名・管理番号 prefix を切り替える。
+    デフォルトの ``jissen_default`` は既存挙動を完全維持する。
 """
 
 from __future__ import annotations
 
 import argparse
-import sys
 import tempfile
 from pathlib import Path
 
 from src.utils import setup_logging, ensure_fonts
-from src.config import DRIVE_OUTPUT_FOLDER_ID
 from src import drive_client, sheets_client
 from src import pdf_reader, comment_generator, pdf_creator, pdf_merger
+from src.profile import load_profile
 
 
-def run(test_count: int = 0) -> None:
+def run(test_count: int = 0, profile_name: str = "jissen_default") -> None:
     """通常モードのメイン処理。
 
     Args:
         test_count: テスト件数（0=全件処理）
+        profile_name: プロファイル名（``profiles/<name>.yaml``）
     """
     logger = setup_logging()
     logger.info("=== じっせん君コメントシステム（通常モード）開始 ===")
 
-    if not DRIVE_OUTPUT_FOLDER_ID:
-        raise RuntimeError(
-            "DRIVE_OUTPUT_FOLDER_ID が設定されていません。"
-            "GitHub Secrets またはローカル環境変数に設定してください。"
-        )
+    profile = load_profile(profile_name)
+    logger.info(
+        f"プロファイル: {profile.display_name} ({profile.name}, "
+        f"document_type={profile.document_type}, period={profile.period})"
+    )
 
     ensure_fonts()
 
     logger.info("Step 1: PDF一覧取得")
-    pdf_files = drive_client.list_pdfs()
+    pdf_files = drive_client.list_pdfs(folder_id=profile.input_folder_id)
 
     if test_count > 0:
         pdf_files = pdf_files[:test_count]
@@ -45,8 +50,15 @@ def run(test_count: int = 0) -> None:
     logger.info(f"処理対象: {len(pdf_files)}件のPDF")
 
     # 管理番号の採番起点：既存シートの最大値を取得し、以降の連番はこの値+1から発行する
-    initial_max = sheets_client.get_max_management_number()
-    logger.info(f"管理番号 採番起点: {initial_max} (次の発行は {initial_max + 1:06d})")
+    initial_max = sheets_client.get_max_management_number(
+        sheet_name=profile.output_sheet_name,
+        prefix=profile.management_number_prefix or None,
+    )
+    prefix = profile.management_number_prefix
+    logger.info(
+        f"管理番号 採番起点: {initial_max} "
+        f"(次の発行は {prefix}{initial_max + 1:06d})"
+    )
 
     stats = {"success": 0, "skip": 0, "error": 0}
     processed = 0  # シートに書き込んだ件数（success と独立して管理番号採番に使う）
@@ -95,19 +107,20 @@ def run(test_count: int = 0) -> None:
 
                 upload_result = drive_client.upload_pdf_to_clinic_person(
                     file_path=output_path,
-                    output_root_folder_id=DRIVE_OUTPUT_FOLDER_ID,
+                    output_root_folder_id=profile.output_folder_id,
                     clinic_name=clinic_name,
                     person_name=person_name,
                     file_name=output_filename,
                 )
 
-            mgmt_num = f"{initial_max + processed + 1:06d}"
+            mgmt_num = f"{prefix}{initial_max + processed + 1:06d}"
             sheets_client.append_output_record(
                 management_number=mgmt_num,
                 clinic_name=clinic_name,
                 person_name=person_name,
                 sample_name=sample_title,
                 drive_url=upload_result["webViewLink"],
+                sheet_name=profile.output_sheet_name,
             )
             processed += 1
 
@@ -134,8 +147,15 @@ def main() -> None:
         "--test-count", type=int, default=0,
         help="テスト件数（0=全件処理）",
     )
+    parser.add_argument(
+        "--profile", type=str, default="jissen_default",
+        help=(
+            "プロファイル名（profiles/<name>.yaml）。"
+            "省略時は jissen_default（既存挙動）"
+        ),
+    )
     args = parser.parse_args()
-    run(test_count=args.test_count)
+    run(test_count=args.test_count, profile_name=args.profile)
 
 
 if __name__ == "__main__":

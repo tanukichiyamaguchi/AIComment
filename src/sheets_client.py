@@ -214,6 +214,7 @@ def _ensure_output_sheet(
 def get_max_management_number(
     spreadsheet_id: str | None = None,
     sheet_name: str | None = None,
+    prefix: str | None = None,
 ) -> int:
     """出力一覧シートのA列（管理番号）から最大値を取得する。
 
@@ -224,6 +225,10 @@ def get_max_management_number(
     Args:
         spreadsheet_id: スプレッドシートID（省略時は設定値）
         sheet_name: シート名（省略時は設定値 ``OUTPUT_SHEET_NAME``）
+        prefix: 管理番号の prefix（例 ``"J24Q1-"``）。指定された場合は
+            prefix で始まるセルだけを対象とし、prefix を除いた数値部分の
+            最大を返す。``None`` または空文字列の場合は従来挙動（prefix なし
+            の純粋数値セル）。
 
     Returns:
         A列の数値として解釈できる最大値。1件もない / 数値変換できない場合は 0。
@@ -256,8 +261,17 @@ def get_max_management_number(
         cell = cell.strip()
         if not cell:
             continue
+
+        if prefix:
+            # prefix 付き行のみ対象。prefix で始まらない行はスキップ。
+            if not cell.startswith(prefix):
+                continue
+            numeric_part = cell[len(prefix):]
+        else:
+            numeric_part = cell
+
         try:
-            num = int(cell)
+            num = int(numeric_part)
         except (ValueError, TypeError):
             # ヘッダー行（"管理番号"）や非数値はスキップ
             continue

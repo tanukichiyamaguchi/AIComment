@@ -96,6 +96,51 @@ https://www.googleapis.com/auth/gmail.compose
 
 ファイル名は ``<医院名>＿<個人名>＿<実践事例タイトル>.pdf`` 形式（区切りは全角アンダースコア ``＿``）。AI が抽出した値から特殊文字を除いて生成。
 
+## プロファイル
+
+### なぜ必要か
+
+「ドキュメントタイプ × 提出期間」の組み合わせごとに **入力フォルダ / 出力フォルダ / 出力一覧シート / 管理番号 prefix** を切り替えるための仕組み。同一ワークフローを 1 本だけ保ったまま、四半期ごとの実践事例を別フォルダ・別シートに整理して処理できる。
+
+```
+[現状] 1 ワークフロー → 固定の {入力/出力/シート/プロンプト} を直接参照
+[新規] 1 ワークフロー → --profile 引数 → プロファイル定義 → 各種設定を解決
+```
+
+### 利用可能なプロファイル
+
+`profiles/*.yaml` に定義。コマンドラインからは `python -c "from src.profile import list_available_profiles; print(list_available_profiles())"` で一覧取得可能。
+
+| プロファイル名 | 入力 Secret | 出力 Secret | 出力シート | 管理番号 prefix |
+|---------------|------------|------------|-----------|----------------|
+| `jissen_default` | `DRIVE_FOLDER_ID` | `DRIVE_OUTPUT_FOLDER_ID` | `出力一覧` | （なし） |
+| `jissen_2024_q1` | `DRIVE_FOLDER_JISSEN_2024_Q1` | `DRIVE_OUTPUT_JISSEN_2024_Q1` | `実践事例_2024Q1_出力一覧` | `J24Q1-` |
+| `jissen_2024_q2` | `DRIVE_FOLDER_JISSEN_2024_Q2` | `DRIVE_OUTPUT_JISSEN_2024_Q2` | `実践事例_2024Q2_出力一覧` | `J24Q2-` |
+| `jissen_2024_q3` | `DRIVE_FOLDER_JISSEN_2024_Q3` | `DRIVE_OUTPUT_JISSEN_2024_Q3` | `実践事例_2024Q3_出力一覧` | `J24Q3-` |
+| `jissen_2024_q4` | `DRIVE_FOLDER_JISSEN_2024_Q4` | `DRIVE_OUTPUT_JISSEN_2024_Q4` | `実践事例_2024Q4_出力一覧` | `J24Q4-` |
+
+`jissen_default` は **既存挙動を完全維持する後方互換プロファイル**。`--profile` 引数を省略した場合の既定値でもあり、過去の Secret / シート / 管理番号採番ロジックがそのまま動く。
+
+### 新しいプロファイルを追加する手順
+
+1. `profiles/<新プロファイル名>.yaml` を作成。schema は下記を参照
+2. GitHub Secrets に `input_folder_id_secret` / `output_folder_id_secret` で指定したキー名で Drive フォルダ ID を登録
+3. `.github/workflows/generate_comments.yml` の `env:` セクションに `<KEY>: ${{ secrets.<KEY> }}` を追記
+4. （オプション）Google フォームのプルダウン選択肢と Apps Script の `ALLOWED_PROFILES` 配列に新プロファイル名を追加
+
+YAML スキーマ（必須フィールド）：
+
+```yaml
+display_name: "（ログ表示用の人間可読名）"
+document_type: jissen_practice_case          # 文書タイプ識別子
+period: "2024_q1"                             # 期間識別子
+input_folder_id_secret: DRIVE_FOLDER_XXX     # 環境変数名（解決はランタイム）
+output_folder_id_secret: DRIVE_OUTPUT_XXX    # 環境変数名（解決はランタイム）
+output_sheet_name: "実践事例_2024Q1_出力一覧" # 同一スプレッドシート内のシート名
+management_number_prefix: "J24Q1-"           # 管理番号の prefix（空文字で prefix なし）
+prompt_template: jissen_practice_case        # コメント生成プロンプト識別子
+```
+
 ## 使い方
 
 ### コマンドライン
@@ -104,9 +149,13 @@ https://www.googleapis.com/auth/gmail.compose
 # 通常モード（1件ずつ処理、まずは少量で動作確認）
 python -m src.main --test-count 5
 
-# Batchモード（50%割引・大量一括処理）
+# Batchモード（50%割引・大量一括処理、デフォルトプロファイル）
 python -m src.batch_main --test-count 5      # まずテスト
 python -m src.batch_main                      # 本番（全件）
+
+# プロファイル指定（例: 2024 年度 Q1）
+python -m src.batch_main --profile jissen_2024_q1 --test-count 5
+python -m src.main --profile jissen_2024_q3
 
 # バッチ結果取得から再開
 python -m src.batch_main --batch-id msgbatch_xxx --step results
@@ -162,6 +211,7 @@ python -m src.batch_main --batch-id msgbatch_xxx --step results
 │   ├── main.py              # 通常モード エントリポイント
 │   ├── batch_main.py         # Batchモード エントリポイント
 │   ├── config.py             # 設定値管理
+│   ├── profile.py            # プロファイル loader / resolver
 │   ├── utils.py              # ログ設定・フォントダウンロード・ファイル名整形
 │   ├── pdf_reader.py         # PDFテキスト抽出
 │   ├── comment_generator.py  # Claude API（構造化出力で医院名/氏名/タイトル/コメント取得）
@@ -171,6 +221,7 @@ python -m src.batch_main --batch-id msgbatch_xxx --step results
 │   ├── sheets_client.py      # Google Sheets API（出力一覧シート追記）
 │   ├── gmail_client.py       # Gmail API（v2では未使用、将来Gmail送付時に再利用）
 │   └── matcher.py            # 旧マッチング（v2では未使用）
+├── profiles/                 # プロファイル YAML（document_type × period の組み合わせ）
 ├── tests/                    # テストコード
 ├── notebooks/                # Google Colabノートブック
 ├── assets/                   # フォント・画像

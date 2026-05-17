@@ -3,6 +3,10 @@ name: Generate Jissen Comments
 on:
   workflow_dispatch:
     inputs:
+      profile:
+        description: 'Profile name (jissen_default, jissen_2024_q1, jissen_2024_q2, jissen_2024_q3, jissen_2024_q4)'
+        type: string
+        default: jissen_default
       batch_mode:
         description: 'Use Batch API (50% off)'
         type: boolean
@@ -41,15 +45,28 @@ jobs:
         run: |
           if [ "${{ inputs.batch_mode }}" = "true" ]; then
             python -m src.batch_main \
+              --profile ${{ inputs.profile }} \
               --test-count ${{ inputs.test_count }}
           else
             python -m src.main \
+              --profile ${{ inputs.profile }} \
               --test-count ${{ inputs.test_count }}
           fi
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          # jissen_default プロファイル用（既存）
           DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
           DRIVE_OUTPUT_FOLDER_ID: ${{ secrets.DRIVE_OUTPUT_FOLDER_ID }}
+          # jissen_2024_q1 〜 q4 プロファイル用
+          DRIVE_FOLDER_JISSEN_2024_Q1: ${{ secrets.DRIVE_FOLDER_JISSEN_2024_Q1 }}
+          DRIVE_OUTPUT_JISSEN_2024_Q1: ${{ secrets.DRIVE_OUTPUT_JISSEN_2024_Q1 }}
+          DRIVE_FOLDER_JISSEN_2024_Q2: ${{ secrets.DRIVE_FOLDER_JISSEN_2024_Q2 }}
+          DRIVE_OUTPUT_JISSEN_2024_Q2: ${{ secrets.DRIVE_OUTPUT_JISSEN_2024_Q2 }}
+          DRIVE_FOLDER_JISSEN_2024_Q3: ${{ secrets.DRIVE_FOLDER_JISSEN_2024_Q3 }}
+          DRIVE_OUTPUT_JISSEN_2024_Q3: ${{ secrets.DRIVE_OUTPUT_JISSEN_2024_Q3 }}
+          DRIVE_FOLDER_JISSEN_2024_Q4: ${{ secrets.DRIVE_FOLDER_JISSEN_2024_Q4 }}
+          DRIVE_OUTPUT_JISSEN_2024_Q4: ${{ secrets.DRIVE_OUTPUT_JISSEN_2024_Q4 }}
+          # 全プロファイル共通
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           # OAuthユーザートークン（Drive/Gmail共通）。
           # GOOGLE_OAUTH_TOKEN_JSON が未設定なら旧 GMAIL_TOKEN_JSON にフォールバック。
