@@ -1,5 +1,52 @@
 # じっせん君コメントシステム - Task Tracker
 
+## Phase 9: フォルダ自動検出システム（2026-05-17）
+
+### ゴール
+INPUT_ROOT 配下のサブフォルダを auto-discover し、出力フォルダ・シートタブ・
+管理番号 prefix を自動派生するアーキテクチャを追加する。
+Convention over Configuration を優先し、Secret/YAML 追加なしで新セミナーに対応する。
+
+### 設計コンセプト
+- 必要な Secret 3 つ: `DRIVE_INPUT_ROOT` / `DRIVE_OUTPUT_ROOT` / `SPREADSHEET_ID`
+- ユーザー作業: Drive サブフォルダ作成 + PDF アップロード + `target_folder` 名を入力
+- システム: フォルダ検索（表記揺れ吸収）→ 出力フォルダ自動作成 → シートタブ自動作成
+  → 管理番号 prefix を `<folder_name>-` で派生 → 既存パイプライン実行
+- 後方互換: `--profile` モードは完全維持
+
+### タスク
+
+- [x] baseline: 265 tests pass, mypy 0 errors
+- [x] `src/discover.py` 新規: 3 関数（list_input_subfolders / resolve_context / list_target_folder_names）
+- [x] `src/config.py` 修正: `DRIVE_INPUT_ROOT` `DRIVE_OUTPUT_ROOT` 読み込み追加
+- [x] `src/main.py` 修正: `--target-folder` 引数 / `__list__` モード / run() 分岐
+- [x] `src/batch_main.py` 修正: `--target-folder` 引数 / step1 / step4 への context 受け渡し
+- [x] `tests/test_discover.py` 新規: 上記 3 関数の単体テスト
+- [x] `tests/test_main.py` 拡張: --target-folder 関連テスト
+- [x] `tests/test_batch_main.py` 拡張: --target-folder 関連テスト
+- [x] `tests/test_integration_smoke.py` 拡張: target_folder E2E + profile リグレッション
+- [x] `.github/workflows/generate_comments.yml` 修正: target_folder input + 2 Secret env
+- [x] `docs/google_form_setup.md` 修正: 対象フォルダ名質問追加
+- [x] `README.md` 修正: フォルダ自動検出セクション
+- [x] `tasks/lessons.md` 修正: P-013 Convention over Configuration
+- [x] pytest 全件 pass / mypy 0 errors
+- [x] 論理単位でコミット → push → ドラフト PR 作成
+
+### 受け入れ条件
+- [x] `pytest tests/` 全件 pass（既存 265 + 新規）
+- [x] `mypy src/ --ignore-missing-imports` エラー 0
+- [x] `src/discover.py` 関数 3 つ実装
+- [x] `--target-folder` 引数が main.py / batch_main.py で動作
+- [x] `--target-folder __list__` で候補列挙
+- [x] 既存 `--profile` モードのリグレッションテスト追加
+- [x] workflow YAML に `target_folder` input + 2 Secret env 追加
+- [x] docs/google_form_setup.md に対象フォルダ名質問の追加手順
+- [x] README にフォルダ自動検出セクション追加
+- [x] tasks/lessons.md に P-013 追記
+- [x] ドラフト PR 作成完了
+
+---
+
 ## 実装フェーズ
 
 - [x] Phase 1: 基盤構築（ディレクトリ構成・requirements.txt・config.py・utils.py）

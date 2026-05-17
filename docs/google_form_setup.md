@@ -87,10 +87,16 @@ Apps Script が GitHub Actions を起動するための認証トークンを発�
      - `jissen_2024_q4`
    - 右下「必須」を ON
    - 三点メニュー →「説明」→「通常は `jissen_default`（既存挙動）。期間別の出力を分けたいときだけ該当の四半期を選ぶ」と入力
-8. 上部の「**回答**」タブを開く → 緑色のスプレッドシートアイコン「**スプレッドシートにリンク**」を押す
+8. 右側ツールバーの「**＋**」で **質問 4 を追加**（フォルダ自動検出モード用、**任意**）:
+   - 質問文: **「対象フォルダ名（自動検出モード）」**
+   - 回答形式: **「記述式」**（短文回答）
+   - 右下「必須」は **OFF**（空欄なら従来の profile 動作）
+   - 三点メニュー →「説明」→「`DRIVE_INPUT_ROOT` 配下のサブフォルダ名を入力すると、profile/Secret 追加なしで処理対象を切り替えできます（例: `2024_Q1_実践事例`）。候補一覧を見たい場合は `__list__` を入力すると GitHub Actions のログに表示されます。**この欄を埋めると質問 3 のプロファイル選択は無視されます**」と入力
+   - 補足: フォルダ自動検出モードを使うには、GitHub Secrets に `DRIVE_INPUT_ROOT` / `DRIVE_OUTPUT_ROOT` を別途登録しておく必要があります。README の「フォルダ自動検出モード」セクションを参照
+9. 上部の「**回答**」タブを開く → 緑色のスプレッドシートアイコン「**スプレッドシートにリンク**」を押す
    - 「**新しいスプレッドシートを作成**」→ 名前は **「じっせん君コメント生成 実行ログ」** など
    - 既存の出力一覧シートとは **別ファイル** にすること（混在させない）
-9. 上部「**プレビュー（目のアイコン）**」で動作確認
+10. 上部「**プレビュー（目のアイコン）**」で動作確認
 
 ---
 
@@ -168,6 +174,9 @@ PAT などの秘密値をコードに直書きしないため、スクリプト�
  *   2. 「Batch API を使う（50%割引、推奨）」 : ラジオボタン「はい」「いいえ」
  *   3. 「プロファイル（処理対象の四半期 / 文書種別）」 : プルダウン
  *        選択肢は jissen_default / jissen_2024_q1 〜 q4 のいずれか
+ *   4. （任意）「対象フォルダ名（自動検出モード）」 : 短文回答
+ *        DRIVE_INPUT_ROOT 配下のサブフォルダ名。入力されれば profile より優先。
+ *        "__list__" を入れると GitHub Actions のログに候補一覧が出力される。
  */
 
 // プロファイル名の許可リスト（ホワイトリスト）。
@@ -250,6 +259,7 @@ function parseFormResponse_(e) {
   let testCount = '0';
   let batchMode = 'true';
   let profile = 'jissen_default';
+  let targetFolder = '';
 
   itemResponses.forEach(function (itemResponse) {
     const title = (itemResponse.getItem().getTitle() || '').trim();
@@ -271,6 +281,11 @@ function parseFormResponse_(e) {
       } else {
         throw new Error('「Batch API を使う」には「はい」「いいえ」のいずれかを選んでください。入力値: ' + answer);
       }
+    } else if (title.indexOf('対象フォルダ') !== -1 || title.indexOf('target_folder') !== -1) {
+      // フォルダ自動検出モード。空欄なら profile を使う後方互換動作。
+      // 入力されれば中身をそのまま渡す（Drive 側のフォルダ命名は自由なため
+      // ホワイトリスト照合不可。Python 側で表記揺れ吸収しつつマッチさせる）。
+      targetFolder = answer;
     } else if (title.indexOf('プロファイル') !== -1 || title.toLowerCase().indexOf('profile') !== -1) {
       // ホワイトリスト照合（タイポや未知の値は拒否）
       if (ALLOWED_PROFILES.indexOf(answer) === -1) {
@@ -287,6 +302,7 @@ function parseFormResponse_(e) {
     test_count: testCount,
     batch_mode: batchMode,
     profile: profile,
+    target_folder: targetFolder,
   };
 }
 
@@ -303,6 +319,7 @@ function dispatchWorkflow_(config, inputs) {
     ref: config.WORKFLOW_REF,
     inputs: {
       profile: inputs.profile,
+      target_folder: inputs.target_folder,
       batch_mode: inputs.batch_mode,
       test_count: inputs.test_count,
     },
@@ -381,9 +398,30 @@ function writeStatusToSheet_(e, statusText) {
 // ============================================================================
 function testDispatch() {
   const config = loadConfig_();
-  const inputs = { test_count: '1', batch_mode: 'false', profile: 'jissen_default' };
+  const inputs = {
+    test_count: '1',
+    batch_mode: 'false',
+    profile: 'jissen_default',
+    target_folder: '',
+  };
   const result = dispatchWorkflow_(config, inputs);
   console.log('testDispatch OK', result);
+}
+
+// ============================================================================
+// 手動テスト用 2: フォルダ自動検出モードの疎通確認
+// ============================================================================
+function testDispatchTargetFolder() {
+  const config = loadConfig_();
+  // "__list__" を指定すると GitHub Actions のログに候補一覧が出力される
+  const inputs = {
+    test_count: '0',
+    batch_mode: 'false',
+    profile: '',
+    target_folder: '__list__',
+  };
+  const result = dispatchWorkflow_(config, inputs);
+  console.log('testDispatchTargetFolder OK', result);
 }
 
 // ============================================================================
@@ -422,8 +460,10 @@ function formatJst_(date) {
 | `GitHub 認証エラー (401)` | PAT を再発行し `GITHUB_PAT` を上書き |
 | `GitHub 権限エラー (403)` | PAT の「Repository permissions → Actions」が **Read and write** か |
 | `GitHub リソースが見つかりません (404)` | `GITHUB_OWNER` / `GITHUB_REPO` / `WORKFLOW_FILE` / `WORKFLOW_REF` のスペルを再確認 |
-| `バリデーションエラー (422)` | フォームの質問タイトル（「件数」「Batch」「プロファイル」を含む）が変わっていないか |
+| `バリデーションエラー (422)` | フォームの質問タイトル（「件数」「Batch」「プロファイル」「対象フォルダ」を含む）が変わっていないか |
 | `「プロファイル」には次のいずれかを選んでください` | 質問 3 の選択肢が `jissen_default` / `jissen_2024_q1` 〜 `q4` のスペル完全一致になっているか |
+| 自動検出モードで `target_folder ... が DRIVE_INPUT_ROOT 配下に見つかりません` | 入力した「対象フォルダ名」が Drive 上の `DRIVE_INPUT_ROOT` 配下に存在しない。`testDispatchTargetFolder` で `__list__` を投げて候補一覧を Actions ログで確認する |
+| 自動検出モードで `DRIVE_INPUT_ROOT が未設定です` | GitHub Secrets に `DRIVE_INPUT_ROOT` / `DRIVE_OUTPUT_ROOT` を登録していない。README の「フォルダ自動検出モード」セクションを参照 |
 | GitHub Actions が起動するが処理がエラー | これは Apps Script の責任範囲外。`Generate Jissen Comments` のログを直接確認 |
 
 ネットワーク一時エラー時のリトライ機構は入れていません。フォームを再送信してください。

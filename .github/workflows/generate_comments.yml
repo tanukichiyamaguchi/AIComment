@@ -4,9 +4,13 @@ on:
   workflow_dispatch:
     inputs:
       profile:
-        description: 'Profile name (jissen_default, jissen_2024_q1, jissen_2024_q2, jissen_2024_q3, jissen_2024_q4)'
+        description: 'Profile name (jissen_default, jissen_2024_q1, jissen_2024_q2, jissen_2024_q3, jissen_2024_q4). Ignored if target_folder is set.'
         type: string
-        default: jissen_default
+        default: ""
+      target_folder:
+        description: 'Discovery mode: target subfolder name under DRIVE_INPUT_ROOT (use "__list__" to list candidates). Overrides profile when set.'
+        type: string
+        default: ""
       batch_mode:
         description: 'Use Batch API (50% off)'
         type: boolean
@@ -43,13 +47,26 @@ jobs:
 
       - name: Run comment generation
         run: |
+          # 優先順位:
+          # 1. target_folder 指定 → フォルダ自動検出モード（profile より優先）
+          # 2. profile 指定        → 既存プロファイルモード
+          # 3. どちらも未指定      → jissen_default プロファイル（既存挙動）
           if [ "${{ inputs.batch_mode }}" = "true" ]; then
-            python -m src.batch_main \
-              --profile ${{ inputs.profile }} \
+            ENTRY="python -m src.batch_main"
+          else
+            ENTRY="python -m src.main"
+          fi
+
+          if [ -n "${{ inputs.target_folder }}" ]; then
+            $ENTRY \
+              --target-folder "${{ inputs.target_folder }}" \
+              --test-count ${{ inputs.test_count }}
+          elif [ -n "${{ inputs.profile }}" ]; then
+            $ENTRY \
+              --profile "${{ inputs.profile }}" \
               --test-count ${{ inputs.test_count }}
           else
-            python -m src.main \
-              --profile ${{ inputs.profile }} \
+            $ENTRY \
               --test-count ${{ inputs.test_count }}
           fi
         env:
@@ -66,7 +83,11 @@ jobs:
           DRIVE_OUTPUT_JISSEN_2024_Q3: ${{ secrets.DRIVE_OUTPUT_JISSEN_2024_Q3 }}
           DRIVE_FOLDER_JISSEN_2024_Q4: ${{ secrets.DRIVE_FOLDER_JISSEN_2024_Q4 }}
           DRIVE_OUTPUT_JISSEN_2024_Q4: ${{ secrets.DRIVE_OUTPUT_JISSEN_2024_Q4 }}
-          # 全プロファイル共通
+          # フォルダ自動検出モード用（target_folder 指定時に使う）
+          # ROOT 配下のサブフォルダ名で動的に解決される。1 つ作るだけで何セミナーでも対応。
+          DRIVE_INPUT_ROOT: ${{ secrets.DRIVE_INPUT_ROOT }}
+          DRIVE_OUTPUT_ROOT: ${{ secrets.DRIVE_OUTPUT_ROOT }}
+          # 全プロファイル / 自動検出モード共通
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           # OAuthユーザートークン（Drive/Gmail共通）。
           # GOOGLE_OAUTH_TOKEN_JSON が未設定なら旧 GMAIL_TOKEN_JSON にフォールバック。
