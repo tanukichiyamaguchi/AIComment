@@ -173,7 +173,7 @@ def _validate_email(email: str) -> bool:
     return bool(re.match(pattern, email))
 
 
-_OUTPUT_HEADER = ["医院名", "個人名", "実践事例名", "Drive URL", "処理日時"]
+_OUTPUT_HEADER = ["管理番号", "医院名", "個人名", "実践事例名", "Drive URL", "処理日時"]
 
 
 def _ensure_output_sheet(
@@ -196,7 +196,7 @@ def _ensure_output_sheet(
         ).execute()
         logger.info(f"Sheets: 出力一覧シートを新規作成 ({sheet_name})")
 
-    header_range = f"{sheet_name}!A1:E1"
+    header_range = f"{sheet_name}!A1:F1"
     current = service.spreadsheets().values().get(
         spreadsheetId=spreadsheet_id,
         range=header_range,
@@ -211,7 +211,64 @@ def _ensure_output_sheet(
         logger.info(f"Sheets: 出力一覧シートのヘッダーを書き込み ({sheet_name})")
 
 
+def get_max_management_number(
+    spreadsheet_id: str | None = None,
+    sheet_name: str | None = None,
+) -> int:
+    """出力一覧シートのA列（管理番号）から最大値を取得する。
+
+    AI抽出の医院名/個人名は表記揺れがあり一意キーにできないため、
+    PDF1件ごとに連番（6桁ゼロパディング）を発行して別軸の一意キーとする。
+    再実行時はこの最大値+1から新規採番を継続するために使用する。
+
+    Args:
+        spreadsheet_id: スプレッドシートID（省略時は設定値）
+        sheet_name: シート名（省略時は設定値 ``OUTPUT_SHEET_NAME``）
+
+    Returns:
+        A列の数値として解釈できる最大値。1件もない / 数値変換できない場合は 0。
+        非数値・空セル・ヘッダー行はスキップする。
+    """
+    spreadsheet_id = spreadsheet_id or SPREADSHEET_ID
+    if not spreadsheet_id:
+        raise ValueError("SPREADSHEET_IDが設定されていません")
+    sheet_name = sheet_name or OUTPUT_SHEET_NAME
+
+    service = get_sheets_service()
+    _ensure_output_sheet(service, spreadsheet_id, sheet_name)
+
+    result = service.spreadsheets().values().get(
+        spreadsheetId=spreadsheet_id,
+        range=f"{sheet_name}!A:A",
+    ).execute()
+
+    rows = result.get("values", [])
+    if not rows:
+        return 0
+
+    max_num = 0
+    for row in rows:
+        if not row:
+            continue
+        cell = row[0]
+        if not isinstance(cell, str):
+            cell = str(cell)
+        cell = cell.strip()
+        if not cell:
+            continue
+        try:
+            num = int(cell)
+        except (ValueError, TypeError):
+            # ヘッダー行（"管理番号"）や非数値はスキップ
+            continue
+        if num > max_num:
+            max_num = num
+
+    return max_num
+
+
 def append_output_record(
+    management_number: str,
     clinic_name: str,
     person_name: str,
     sample_name: str,
@@ -220,9 +277,10 @@ def append_output_record(
     sheet_name: str | None = None,
     processed_at: str | None = None,
 ) -> None:
-    """出力一覧シートに1行追加する（医院名 / 個人名 / 実践事例名 / Drive URL / 処理日時）。
+    """出力一覧シートに1行追加する（管理番号 / 医院名 / 個人名 / 実践事例名 / Drive URL / 処理日時）。
 
     Args:
+        management_number: 管理番号（6桁ゼロパディング、呼び出し側で生成済み）
         clinic_name: 医院名
         person_name: 個人名
         sample_name: 実践事例名（元PDFファイル名）
@@ -242,16 +300,23 @@ def append_output_record(
 
     service.spreadsheets().values().append(
         spreadsheetId=spreadsheet_id,
-        range=f"{sheet_name}!A:E",
+        range=f"{sheet_name}!A:F",
         valueInputOption="USER_ENTERED",
         insertDataOption="INSERT_ROWS",
         body={
             "values": [
-                [clinic_name, person_name, sample_name, drive_url, processed_at]
+                [
+                    management_number,
+                    clinic_name,
+                    person_name,
+                    sample_name,
+                    drive_url,
+                    processed_at,
+                ]
             ]
         },
     ).execute()
 
     logger.info(
-        f"Sheets: 出力一覧に追加 ({clinic_name} / {person_name} / {sample_name})"
+        f"Sheets: 出力一覧に追加 ({management_number} / {clinic_name} / {person_name} / {sample_name})"
     )
