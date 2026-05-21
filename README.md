@@ -76,7 +76,7 @@ https://www.googleapis.com/auth/gmail.compose
 
 | 列 | ヘッダー | 内容 |
 |----|---------|------|
-| A | 管理番号 | プロファイルの `management_number_prefix` + 6桁ゼロパディング連番（例: `J24Q1-000001`、prefix 空なら `000001`） |
+| A | 管理番号 | 実践事例 PDF のファイル名先頭の8桁コード（例: `001-01-0`）。ファイル名が `NNN-NN-N` 形式（数字3-数字2-数字1）で始まらない場合は空欄 |
 | B | 医院名 | AIがPDFから自動抽出 |
 | C | 個人名 | AIがPDFから自動抽出 |
 | D | 実践事例名 | AIがPDFから自動抽出 |
@@ -107,7 +107,7 @@ https://www.googleapis.com/auth/gmail.compose
 
 ### なぜ必要か
 
-「ドキュメントタイプ × 提出期間」の組み合わせごとに **入力フォルダ / 出力フォルダ / 出力一覧シート / 管理番号 prefix** を切り替えるための仕組み。同一ワークフローを 1 本だけ保ったまま、四半期ごとの実践事例を別フォルダ・別シートに整理して処理できる。
+「ドキュメントタイプ × 提出期間」の組み合わせごとに **入力フォルダ / 出力フォルダ / 出力一覧シート** を切り替えるための仕組み。同一ワークフローを 1 本だけ保ったまま、四半期ごとの実践事例を別フォルダ・別シートに整理して処理できる。
 
 ```
 [現状] 1 ワークフロー → 固定の {入力/出力/シート/プロンプト} を直接参照
@@ -118,15 +118,17 @@ https://www.googleapis.com/auth/gmail.compose
 
 `profiles/*.yaml` に定義。コマンドラインからは `python -c "from src.profile import list_available_profiles; print(list_available_profiles())"` で一覧取得可能。
 
-| プロファイル名 | 入力 Secret | 出力 Secret | 出力シート | 管理番号 prefix |
-|---------------|------------|------------|-----------|----------------|
-| `jissen_default` | `DRIVE_FOLDER_ID` | `DRIVE_OUTPUT_FOLDER_ID` | `出力一覧` | （なし） |
-| `jissen_2024_q1` | `DRIVE_FOLDER_JISSEN_2024_Q1` | `DRIVE_OUTPUT_JISSEN_2024_Q1` | `実践事例_2024Q1_出力一覧` | `J24Q1-` |
-| `jissen_2024_q2` | `DRIVE_FOLDER_JISSEN_2024_Q2` | `DRIVE_OUTPUT_JISSEN_2024_Q2` | `実践事例_2024Q2_出力一覧` | `J24Q2-` |
-| `jissen_2024_q3` | `DRIVE_FOLDER_JISSEN_2024_Q3` | `DRIVE_OUTPUT_JISSEN_2024_Q3` | `実践事例_2024Q3_出力一覧` | `J24Q3-` |
-| `jissen_2024_q4` | `DRIVE_FOLDER_JISSEN_2024_Q4` | `DRIVE_OUTPUT_JISSEN_2024_Q4` | `実践事例_2024Q4_出力一覧` | `J24Q4-` |
+| プロファイル名 | 入力 Secret | 出力 Secret | 出力シート |
+|---------------|------------|------------|-----------|
+| `jissen_default` | `DRIVE_FOLDER_ID` | `DRIVE_OUTPUT_FOLDER_ID` | `出力一覧` |
+| `jissen_2024_q1` | `DRIVE_FOLDER_JISSEN_2024_Q1` | `DRIVE_OUTPUT_JISSEN_2024_Q1` | `実践事例_2024Q1_出力一覧` |
+| `jissen_2024_q2` | `DRIVE_FOLDER_JISSEN_2024_Q2` | `DRIVE_OUTPUT_JISSEN_2024_Q2` | `実践事例_2024Q2_出力一覧` |
+| `jissen_2024_q3` | `DRIVE_FOLDER_JISSEN_2024_Q3` | `DRIVE_OUTPUT_JISSEN_2024_Q3` | `実践事例_2024Q3_出力一覧` |
+| `jissen_2024_q4` | `DRIVE_FOLDER_JISSEN_2024_Q4` | `DRIVE_OUTPUT_JISSEN_2024_Q4` | `実践事例_2024Q4_出力一覧` |
 
-`jissen_default` は **既存挙動を完全維持する後方互換プロファイル**。`--profile` 引数を省略した場合の既定値でもあり、過去の Secret / シート / 管理番号採番ロジックがそのまま動く。
+管理番号はプロファイルに依らず、実践事例 PDF のファイル名先頭の `NNN-NN-N` 形式コードから抽出する（§4 参照）。
+
+`jissen_default` は **既存挙動を完全維持する後方互換プロファイル**。`--profile` 引数を省略した場合の既定値でもあり、過去の Secret / シートがそのまま動く。
 
 ### 新しいプロファイルを追加する手順
 
@@ -178,15 +180,14 @@ https://www.googleapis.com/auth/gmail.compose
 1. `DRIVE_INPUT_ROOT` 配下から `target_folder` 名のフォルダを検索（半角/全角・空白の有無の表記揺れは自動吸収）
 2. `DRIVE_OUTPUT_ROOT` 配下に同名フォルダを作成（既存ならスキップ）
 3. `SPREADSHEET_ID` に同名タブを作成（既存ならスキップ）
-4. 管理番号 prefix を `<target_folder>-` で派生（例: `2024_Q1_実践事例-000001`）
-5. 既存処理パイプライン（PDF 取得 → Claude API → コメント PDF 生成 → 結合 → Drive 保存 → Sheets 追記）を実行
+4. 既存処理パイプライン（PDF 取得 → Claude API → コメント PDF 生成 → 結合 → Drive 保存 → Sheets 追記）を実行
 
 ### 命名規約と派生ルール
 
-- **フォルダ名 = タブ名 = 管理番号 prefix の中身**（例: `2024_Q1_実践事例` → タブ `2024_Q1_実践事例` / 管理番号 `2024_Q1_実践事例-000001`）
+- **フォルダ名 = タブ名**（例: `2024_Q1_実践事例` → タブ `2024_Q1_実践事例`）
 - フォルダ名の sanitize は最小限。Drive で許される文字（半角/全角の日本語、英数字、`_` `-` 等）は基本そのまま使われる
 - 表記揺れマッチング: 「`医療法人 かがやき`」と「`医療法人かがやき`」のような半角/全角空白の有無や全角/半角英数字の差異は **同一フォルダ** と見なし、重複作成を防ぐ（lessons.md P-009 と同じ方針）
-- 管理番号は **同一プレフィックス内で連番継続**（既存シートの最大値 +1 から）。再実行しても連番が乱れない
+- 管理番号は **実践事例 PDF のファイル名先頭の `NNN-NN-N` 形式コードから抽出**する（target_folder モードでもプロファイルモードと同じ）。ファイル名がこの形式で始まらない場合は空欄になる（§4 参照）
 
 ### 候補名を確認する
 
@@ -223,9 +224,10 @@ period: "2024_q1"                             # 期間識別子
 input_folder_id_secret: DRIVE_FOLDER_XXX     # 環境変数名（解決はランタイム）
 output_folder_id_secret: DRIVE_OUTPUT_XXX    # 環境変数名（解決はランタイム）
 output_sheet_name: "実践事例_2024Q1_出力一覧" # 同一スプレッドシート内のシート名
-management_number_prefix: "J24Q1-"           # 管理番号の prefix（空文字で prefix なし）
 prompt_template: jissen_practice_case        # コメント生成プロンプト識別子
 ```
+
+> 管理番号は採番せず、実践事例 PDF のファイル名先頭の `NNN-NN-N` 形式コードから抽出するため、プロファイル/フォルダ自動検出のどちらでも prefix 設定は不要。
 
 ## 使い方
 
