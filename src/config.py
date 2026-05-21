@@ -55,6 +55,14 @@ GOOGLE_SCOPES = [
     "https://www.googleapis.com/auth/gmail.compose",
 ]
 
+# Google API の一過性エラー（503/429/5xx）に対する自動リトライ回数。
+# googleapiclient の ``HttpRequest.execute(num_retries=N)`` /
+# ``MediaIoBaseDownload.next_chunk(num_retries=N)`` に渡すと、5xx
+# （500/502/503/504）と 429/rate-limit エラーを指数バックオフ + ジッターで
+# 自動再試行する。指数バックオフは googleapiclient が担うため、こちらは
+# 回数のみ指定する。401/403/404 のような恒久エラーはリトライ対象外。
+GOOGLE_API_NUM_RETRIES = 5
+
 # ── 出力一覧シート設定 ──
 OUTPUT_SHEET_NAME = "出力一覧"
 

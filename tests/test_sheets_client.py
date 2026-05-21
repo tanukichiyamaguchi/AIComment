@@ -282,5 +282,88 @@ class TestGetProcessedManagementNumbers(unittest.TestCase):
                 sheets_client.get_processed_management_numbers()
 
 
+class TestGoogleApiRetry(unittest.TestCase):
+    """Sheets API 呼び出しが ``num_retries`` 付きで ``execute()`` されることを検証する。
+
+    Google Sheets API は 503 / 429 などの一過性エラーを一定確率で返すため、
+    ``execute(num_retries=N)`` で指数バックオフ・リトライさせる。これが無いと
+    503 が 1 回起きただけでワークフロー全体がクラッシュする（P-017）。
+    """
+
+    @patch("src.sheets_client.get_sheets_service")
+    def test_get_processed_management_numbers_passes_num_retries(
+        self, mock_get_service
+    ):
+        """``get_processed_management_numbers`` の get/values.get に num_retries が渡る。"""
+        service = TestGetProcessedManagementNumbers._build_service(
+            ["出力一覧"], [["001-01-0"]],
+        )
+        mock_get_service.return_value = service
+
+        sheets_client.get_processed_management_numbers(
+            spreadsheet_id="sid", sheet_name="出力一覧",
+        )
+
+        meta_execute = service.spreadsheets.return_value.get.return_value.execute
+        self.assertEqual(
+            meta_execute.call_args.kwargs.get("num_retries"),
+            sheets_client.GOOGLE_API_NUM_RETRIES,
+        )
+        values_execute = (
+            service.spreadsheets.return_value.values.return_value.get
+            .return_value.execute
+        )
+        self.assertEqual(
+            values_execute.call_args.kwargs.get("num_retries"),
+            sheets_client.GOOGLE_API_NUM_RETRIES,
+        )
+
+    @patch("src.sheets_client.get_sheets_service")
+    def test_append_output_record_passes_num_retries(self, mock_get_service):
+        """``append_output_record`` の values.append に num_retries=5 が渡る。"""
+        service = _build_service_with_sheets(["出力一覧"])
+        service.spreadsheets.return_value.values.return_value.get.return_value.execute.return_value = {
+            "values": [["管理番号"]]
+        }
+        mock_get_service.return_value = service
+
+        sheets_client.append_output_record(
+            management_number="000001",
+            clinic_name="A",
+            person_name="B",
+            sample_name="x.pdf",
+            drive_url="url",
+            spreadsheet_id="sid",
+            sheet_name="出力一覧",
+            processed_at="2026-05-21",
+        )
+
+        append_execute = (
+            service.spreadsheets.return_value.values.return_value.append
+            .return_value.execute
+        )
+        self.assertEqual(append_execute.call_args.kwargs.get("num_retries"), 5)
+
+    @patch("src.sheets_client.get_sheets_service")
+    def test_read_records_passes_num_retries(self, mock_get_service):
+        """``read_records`` の values.get に num_retries が渡る。"""
+        service = MagicMock()
+        service.spreadsheets.return_value.values.return_value.get.return_value.execute.return_value = {
+            "values": [["医院名", "氏名", "メール", "ステータス"]]
+        }
+        mock_get_service.return_value = service
+
+        sheets_client.read_records(spreadsheet_id="sid")
+
+        get_execute = (
+            service.spreadsheets.return_value.values.return_value.get
+            .return_value.execute
+        )
+        self.assertEqual(
+            get_execute.call_args.kwargs.get("num_retries"),
+            sheets_client.GOOGLE_API_NUM_RETRIES,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -13,6 +13,7 @@ from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
 from src.config import (
     DRIVE_FOLDER_ID,
+    GOOGLE_API_NUM_RETRIES,
     GOOGLE_CREDENTIALS_JSON,
     GOOGLE_OAUTH_TOKEN_JSON,
     GOOGLE_SCOPES,
@@ -117,7 +118,7 @@ def list_pdfs(folder_id: str | None = None) -> list[dict]:
             pageSize=DRIVE_PAGE_SIZE,
             supportsAllDrives=True,
             includeItemsFromAllDrives=True,
-        ).execute()
+        ).execute(num_retries=GOOGLE_API_NUM_RETRIES)
 
         files.extend(response.get("files", []))
         page_token = response.get("nextPageToken")
@@ -148,7 +149,7 @@ def download_pdf(file_id: str) -> bytes:
 
     done = False
     while not done:
-        _, done = downloader.next_chunk()
+        _, done = downloader.next_chunk(num_retries=GOOGLE_API_NUM_RETRIES)
 
     data = buffer.getvalue()
     logger.info(f"Drive: ダウンロード完了 (ID: {file_id}, {len(data)} bytes)")
@@ -202,7 +203,7 @@ def find_or_create_folder(
             pageToken=page_token,
             supportsAllDrives=True,
             includeItemsFromAllDrives=True,
-        ).execute()
+        ).execute(num_retries=GOOGLE_API_NUM_RETRIES)
 
         for existing_file in response.get("files", []):
             existing_name = existing_file["name"]
@@ -232,7 +233,7 @@ def find_or_create_folder(
         body=metadata,
         fields="id",
         supportsAllDrives=True,
-    ).execute()
+    ).execute(num_retries=GOOGLE_API_NUM_RETRIES)
     new_id: str = created["id"]
     logger.info(f"Drive: フォルダ新規作成 ({folder_name}, ID: {new_id})")
     return new_id
@@ -275,7 +276,7 @@ def upload_pdf(
             media_body=media,
             fields="id, webViewLink",
             supportsAllDrives=True,
-        ).execute()
+        ).execute(num_retries=GOOGLE_API_NUM_RETRIES)
 
     file_id: str = created["id"]
     web_view_link: str = created.get("webViewLink", "")

@@ -11,6 +11,7 @@ from typing import Any
 from googleapiclient.discovery import build
 
 from src.config import (
+    GOOGLE_API_NUM_RETRIES,
     GOOGLE_CREDENTIALS_JSON,
     GOOGLE_SCOPES,
     OUTPUT_SHEET_NAME,
@@ -88,7 +89,7 @@ def read_records(
     result = service.spreadsheets().values().get(
         spreadsheetId=spreadsheet_id,
         range=range_name,
-    ).execute()
+    ).execute(num_retries=GOOGLE_API_NUM_RETRIES)
 
     rows = result.get("values", [])
     if not rows:
@@ -161,7 +162,7 @@ def update_status(
         range=range_name,
         valueInputOption="RAW",
         body={"values": [[status]]},
-    ).execute()
+    ).execute(num_retries=GOOGLE_API_NUM_RETRIES)
 
     logger.info(f"Sheets: 行{row_number}のステータスを「{status}」に更新")
 
@@ -182,7 +183,9 @@ def _ensure_output_sheet(
     sheet_name: str,
 ) -> None:
     """出力一覧シートが無ければ作成し、ヘッダー行を書き込む。"""
-    meta = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+    meta = service.spreadsheets().get(
+        spreadsheetId=spreadsheet_id
+    ).execute(num_retries=GOOGLE_API_NUM_RETRIES)
     existing_titles = [s["properties"]["title"] for s in meta.get("sheets", [])]
 
     if sheet_name not in existing_titles:
@@ -193,21 +196,21 @@ def _ensure_output_sheet(
                     {"addSheet": {"properties": {"title": sheet_name}}}
                 ]
             },
-        ).execute()
+        ).execute(num_retries=GOOGLE_API_NUM_RETRIES)
         logger.info(f"Sheets: 出力一覧シートを新規作成 ({sheet_name})")
 
     header_range = f"{sheet_name}!A1:F1"
     current = service.spreadsheets().values().get(
         spreadsheetId=spreadsheet_id,
         range=header_range,
-    ).execute()
+    ).execute(num_retries=GOOGLE_API_NUM_RETRIES)
     if not current.get("values"):
         service.spreadsheets().values().update(
             spreadsheetId=spreadsheet_id,
             range=header_range,
             valueInputOption="RAW",
             body={"values": [_OUTPUT_HEADER]},
-        ).execute()
+        ).execute(num_retries=GOOGLE_API_NUM_RETRIES)
         logger.info(f"Sheets: 出力一覧シートのヘッダーを書き込み ({sheet_name})")
 
 
@@ -239,7 +242,9 @@ def get_processed_management_numbers(
 
     # 出力一覧シートがまだ作成されていない（初回実行）場合、A2:A の取得は
     # 400 エラーになる。シート一覧を先に確認し、未作成なら空集合で返す。
-    meta = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+    meta = service.spreadsheets().get(
+        spreadsheetId=spreadsheet_id
+    ).execute(num_retries=GOOGLE_API_NUM_RETRIES)
     existing_titles = [s["properties"]["title"] for s in meta.get("sheets", [])]
     if sheet_name not in existing_titles:
         logger.info(
@@ -250,7 +255,7 @@ def get_processed_management_numbers(
     result = service.spreadsheets().values().get(
         spreadsheetId=spreadsheet_id,
         range=f"{sheet_name}!A2:A",
-    ).execute()
+    ).execute(num_retries=GOOGLE_API_NUM_RETRIES)
 
     rows = result.get("values", [])
     processed = {
@@ -316,7 +321,7 @@ def append_output_record(
                 ]
             ]
         },
-    ).execute()
+    ).execute(num_retries=GOOGLE_API_NUM_RETRIES)
 
     logger.info(
         f"Sheets: 出力一覧に追加 ({management_number} / {clinic_name} / {person_name} / {sample_name})"
