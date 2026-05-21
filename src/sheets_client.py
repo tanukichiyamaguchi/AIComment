@@ -211,6 +211,59 @@ def _ensure_output_sheet(
         logger.info(f"Sheets: 出力一覧シートのヘッダーを書き込み ({sheet_name})")
 
 
+def get_processed_management_numbers(
+    spreadsheet_id: str | None = None,
+    sheet_name: str | None = None,
+) -> set[str]:
+    """出力一覧シートの A列（管理番号）から、処理済み管理番号の集合を返す。
+
+    重複検知（増分処理）に使う。入力フォルダに PDF を継続的に追加して
+    ワークフローを再実行するとき、既に出力済みの管理番号を事前に把握し、
+    download / Claude API 呼び出しの前にスキップ判定するためのキー集合。
+
+    Args:
+        spreadsheet_id: スプレッドシートID（省略時は設定値 ``SPREADSHEET_ID``）
+        sheet_name: シート名（省略時は設定値 ``OUTPUT_SHEET_NAME``）
+
+    Returns:
+        処理済み管理番号の集合。空セル・ヘッダー行は除外する。
+        シートが未作成（``_ensure_output_sheet`` 前）の場合や
+        ``values`` キーが無い場合は空集合を返す。
+    """
+    spreadsheet_id = spreadsheet_id or SPREADSHEET_ID
+    if not spreadsheet_id:
+        raise ValueError("SPREADSHEET_IDが設定されていません")
+    sheet_name = sheet_name or OUTPUT_SHEET_NAME
+
+    service = get_sheets_service()
+
+    # 出力一覧シートがまだ作成されていない（初回実行）場合、A2:A の取得は
+    # 400 エラーになる。シート一覧を先に確認し、未作成なら空集合で返す。
+    meta = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+    existing_titles = [s["properties"]["title"] for s in meta.get("sheets", [])]
+    if sheet_name not in existing_titles:
+        logger.info(
+            f"Sheets: 出力一覧シート未作成のため処理済み管理番号は0件 ({sheet_name})"
+        )
+        return set()
+
+    result = service.spreadsheets().values().get(
+        spreadsheetId=spreadsheet_id,
+        range=f"{sheet_name}!A2:A",
+    ).execute()
+
+    rows = result.get("values", [])
+    processed = {
+        row[0].strip()
+        for row in rows
+        if row and row[0] and row[0].strip()
+    }
+    logger.info(
+        f"Sheets: 処理済み管理番号 {len(processed)}件を取得 ({sheet_name})"
+    )
+    return processed
+
+
 def append_output_record(
     management_number: str,
     clinic_name: str,
