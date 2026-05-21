@@ -3,6 +3,7 @@
 import unittest
 
 from src.utils import (
+    extract_clinic_number,
     extract_management_number,
     is_attachment_filename,
     mask_email,
@@ -129,8 +130,9 @@ class TestNormalizeNameForMatch(unittest.TestCase):
 class TestExtractManagementNumber(unittest.TestCase):
     """PDFファイル名先頭からの管理番号抽出のテスト。
 
-    実践事例 PDF はファイル名先頭に ``NNN-NN-N``（数字3-数字2-数字1、
-    計8文字）形式の管理番号が埋め込まれている。
+    実践事例 PDF はファイル名先頭に ``NNN-NN-N``（先頭セグメント 3〜5桁 -
+    数字2 - 数字1）形式の管理番号が埋め込まれている。先頭セグメント
+    （= 医院番号）が 3〜5 桁可変なので、管理番号全体は 7〜9 文字になる。
     """
 
     def test_extracts_from_title_directly_after_code(self):
@@ -163,13 +165,28 @@ class TestExtractManagementNumber(unittest.TestCase):
         """先頭グループの桁数不足 ``01-01-0.pdf`` → 空文字列。"""
         self.assertEqual(extract_management_number("01-01-0.pdf"), "")
 
-    def test_returns_empty_when_first_group_too_long(self):
-        """先頭グループが 4 桁 ``0001-01-0.pdf`` → 空文字列。
+    def test_extracts_four_digit_first_group(self):
+        """先頭グループが 4 桁 ``0001-01-0.pdf`` → ``0001-01-0``。
 
-        ``^\\d{3}-\\d{2}-\\d`` は先頭 ``000`` にマッチするが、その直後に
-        ハイフンが必要なところで ``1`` が来るためマッチしない。
+        医院番号（先頭セグメント）は 3〜5 桁可変なので 4 桁も有効。
         """
-        self.assertEqual(extract_management_number("0001-01-0.pdf"), "")
+        self.assertEqual(
+            extract_management_number("0001-01-0.pdf"), "0001-01-0"
+        )
+
+    def test_extracts_five_digit_first_group(self):
+        """先頭グループが 5 桁 ``00001-01-0.pdf`` → ``00001-01-0``（5桁も有効）。"""
+        self.assertEqual(
+            extract_management_number("00001-01-0.pdf"), "00001-01-0"
+        )
+
+    def test_returns_empty_when_first_group_six_digits(self):
+        """先頭グループが 6 桁 ``000001-01-0.pdf`` → 空文字列（6桁は無効）。
+
+        ``^\\d{3,5}-\\d{2}-\\d`` は先頭 5 桁 ``00000`` までしかマッチせず、
+        その直後にハイフンが必要なところで ``1`` が来るためマッチしない。
+        """
+        self.assertEqual(extract_management_number("000001-01-0.pdf"), "")
 
     def test_returns_empty_for_empty_string(self):
         """空文字列 ``""`` → 空文字列。"""
@@ -209,6 +226,69 @@ class TestExtractManagementNumber(unittest.TestCase):
     def test_extracts_with_leading_zeros(self):
         """先頭ゼロを含む ``000-00-0実践.pdf`` → ``000-00-0``。"""
         self.assertEqual(extract_management_number("000-00-0実践.pdf"), "000-00-0")
+
+
+class TestExtractClinicNumber(unittest.TestCase):
+    """PDFファイル名先頭の管理番号からの医院番号抽出のテスト。
+
+    医院番号 = 管理番号 ``NNN-NN-N`` の先頭セグメント（最初のハイフンより前、
+    3〜5 桁）。例: ``001-01-0実践事例.pdf`` → ``001``。
+    """
+
+    def test_extracts_three_digit_clinic_number(self):
+        """3桁医院番号 ``001-01-0実践事例.pdf`` → ``001``。"""
+        self.assertEqual(
+            extract_clinic_number("001-01-0実践事例タイトル.pdf"), "001"
+        )
+
+    def test_extracts_four_digit_clinic_number(self):
+        """4桁医院番号 ``0012-34-5.pdf`` → ``0012``。"""
+        self.assertEqual(extract_clinic_number("0012-34-5.pdf"), "0012")
+
+    def test_extracts_five_digit_clinic_number(self):
+        """5桁医院番号 ``00123-45-6.pdf`` → ``00123``。"""
+        self.assertEqual(extract_clinic_number("00123-45-6.pdf"), "00123")
+
+    def test_extracts_when_separated_by_underscore(self):
+        """区切りがアンダースコア ``012-03-4_別の事例.pdf`` → ``012``。"""
+        self.assertEqual(extract_clinic_number("012-03-4_別の事例.pdf"), "012")
+
+    def test_returns_empty_when_no_management_number(self):
+        """先頭が管理番号でない ``実践事例.pdf`` → 空文字列。"""
+        self.assertEqual(extract_clinic_number("実践事例.pdf"), "")
+
+    def test_returns_empty_when_first_group_too_short(self):
+        """先頭グループが 2 桁 ``01-01-0.pdf`` → 空文字列。"""
+        self.assertEqual(extract_clinic_number("01-01-0.pdf"), "")
+
+    def test_returns_empty_when_first_group_six_digits(self):
+        """先頭グループが 6 桁 ``000001-01-0.pdf`` → 空文字列（6桁は無効）。"""
+        self.assertEqual(extract_clinic_number("000001-01-0.pdf"), "")
+
+    def test_returns_empty_for_empty_string(self):
+        """空文字列 → 空文字列。"""
+        self.assertEqual(extract_clinic_number(""), "")
+
+    def test_returns_empty_for_fullwidth_hyphen(self):
+        """ハイフンが全角 ``００１ー０１ー０.pdf`` → 空文字列（半角のみ対象）。"""
+        self.assertEqual(extract_clinic_number("００１ー０１ー０.pdf"), "")
+
+    def test_non_string_input_is_coerced(self):
+        """非文字列入力（int 等）は str に変換される。
+
+        int ``1234567`` は ``"1234567"`` となり、``123`` の後にハイフンが
+        ないためマッチせず空文字列を返す。
+        """
+        self.assertEqual(extract_clinic_number(1234567), "")  # type: ignore[arg-type]
+
+    def test_clinic_number_matches_management_number_prefix(self):
+        """医院番号は管理番号の先頭ハイフンより前の部分と一致する。"""
+        filename = "00123-45-6実践事例.pdf"
+        mgmt = extract_management_number(filename)
+        clinic = extract_clinic_number(filename)
+        self.assertEqual(mgmt, "00123-45-6")
+        self.assertEqual(clinic, "00123")
+        self.assertEqual(mgmt.split("-")[0], clinic)
 
 
 class TestIsAttachmentFilename(unittest.TestCase):

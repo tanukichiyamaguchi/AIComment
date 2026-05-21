@@ -224,6 +224,42 @@ class TestUploadPdfToClinicPerson(unittest.TestCase):
         self.assertEqual(upload_kwargs["folder_id"], "person_id")
         self.assertEqual(upload_kwargs["file_name"], "事例A.pdf")
 
+    @patch("src.drive_client.upload_pdf")
+    @patch("src.drive_client.find_or_create_folder")
+    @patch("src.drive_client.get_drive_service")
+    def test_return_value_includes_clinic_folder_id(
+        self, mock_get_service, mock_find_or_create, mock_upload
+    ):
+        """戻り値に医院フォルダの ID（``clinic_folder_id``）が含まれる。
+
+        医院フォルダ URL シートの記録に使うため、呼び出し側が医院フォルダ
+        の Drive ID を受け取れる必要がある。
+        """
+        service = MagicMock()
+        mock_get_service.return_value = service
+        # 1 回目 = 医院フォルダ、2 回目 = 個人フォルダ
+        mock_find_or_create.side_effect = ["clinic_folder_xyz", "person_id"]
+        mock_upload.return_value = {
+            "id": "uploaded_file", "webViewLink": "https://drive/view",
+        }
+
+        with TemporaryDirectory() as tmp:
+            pdf_path = Path(tmp) / "事例.pdf"
+            pdf_path.write_bytes(b"%PDF")
+
+            result = drive_client.upload_pdf_to_clinic_person(
+                file_path=pdf_path,
+                output_root_folder_id="root_id",
+                clinic_name="001_三浦歯科医院",
+                person_name="白川 蓮",
+                file_name="事例.pdf",
+            )
+
+        # 既存キーは維持され、clinic_folder_id が追加されている
+        self.assertEqual(result["clinic_folder_id"], "clinic_folder_xyz")
+        self.assertEqual(result["id"], "uploaded_file")
+        self.assertEqual(result["webViewLink"], "https://drive/view")
+
 
 class TestSharedDriveSupport(unittest.TestCase):
     """共有ドライブ対応：すべての Drive API 呼び出しに supportsAllDrives=True が

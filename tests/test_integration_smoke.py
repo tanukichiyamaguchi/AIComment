@@ -81,6 +81,7 @@ def _install_main_mocks(
     mock_drive.download_pdf.return_value = b"%PDF-1.4 fake"
     mock_drive.upload_pdf_to_clinic_person.return_value = {
         "webViewLink": "https://drive.google.com/fake",
+        "clinic_folder_id": "clinic_folder_fake",
     }
     mock_reader.extract_text.return_value = "PDFテキスト"
     mock_gen.generate_comment_with_metadata.return_value = _make_metadata()
@@ -455,6 +456,7 @@ class TestManagementNumberFromFilename(unittest.TestCase):
         mock_drive.download_pdf.return_value = b"%PDF-1.4 fake"
         mock_drive.upload_pdf_to_clinic_person.return_value = {
             "webViewLink": "https://drive.google.com/fake",
+            "clinic_folder_id": "clinic_folder_fake",
         }
         mock_reader.extract_text.return_value = "PDFテキスト"
         mock_gen.generate_comment_with_metadata.return_value = _make_metadata()
@@ -492,6 +494,7 @@ class TestManagementNumberFromFilename(unittest.TestCase):
         mock_drive.download_pdf.return_value = b"%PDF-1.4 fake"
         mock_drive.upload_pdf_to_clinic_person.return_value = {
             "webViewLink": "https://drive.google.com/fake",
+            "clinic_folder_id": "clinic_folder_fake",
         }
         mock_reader.extract_text.return_value = "PDFテキスト"
         mock_gen.generate_comment_with_metadata.return_value = _make_metadata()
@@ -682,6 +685,7 @@ class TestBatchE2E(unittest.TestCase):
         mock_drive.download_pdf.return_value = b"%PDF-1.4 fake"
         mock_drive.upload_pdf_to_clinic_person.return_value = {
             "webViewLink": "https://drive.google.com/fake",
+            "clinic_folder_id": "clinic_folder_fake",
         }
         mock_reader.extract_text.return_value = "PDFテキスト"
         mock_gen.submit_batch.return_value = "batch_test_001"
@@ -1009,6 +1013,7 @@ class TestLegacyBehaviorRegression(unittest.TestCase):
         mock_drive.download_pdf.return_value = b"%PDF-1.4 fake"
         mock_drive.upload_pdf_to_clinic_person.return_value = {
             "webViewLink": "https://drive.google.com/fake",
+            "clinic_folder_id": "clinic_folder_fake",
         }
         mock_reader.extract_text.return_value = "PDFテキスト"
         mock_gen.generate_comment_with_metadata.return_value = {
@@ -1067,13 +1072,15 @@ class TestLegacyBehaviorRegression(unittest.TestCase):
 
         main.run(test_count=0, profile_name="jissen_default")
 
-        # upload 呼び出しで clinic_name がそのまま渡される
-        # （正規化は find_or_create_folder 内部で行われる責務分離）
+        # upload 呼び出しで医院フォルダ名 <医院番号>_<医院名> が渡される。
+        # 医院名部分の表記揺れはそのまま保持され、正規化は
+        # find_or_create_folder 内部で行われる（責務分離 / P-018）。
+        # PDF は 001-00-0... / 002-00-0... なので医院番号は 001 / 002。
         upload_calls = mock_drive.upload_pdf_to_clinic_person.call_args_list
         self.assertEqual(len(upload_calls), 2)
         clinics = [c.kwargs["clinic_name"] for c in upload_calls]
-        self.assertEqual(clinics[0], "医療法人 かがやき")
-        self.assertEqual(clinics[1], "医療法人かがやき")
+        self.assertEqual(clinics[0], "001_医療法人 かがやき")
+        self.assertEqual(clinics[1], "002_医療法人かがやき")
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -1181,6 +1188,7 @@ class TestTargetFolderE2E(unittest.TestCase):
         mock_drive.download_pdf.return_value = b"%PDF-1.4 fake"
         mock_drive.upload_pdf_to_clinic_person.return_value = {
             "webViewLink": "https://drive.google.com/fake",
+            "clinic_folder_id": "clinic_folder_fake",
         }
         mock_reader.extract_text.return_value = "PDFテキスト"
         mock_gen.submit_batch.return_value = "batch_test_001"
@@ -1239,6 +1247,7 @@ class TestTargetFolderE2E(unittest.TestCase):
         mock_drive.download_pdf.return_value = b"%PDF-1.4 fake"
         mock_drive.upload_pdf_to_clinic_person.return_value = {
             "webViewLink": "https://drive.google.com/fake",
+            "clinic_folder_id": "clinic_folder_fake",
         }
         mock_reader.extract_text.return_value = "PDFテキスト"
         mock_gen.generate_comment_with_metadata.return_value = _make_metadata()
@@ -1347,6 +1356,7 @@ class TestProfileModeRegressionAfterDiscoveryAdded(unittest.TestCase):
         mock_drive.download_pdf.return_value = b"%PDF-1.4 fake"
         mock_drive.upload_pdf_to_clinic_person.return_value = {
             "webViewLink": "url",
+            "clinic_folder_id": "clinic_folder_fake",
         }
         mock_reader.extract_text.return_value = "テキスト"
         mock_gen.submit_batch.return_value = "batch_001"
@@ -1543,6 +1553,7 @@ class TestAttachmentPassthroughE2E(unittest.TestCase):
         mock_drive.download_pdf.return_value = b"%PDF-1.4 fake"
         mock_drive.upload_pdf_to_clinic_person.return_value = {
             "webViewLink": "https://drive.google.com/fake",
+            "clinic_folder_id": "clinic_folder_fake",
         }
         mock_sheets.get_processed_management_numbers.return_value = set()
         mock_reader.extract_text.return_value = "PDFテキスト"
@@ -1555,7 +1566,8 @@ class TestAttachmentPassthroughE2E(unittest.TestCase):
 
         # メイン 1 件は Claude API に投げる、添付資料は投げない
         self.assertEqual(mock_gen.generate_comment_with_metadata.call_count, 1)
-        # upload は 2 回、両方とも同じ医院/個人フォルダへ
+        # upload は 2 回、両方とも同じ医院フォルダへ。医院フォルダ名は
+        # <医院番号>_<医院名>（管理番号 001-01-0 → 医院番号 001）。
         self.assertEqual(mock_drive.upload_pdf_to_clinic_person.call_count, 2)
         clinics = {
             c.kwargs["clinic_name"]
@@ -1565,7 +1577,7 @@ class TestAttachmentPassthroughE2E(unittest.TestCase):
             c.kwargs["person_name"]
             for c in mock_drive.upload_pdf_to_clinic_person.call_args_list
         }
-        self.assertEqual(clinics, {"山田歯科"})
+        self.assertEqual(clinics, {"001_山田歯科"})
         self.assertEqual(persons, {"田中太郎"})
         # シートは 2 行。両方とも管理番号 001-01-0。メイン処理が先、添付資料が後。
         self.assertEqual(mock_sheets.append_output_record.call_count, 2)
@@ -1599,6 +1611,7 @@ class TestAttachmentPassthroughE2E(unittest.TestCase):
         mock_drive.download_pdf.return_value = b"%PDF-1.4 fake"
         mock_drive.upload_pdf_to_clinic_person.return_value = {
             "webViewLink": "https://drive.google.com/fake",
+            "clinic_folder_id": "clinic_folder_fake",
         }
         mock_sheets.get_processed_management_numbers.return_value = set()
         mock_reader.extract_text.return_value = "PDFテキスト"
@@ -1628,10 +1641,11 @@ class TestAttachmentPassthroughE2E(unittest.TestCase):
         submit_arg = mock_gen.submit_batch.call_args.args[0]
         self.assertEqual(len(submit_arg), 1)
         self.assertEqual(submit_arg[0]["pdf_file_name"], "001-01-0実践事例.pdf")
-        # upload は 2 回（メイン + 添付資料）、両方同じ医院/個人フォルダへ
+        # upload は 2 回（メイン + 添付資料）、両方同じ医院フォルダへ。
+        # 医院フォルダ名は <医院番号>_<医院名>（管理番号 001-01-0 → 001）。
         self.assertEqual(mock_drive.upload_pdf_to_clinic_person.call_count, 2)
         att_upload = mock_drive.upload_pdf_to_clinic_person.call_args_list[1]
-        self.assertEqual(att_upload.kwargs["clinic_name"], "山田歯科")
+        self.assertEqual(att_upload.kwargs["clinic_name"], "001_山田歯科")
         self.assertEqual(att_upload.kwargs["person_name"], "田中太郎")
         self.assertEqual(
             att_upload.kwargs["file_name"], "001-01-0【添付資料】補足資料.pdf"
@@ -1646,6 +1660,164 @@ class TestAttachmentPassthroughE2E(unittest.TestCase):
             rows[1].kwargs["sample_name"],
             "【添付資料】001-01-0【添付資料】補足資料.pdf",
         )
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 11. 医院番号付きフォルダ + 医院フォルダURLシートの E2E スモークテスト
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestClinicNumberFolderE2E(unittest.TestCase):
+    """医院番号付きフォルダ名 + 医院フォルダURLシート記録の結合テスト。
+
+    医院フォルダ名は ``<医院番号>_<医院名>``（医院番号 = 管理番号の先頭
+    セグメント）。医院フォルダURLシート（``<出力シート名>_医院``）に
+    医院番号 / 医院名 / フォルダURL が記録され、同一医院は 1 行のみ。
+    """
+
+    def setUp(self):
+        self._env_patcher = patch.dict(os.environ, _PROFILE_ENV, clear=False)
+        self._env_patcher.start()
+
+    def tearDown(self):
+        self._env_patcher.stop()
+
+    @patch("src.main.ensure_fonts")
+    @patch("src.main.pdf_merger")
+    @patch("src.main.pdf_creator")
+    @patch("src.main.pdf_reader")
+    @patch("src.main.comment_generator")
+    @patch("src.main.sheets_client")
+    @patch("src.main.drive_client")
+    def test_main_e2e_clinic_number_folder_and_sheet(
+        self, mock_drive, mock_sheets, mock_gen, mock_reader,
+        mock_creator, mock_merger, mock_fonts,
+    ):
+        """通常モード E2E: 医院番号付きフォルダ + 医院シート記録。"""
+        # 医院番号 001 が 2 件、002 が 1 件
+        mock_drive.list_pdfs.return_value = [
+            {"id": "id_1", "name": "001-01-0実践事例A.pdf"},
+            {"id": "id_2", "name": "001-01-1実践事例B.pdf"},
+            {"id": "id_3", "name": "002-02-0実践事例C.pdf"},
+        ]
+        mock_drive.download_pdf.return_value = b"%PDF-1.4 fake"
+        mock_drive.upload_pdf_to_clinic_person.return_value = {
+            "webViewLink": "https://drive.google.com/fake",
+            "clinic_folder_id": "clinic_folder_id_xyz",
+        }
+        mock_sheets.get_processed_management_numbers.return_value = set()
+        mock_sheets.get_recorded_clinic_numbers.return_value = set()
+        mock_reader.extract_text.return_value = "PDFテキスト"
+        mock_gen.generate_comment_with_metadata.return_value = _make_metadata()
+        mock_merger.make_output_filename.return_value = "out.pdf"
+
+        main.run(test_count=0, profile_name="jissen_default")
+
+        # 全 3 件、医院フォルダ名は <医院番号>_<医院名>
+        clinic_folders = [
+            c.kwargs["clinic_name"]
+            for c in mock_drive.upload_pdf_to_clinic_person.call_args_list
+        ]
+        self.assertEqual(
+            clinic_folders, ["001_山田歯科", "001_山田歯科", "002_山田歯科"]
+        )
+        # 出力一覧シートの医院名列は AI 抽出値（医院番号なし）
+        for c in mock_sheets.append_output_record.call_args_list:
+            self.assertEqual(c.kwargs["clinic_name"], "山田歯科")
+        # 医院フォルダURLシート（出力一覧_医院）に医院番号ごとに 1 行
+        # （001 と 002、001 は重複しない）
+        recorded = [
+            c.kwargs["clinic_number"]
+            for c in mock_sheets.append_clinic_folder_record.call_args_list
+        ]
+        self.assertEqual(recorded, ["001", "002"])
+        for c in mock_sheets.append_clinic_folder_record.call_args_list:
+            self.assertEqual(c.kwargs["sheet_name"], "出力一覧_医院")
+            self.assertEqual(
+                c.kwargs["clinic_folder_url"],
+                "https://drive.google.com/drive/folders/clinic_folder_id_xyz",
+            )
+
+    @patch("src.main.ensure_fonts")
+    @patch("src.main.pdf_merger")
+    @patch("src.main.pdf_creator")
+    @patch("src.main.pdf_reader")
+    @patch("src.main.comment_generator")
+    @patch("src.main.sheets_client")
+    @patch("src.main.drive_client")
+    def test_main_e2e_clinic_sheet_name_derives_from_output_sheet(
+        self, mock_drive, mock_sheets, mock_gen, mock_reader,
+        mock_creator, mock_merger, mock_fonts,
+    ):
+        """医院シート名は ``<出力シート名>_医院``（プロファイル依存）。"""
+        _install_main_mocks(
+            mock_drive, mock_sheets, mock_gen, mock_reader,
+            mock_creator, mock_merger, mock_fonts, pdf_count=1,
+        )
+        mock_sheets.get_recorded_clinic_numbers.return_value = set()
+
+        main.run(test_count=0, profile_name="jissen_2024_q1")
+
+        # Q1 プロファイルの出力シートは 実践事例_2024Q1_出力一覧
+        # → 医院シートは 実践事例_2024Q1_出力一覧_医院
+        snapshot = mock_sheets.get_recorded_clinic_numbers.call_args.kwargs
+        self.assertEqual(snapshot["sheet_name"], "実践事例_2024Q1_出力一覧_医院")
+        rec = mock_sheets.append_clinic_folder_record.call_args.kwargs
+        self.assertEqual(rec["sheet_name"], "実践事例_2024Q1_出力一覧_医院")
+
+    @patch("src.batch_main.ensure_fonts")
+    @patch("src.batch_main.pdf_merger")
+    @patch("src.batch_main.pdf_creator")
+    @patch("src.batch_main.pdf_reader")
+    @patch("src.batch_main.comment_generator")
+    @patch("src.batch_main.sheets_client")
+    @patch("src.batch_main.drive_client")
+    def test_batch_e2e_clinic_number_folder_and_sheet(
+        self, mock_drive, mock_sheets, mock_gen, mock_reader,
+        mock_creator, mock_merger, mock_fonts,
+    ):
+        """Batch モード E2E: 医院番号付きフォルダ + 医院シート記録。"""
+        mock_drive.list_pdfs.return_value = [
+            {"id": "id_1", "name": "001-01-0実践事例A.pdf"},
+            {"id": "id_2", "name": "002-02-0実践事例B.pdf"},
+        ]
+        mock_drive.download_pdf.return_value = b"%PDF-1.4 fake"
+        mock_drive.upload_pdf_to_clinic_person.return_value = {
+            "webViewLink": "https://drive.google.com/fake",
+            "clinic_folder_id": "clinic_folder_batch",
+        }
+        mock_sheets.get_processed_management_numbers.return_value = set()
+        mock_sheets.get_recorded_clinic_numbers.return_value = set()
+        mock_reader.extract_text.return_value = "PDFテキスト"
+        mock_gen.submit_batch.return_value = "batch_clinic_001"
+        mock_gen.get_batch_status.return_value = {
+            "status": "ended",
+            "request_counts": {
+                "processing": 0, "succeeded": 2,
+                "errored": 0, "canceled": 0, "expired": 0,
+            },
+        }
+        mock_gen.get_batch_results.return_value = (
+            {f"item_{i:04d}": _make_metadata() for i in range(1, 3)}, [],
+        )
+        mock_merger.make_output_filename.return_value = "out.pdf"
+
+        with patch("src.batch_main.time.sleep"):
+            batch_main.run(
+                batch_mode=True, test_count=0, step="all",
+                profile_name="jissen_default",
+            )
+
+        clinic_folders = {
+            c.kwargs["clinic_name"]
+            for c in mock_drive.upload_pdf_to_clinic_person.call_args_list
+        }
+        self.assertEqual(clinic_folders, {"001_山田歯科", "002_山田歯科"})
+        recorded = sorted(
+            c.kwargs["clinic_number"]
+            for c in mock_sheets.append_clinic_folder_record.call_args_list
+        )
+        self.assertEqual(recorded, ["001", "002"])
 
 
 if __name__ == "__main__":

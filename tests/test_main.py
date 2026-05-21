@@ -73,6 +73,7 @@ def _install_run_mocks(
     mock_drive.download_pdf.return_value = b"%PDF-1.4 fake"
     mock_drive.upload_pdf_to_clinic_person.return_value = {
         "webViewLink": "https://drive.google.com/fake",
+        "clinic_folder_id": "clinic_folder_fake",
     }
     mock_reader.extract_text.return_value = "PDFテキスト"
     mock_gen.generate_comment_with_metadata.return_value = {
@@ -411,12 +412,13 @@ class TestRunAttachmentPassthrough(unittest.TestCase):
 
         main_module.run(test_count=0, profile_name="jissen_default")
 
-        # upload は 2 回（メイン + 添付資料）。両方とも同じ医院/個人フォルダへ。
+        # upload は 2 回（メイン + 添付資料）。両方とも同じ医院フォルダへ。
+        # 医院フォルダ名は <医院番号>_<医院名>（001-01-0 → 医院番号 001）。
         self.assertEqual(
             mock_drive_client.upload_pdf_to_clinic_person.call_count, 2
         )
         for call in mock_drive_client.upload_pdf_to_clinic_person.call_args_list:
-            self.assertEqual(call.kwargs["clinic_name"], "山田歯科")
+            self.assertEqual(call.kwargs["clinic_name"], "001_山田歯科")
             self.assertEqual(call.kwargs["person_name"], "田中太郎")
             self.assertEqual(
                 call.kwargs["output_root_folder_id"], "output_folder_yyy"
@@ -683,6 +685,186 @@ class TestRunAttachmentPassthrough(unittest.TestCase):
             for c in mock_sheets_client.append_output_record.call_args_list
         ]
         self.assertEqual(mgmt_nums, ["001-01-1", "001-01-1"])
+
+
+class TestRunClinicNumberFolder(unittest.TestCase):
+    """``run()`` の医院番号付きフォルダ名 + 医院フォルダURLシート記録。
+
+    医院フォルダ名は ``<医院番号>_<医院名>``（医院番号 = 管理番号の先頭
+    セグメント）。医院フォルダURLシート（``<出力シート名>_医院``）に
+    医院番号 / 医院名 / フォルダURL を記録し、同一医院は 1 行のみ。
+    """
+
+    @patch("src.main.ensure_fonts")
+    @patch("src.main.pdf_merger")
+    @patch("src.main.pdf_creator")
+    @patch("src.main.pdf_reader")
+    @patch("src.main.comment_generator")
+    @patch("src.main.sheets_client")
+    @patch("src.main.drive_client")
+    @patch("src.discover.load_profile")
+    def test_clinic_folder_name_has_clinic_number_prefix(
+        self, mock_load_profile, mock_drive_client, mock_sheets_client,
+        mock_gen, mock_reader, mock_creator, mock_merger, mock_ensure_fonts,
+    ):
+        """医院フォルダ名が ``<医院番号>_<医院名>`` になる。"""
+        mock_load_profile.return_value = _make_profile()
+        mock_sheets_client.get_processed_management_numbers.return_value = set()
+        mock_sheets_client.get_recorded_clinic_numbers.return_value = set()
+        _install_run_mocks(
+            mock_drive_client, mock_gen, mock_reader, mock_creator, mock_merger,
+            pdf_files=[{"id": "id_1", "name": "012-03-4実践事例.pdf"}],
+        )
+
+        main_module.run(test_count=0, profile_name="jissen_default")
+
+        upload_kwargs = (
+            mock_drive_client.upload_pdf_to_clinic_person.call_args.kwargs
+        )
+        # 医院番号 012 が医院名の先頭にアンダースコア区切りで付く
+        self.assertEqual(upload_kwargs["clinic_name"], "012_山田歯科")
+
+    @patch("src.main.ensure_fonts")
+    @patch("src.main.pdf_merger")
+    @patch("src.main.pdf_creator")
+    @patch("src.main.pdf_reader")
+    @patch("src.main.comment_generator")
+    @patch("src.main.sheets_client")
+    @patch("src.main.drive_client")
+    @patch("src.discover.load_profile")
+    def test_clinic_folder_url_recorded_in_clinic_sheet(
+        self, mock_load_profile, mock_drive_client, mock_sheets_client,
+        mock_gen, mock_reader, mock_creator, mock_merger, mock_ensure_fonts,
+    ):
+        """医院フォルダURLシート（``<出力シート名>_医院``）に医院が記録される。"""
+        mock_load_profile.return_value = _make_profile(output_sheet_name="出力一覧")
+        mock_sheets_client.get_processed_management_numbers.return_value = set()
+        mock_sheets_client.get_recorded_clinic_numbers.return_value = set()
+        mock_drive_client.upload_pdf_to_clinic_person.return_value = {
+            "webViewLink": "https://drive.google.com/fake",
+            "clinic_folder_id": "clinic_xyz",
+        }
+        _install_run_mocks(
+            mock_drive_client, mock_gen, mock_reader, mock_creator, mock_merger,
+            pdf_files=[{"id": "id_1", "name": "012-03-4実践事例.pdf"}],
+        )
+        mock_drive_client.upload_pdf_to_clinic_person.return_value = {
+            "webViewLink": "https://drive.google.com/fake",
+            "clinic_folder_id": "clinic_xyz",
+        }
+
+        main_module.run(test_count=0, profile_name="jissen_default")
+
+        # 医院シート名は <出力シート名>_医院
+        snapshot_call = (
+            mock_sheets_client.get_recorded_clinic_numbers.call_args.kwargs
+        )
+        self.assertEqual(snapshot_call["sheet_name"], "出力一覧_医院")
+        # append_clinic_folder_record が医院番号 / 医院名 / フォルダURL で呼ばれる
+        rec_call = mock_sheets_client.append_clinic_folder_record.call_args.kwargs
+        self.assertEqual(rec_call["clinic_number"], "012")
+        self.assertEqual(rec_call["clinic_name"], "山田歯科")
+        self.assertEqual(
+            rec_call["clinic_folder_url"],
+            "https://drive.google.com/drive/folders/clinic_xyz",
+        )
+        self.assertEqual(rec_call["sheet_name"], "出力一覧_医院")
+
+    @patch("src.main.ensure_fonts")
+    @patch("src.main.pdf_merger")
+    @patch("src.main.pdf_creator")
+    @patch("src.main.pdf_reader")
+    @patch("src.main.comment_generator")
+    @patch("src.main.sheets_client")
+    @patch("src.main.drive_client")
+    @patch("src.discover.load_profile")
+    def test_same_clinic_recorded_only_once(
+        self, mock_load_profile, mock_drive_client, mock_sheets_client,
+        mock_gen, mock_reader, mock_creator, mock_merger, mock_ensure_fonts,
+    ):
+        """同一医院番号の PDF が複数あっても医院シートには 1 行のみ記録される。"""
+        mock_load_profile.return_value = _make_profile()
+        mock_sheets_client.get_processed_management_numbers.return_value = set()
+        mock_sheets_client.get_recorded_clinic_numbers.return_value = set()
+        # 医院番号 005 が 2 件、007 が 1 件
+        _install_run_mocks(
+            mock_drive_client, mock_gen, mock_reader, mock_creator, mock_merger,
+            pdf_files=[
+                {"id": "id_1", "name": "005-01-0実践事例A.pdf"},
+                {"id": "id_2", "name": "005-01-1実践事例B.pdf"},
+                {"id": "id_3", "name": "007-02-0実践事例C.pdf"},
+            ],
+        )
+
+        main_module.run(test_count=0, profile_name="jissen_default")
+
+        # append_clinic_folder_record は医院番号ごとに 1 回（005 と 007）
+        recorded = [
+            c.kwargs["clinic_number"]
+            for c in mock_sheets_client.append_clinic_folder_record.call_args_list
+        ]
+        self.assertEqual(sorted(recorded), ["005", "007"])
+
+    @patch("src.main.ensure_fonts")
+    @patch("src.main.pdf_merger")
+    @patch("src.main.pdf_creator")
+    @patch("src.main.pdf_reader")
+    @patch("src.main.comment_generator")
+    @patch("src.main.sheets_client")
+    @patch("src.main.drive_client")
+    @patch("src.discover.load_profile")
+    def test_already_recorded_clinic_is_not_appended_again(
+        self, mock_load_profile, mock_drive_client, mock_sheets_client,
+        mock_gen, mock_reader, mock_creator, mock_merger, mock_ensure_fonts,
+    ):
+        """医院シートに既に記録済みの医院番号は再追記されない（スナップショット）。"""
+        mock_load_profile.return_value = _make_profile()
+        mock_sheets_client.get_processed_management_numbers.return_value = set()
+        # 医院番号 012 は前回実行で既に医院シートに記録済み
+        mock_sheets_client.get_recorded_clinic_numbers.return_value = {"012"}
+        _install_run_mocks(
+            mock_drive_client, mock_gen, mock_reader, mock_creator, mock_merger,
+            pdf_files=[{"id": "id_1", "name": "012-03-4実践事例.pdf"}],
+        )
+
+        main_module.run(test_count=0, profile_name="jissen_default")
+
+        # 出力一覧シートには記録されるが、医院シートには追記されない
+        mock_sheets_client.append_output_record.assert_called_once()
+        mock_sheets_client.append_clinic_folder_record.assert_not_called()
+
+    @patch("src.main.ensure_fonts")
+    @patch("src.main.pdf_merger")
+    @patch("src.main.pdf_creator")
+    @patch("src.main.pdf_reader")
+    @patch("src.main.comment_generator")
+    @patch("src.main.sheets_client")
+    @patch("src.main.drive_client")
+    @patch("src.discover.load_profile")
+    def test_attachment_uses_clinic_number_folder(
+        self, mock_load_profile, mock_drive_client, mock_sheets_client,
+        mock_gen, mock_reader, mock_creator, mock_merger, mock_ensure_fonts,
+    ):
+        """添付資料も医院番号付きフォルダ ``<医院番号>_<医院名>`` へコピーされる。"""
+        mock_load_profile.return_value = _make_profile()
+        mock_sheets_client.get_processed_management_numbers.return_value = set()
+        mock_sheets_client.get_recorded_clinic_numbers.return_value = set()
+        _install_run_mocks(
+            mock_drive_client, mock_gen, mock_reader, mock_creator, mock_merger,
+            pdf_files=[
+                {"id": "id_main", "name": "088-01-0実践事例.pdf"},
+                {"id": "id_att", "name": "088-01-0【添付資料】補足.pdf"},
+            ],
+        )
+
+        main_module.run(test_count=0, profile_name="jissen_default")
+
+        # メイン・添付資料ともに医院フォルダ名 088_山田歯科
+        for call in mock_drive_client.upload_pdf_to_clinic_person.call_args_list:
+            self.assertEqual(call.kwargs["clinic_name"], "088_山田歯科")
+        # 出力一覧シートの医院名列は AI 抽出値（医院番号なし）
+        for call in mock_sheets_client.append_output_record.call_args_list:
+            self.assertEqual(call.kwargs["clinic_name"], "山田歯科")
 
 
 class TestArgparseTargetFolder(unittest.TestCase):
