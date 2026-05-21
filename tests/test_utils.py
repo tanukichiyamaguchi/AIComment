@@ -4,6 +4,7 @@ import unittest
 
 from src.utils import (
     extract_management_number,
+    is_attachment_filename,
     mask_email,
     normalize_name_for_match,
     sanitize_filename,
@@ -208,6 +209,55 @@ class TestExtractManagementNumber(unittest.TestCase):
     def test_extracts_with_leading_zeros(self):
         """先頭ゼロを含む ``000-00-0実践.pdf`` → ``000-00-0``。"""
         self.assertEqual(extract_management_number("000-00-0実践.pdf"), "000-00-0")
+
+
+class TestIsAttachmentFilename(unittest.TestCase):
+    """添付資料ファイル名判定のテスト。
+
+    ファイル名に「【添付資料】」（全角の隅付き括弧込み）を含む PDF は、
+    実践事例の補足資料。AI 処理せずメインと同じ出力フォルダにコピーする対象。
+    """
+
+    def test_detects_marker_at_start(self):
+        """先頭にマーカーがあるファイル名 → True。"""
+        self.assertTrue(
+            is_attachment_filename("【添付資料】001-01-0補足.pdf")
+        )
+
+    def test_detects_marker_in_middle(self):
+        """ファイル名の途中にマーカーがあっても → True。"""
+        self.assertTrue(
+            is_attachment_filename("001-01-0【添付資料】補足データ.pdf")
+        )
+
+    def test_detects_marker_without_extension(self):
+        """拡張子なしでもマーカーを含めば → True。"""
+        self.assertTrue(is_attachment_filename("【添付資料】補足"))
+
+    def test_returns_false_for_main_practice_case(self):
+        """マーカーを含まないメイン実践事例 PDF → False。"""
+        self.assertFalse(
+            is_attachment_filename("001-01-0実践事例タイトル.pdf")
+        )
+
+    def test_returns_false_for_empty_string(self):
+        """空文字列 → False。"""
+        self.assertFalse(is_attachment_filename(""))
+
+    def test_partial_bracket_does_not_match(self):
+        """隅付き括弧が欠けた「添付資料」だけでは → False（全角【】が必須）。"""
+        self.assertFalse(is_attachment_filename("001-01-0添付資料.pdf"))
+
+    def test_halfwidth_bracket_does_not_match(self):
+        """半角の括弧 [添付資料] では → False（全角の【】のみ対象）。"""
+        self.assertFalse(is_attachment_filename("001-01-0[添付資料].pdf"))
+
+    def test_non_string_input_is_coerced(self):
+        """非文字列入力（int 等）は str に変換される。
+
+        int ``12345`` は ``"12345"`` となり、マーカーを含まないため False。
+        """
+        self.assertFalse(is_attachment_filename(12345))  # type: ignore[arg-type]
 
 
 if __name__ == "__main__":

@@ -109,6 +109,31 @@ def extract_management_number(filename: str) -> str:
     return match.group(0) if match else ""
 
 
+# 添付資料 PDF をファイル名から識別するためのマーカー（全角の隅付き括弧込み）。
+# このマーカーを含む PDF は実践事例の補足資料であり、AI 処理（テキスト抽出 /
+# Claude API 呼び出し / コメントページ生成 / PDF 結合）を一切せず、
+# メイン実践事例 PDF と同じ出力フォルダへ元ファイルのままコピーする。
+_ATTACHMENT_MARKER = "【添付資料】"
+
+
+def is_attachment_filename(filename: str) -> bool:
+    """ファイル名が添付資料を示すか判定する。
+
+    ファイル名に「【添付資料】」（全角の【】込み）を含む PDF は、
+    実践事例の補足資料。AI 処理せず、メインと同じ出力フォルダに
+    元ファイルのままコピーする対象。
+
+    Args:
+        filename: PDF のファイル名
+
+    Returns:
+        ファイル名に添付資料マーカーを含むなら True。
+    """
+    if not isinstance(filename, str):
+        filename = str(filename)
+    return _ATTACHMENT_MARKER in filename
+
+
 def normalize_name_for_match(name: str) -> str:
     """医院名・氏名のマッチング用に正規化する。
 
