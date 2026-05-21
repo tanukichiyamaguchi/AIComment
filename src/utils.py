@@ -85,6 +85,30 @@ def sanitize_filename(
     return cleaned[:max_length]
 
 
+# 実践事例 PDF のファイル名先頭に埋め込まれた管理番号のパターン。
+# ``NNN-NN-N``（数字3 - 数字2 - 数字1、ハイフン込みで計 8 文字）。
+_MANAGEMENT_NUMBER_PATTERN = re.compile(r"^\d{3}-\d{2}-\d")
+
+
+def extract_management_number(filename: str) -> str:
+    """PDFファイル名の先頭から管理番号を抽出する。
+
+    実践事例 PDF はファイル名の先頭に ``NNN-NN-N`` 形式（数字3-数字2-数字1、
+    計8文字）の管理番号が埋め込まれている。例: ``001-01-0実践事例.pdf`` → ``001-01-0``。
+
+    Args:
+        filename: PDF のファイル名
+
+    Returns:
+        抽出した8文字の管理番号。先頭がパターンに合致しない場合は空文字列。
+        （呼び出し側で空文字列を検知して warning ログを出すこと）
+    """
+    if not isinstance(filename, str):
+        filename = str(filename)
+    match = _MANAGEMENT_NUMBER_PATTERN.match(filename)
+    return match.group(0) if match else ""
+
+
 def normalize_name_for_match(name: str) -> str:
     """医院名・氏名のマッチング用に正規化する。
 

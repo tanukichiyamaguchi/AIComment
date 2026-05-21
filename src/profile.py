@@ -1,14 +1,17 @@
 """プロファイル loader: profiles/*.yaml を読み込んで実行時設定を解決する。
 
 「ドキュメントタイプ × 提出期間」の組み合わせごとに
-入力フォルダ・出力フォルダ・出力シート・管理番号prefix を切り替えるための基盤。
+入力フォルダ・出力フォルダ・出力シートを切り替えるための基盤。
 
 1ワークフロー → profile引数 → プロファイル定義 → 各種設定を解決
 の流れを実現する。
 
 既存挙動の完全維持のため ``jissen_default`` プロファイルは
 従来の ``DRIVE_FOLDER_ID`` / ``DRIVE_OUTPUT_FOLDER_ID`` /
-``OUTPUT_SHEET_NAME="出力一覧"`` / prefix なし管理番号 をそのまま参照する。
+``OUTPUT_SHEET_NAME="出力一覧"`` をそのまま参照する。
+
+管理番号は採番せず、実践事例 PDF のファイル名先頭（``NNN-NN-N`` 形式）から
+抽出する（``src.utils.extract_management_number`` を参照）。
 """
 
 from __future__ import annotations
@@ -29,7 +32,6 @@ _REQUIRED_FIELDS: tuple[str, ...] = (
     "input_folder_id_secret",
     "output_folder_id_secret",
     "output_sheet_name",
-    "management_number_prefix",
     "prompt_template",
 )
 
@@ -49,7 +51,6 @@ class ProfileConfig:
     input_folder_id: str
     output_folder_id: str
     output_sheet_name: str
-    management_number_prefix: str
     prompt_template: str
 
 
@@ -110,7 +111,6 @@ def load_profile(profile_name: str) -> ProfileConfig:
         input_folder_id=input_id,
         output_folder_id=output_id,
         output_sheet_name=str(data["output_sheet_name"]),
-        management_number_prefix=str(data["management_number_prefix"]),
         prompt_template=str(data["prompt_template"]),
     )
 

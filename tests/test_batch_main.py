@@ -23,11 +23,44 @@ def _make_profile(**overrides) -> ProfileConfig:
         input_folder_id="input_folder_xxx",
         output_folder_id="output_folder_yyy",
         output_sheet_name="出力一覧",
-        management_number_prefix="",
         prompt_template="jissen_practice_case",
     )
     defaults.update(overrides)
     return ProfileConfig(**defaults)
+
+
+def _make_batch_items(filenames: list[str]) -> list[dict]:
+    """step4_generate_pdfs 用の items リストを作る。"""
+    return [
+        {
+            "custom_id": f"item_{i:04d}",
+            "pdf_data_id": f"id_{i:04d}",
+            "pdf_file_name": name,
+        }
+        for i, name in enumerate(filenames, start=1)
+    ]
+
+
+def _make_batch_results(count: int) -> dict[str, dict[str, str]]:
+    """step4_generate_pdfs 用の results 辞書を作る。"""
+    return {
+        f"item_{i:04d}": {
+            "clinic_name": "山田歯科",
+            "person_name": "田中太郎",
+            "sample_title": "事例タイトル",
+            "comment": "コメント本文",
+        }
+        for i in range(1, count + 1)
+    }
+
+
+def _install_step4_mocks(mock_drive, mock_merger) -> None:
+    """step4_generate_pdfs が PDF 生成ループを回すための標準モック。"""
+    mock_drive.download_pdf.return_value = b"%PDF-1.4 fake"
+    mock_drive.upload_pdf_to_clinic_person.return_value = {
+        "webViewLink": "https://drive.google.com/fake",
+    }
+    mock_merger.make_output_filename.return_value = "out.pdf"
 
 
 class TestArgparseProfile(unittest.TestCase):
@@ -79,25 +112,77 @@ class TestStep1UsesProfile(unittest.TestCase):
 
 
 class TestStep4UsesProfile(unittest.TestCase):
-    """Step4 がプロファイルの出力シート名 / prefix を sheets_client に渡す。"""
+    """Step4 がプロファイルの出力シート名を sheets_client に渡し、
+    管理番号は PDF ファイル名先頭から抽出する。"""
 
+    @patch("src.batch_main.pdf_merger")
+    @patch("src.batch_main.pdf_creator")
+    @patch("src.batch_main.drive_client")
     @patch("src.batch_main.sheets_client")
     @patch("src.batch_main.ensure_fonts")
-    def test_step4_passes_sheet_and_prefix_for_get_max(
-        self, mock_fonts, mock_sheets,
+    def test_step4_passes_sheet_name_to_append_record(
+        self, mock_fonts, mock_sheets, mock_drive, mock_creator, mock_merger,
     ):
-        mock_sheets.get_max_management_number.return_value = 0
-        profile = _make_profile(
-            output_sheet_name="実践事例_2024Q3_出力一覧",
-            management_number_prefix="J24Q3-",
+        profile = _make_profile(output_sheet_name="実践事例_2024Q3_出力一覧")
+        _install_step4_mocks(mock_drive, mock_merger)
+
+        batch_main.step4_generate_pdfs(
+            profile,
+            results=_make_batch_results(1),
+            items=_make_batch_items(["050-06-7実践事例.pdf"]),
         )
 
-        # results / items が空でも管理番号採番起点の取得は走る
-        batch_main.step4_generate_pdfs(profile, results={}, items=[])
-
-        kwargs = mock_sheets.get_max_management_number.call_args.kwargs
+        kwargs = mock_sheets.append_output_record.call_args.kwargs
         self.assertEqual(kwargs["sheet_name"], "実践事例_2024Q3_出力一覧")
-        self.assertEqual(kwargs["prefix"], "J24Q3-")
+
+    @patch("src.batch_main.pdf_merger")
+    @patch("src.batch_main.pdf_creator")
+    @patch("src.batch_main.drive_client")
+    @patch("src.batch_main.sheets_client")
+    @patch("src.batch_main.ensure_fonts")
+    def test_step4_management_number_extracted_from_filename(
+        self, mock_fonts, mock_sheets, mock_drive, mock_creator, mock_merger,
+    ):
+        """管理番号は ``pdf_file_name`` 先頭（NNN-NN-N）から抽出され、自動採番しない。"""
+        profile = _make_profile()
+        _install_step4_mocks(mock_drive, mock_merger)
+
+        batch_main.step4_generate_pdfs(
+            profile,
+            results=_make_batch_results(2),
+            items=_make_batch_items(
+                ["111-22-3事例A.pdf", "111-22-4_事例B.pdf"]
+            ),
+        )
+
+        mgmt_nums = [
+            c.kwargs["management_number"]
+            for c in mock_sheets.append_output_record.call_args_list
+        ]
+        self.assertEqual(mgmt_nums, ["111-22-3", "111-22-4"])
+
+    @patch("src.batch_main.pdf_merger")
+    @patch("src.batch_main.pdf_creator")
+    @patch("src.batch_main.drive_client")
+    @patch("src.batch_main.sheets_client")
+    @patch("src.batch_main.ensure_fonts")
+    def test_step4_unextractable_filename_yields_empty_with_warning(
+        self, mock_fonts, mock_sheets, mock_drive, mock_creator, mock_merger,
+    ):
+        """先頭が NNN-NN-N でないファイルは管理番号が空文字列になり warning が出る。"""
+        profile = _make_profile()
+        _install_step4_mocks(mock_drive, mock_merger)
+
+        with self.assertLogs("jissen_comment", level="WARNING") as log_ctx:
+            batch_main.step4_generate_pdfs(
+                profile,
+                results=_make_batch_results(1),
+                items=_make_batch_items(["管理番号なし.pdf"]),
+            )
+
+        kwargs = mock_sheets.append_output_record.call_args.kwargs
+        self.assertEqual(kwargs["management_number"], "")
+        self.assertIn("管理番号なし.pdf", "\n".join(log_ctx.output))
 
 
 class TestArgparseTargetFolder(unittest.TestCase):
@@ -180,10 +265,8 @@ class TestRunUsesTargetFolder(unittest.TestCase):
             input_folder_id="auto_input",
             output_folder_id="auto_output",
             output_sheet_name="X",
-            management_number_prefix="X-",
         )
         mock_drive.list_pdfs.return_value = []
-        mock_sheets.get_max_management_number.return_value = 0
 
         with patch("src.config.DRIVE_INPUT_ROOT", "in_root"), \
              patch("src.config.DRIVE_OUTPUT_ROOT", "out_root"), \
@@ -216,10 +299,8 @@ class TestRunUsesTargetFolder(unittest.TestCase):
             input_folder_id="x_in",
             output_folder_id="x_out",
             output_sheet_name="X",
-            management_number_prefix="X-",
         )
         mock_drive.list_pdfs.return_value = []
-        mock_sheets.get_max_management_number.return_value = 0
 
         with patch("src.config.DRIVE_INPUT_ROOT", "ir"), \
              patch("src.config.DRIVE_OUTPUT_ROOT", "or"), \
@@ -238,24 +319,32 @@ class TestRunUsesTargetFolder(unittest.TestCase):
 class TestStep4WithRunConfig(unittest.TestCase):
     """``step4_generate_pdfs`` が ``RunConfig`` ベースの設定を受け付ける。"""
 
+    @patch("src.batch_main.pdf_merger")
+    @patch("src.batch_main.pdf_creator")
+    @patch("src.batch_main.drive_client")
     @patch("src.batch_main.sheets_client")
     @patch("src.batch_main.ensure_fonts")
-    def test_step4_accepts_run_config(self, mock_fonts, mock_sheets):
+    def test_step4_accepts_run_config(
+        self, mock_fonts, mock_sheets, mock_drive, mock_creator, mock_merger,
+    ):
         """``RunConfig`` が ``ProfileConfig`` と同じインターフェースで使える。"""
-        mock_sheets.get_max_management_number.return_value = 0
+        _install_step4_mocks(mock_drive, mock_merger)
         cfg = batch_main.RunConfig(
             display_name="自動検出: X",
             input_folder_id="auto_in",
             output_folder_id="auto_out",
             output_sheet_name="X_sheet",
-            management_number_prefix="X-",
         )
 
-        batch_main.step4_generate_pdfs(cfg, results={}, items=[])
+        batch_main.step4_generate_pdfs(
+            cfg,
+            results=_make_batch_results(1),
+            items=_make_batch_items(["200-30-4実践事例.pdf"]),
+        )
 
-        kwargs = mock_sheets.get_max_management_number.call_args.kwargs
+        kwargs = mock_sheets.append_output_record.call_args.kwargs
         self.assertEqual(kwargs["sheet_name"], "X_sheet")
-        self.assertEqual(kwargs["prefix"], "X-")
+        self.assertEqual(kwargs["management_number"], "200-30-4")
 
 
 if __name__ == "__main__":

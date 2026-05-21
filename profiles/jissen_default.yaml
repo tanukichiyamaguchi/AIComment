@@ -10,8 +10,5 @@ output_folder_id_secret: DRIVE_OUTPUT_FOLDER_ID
 # 既存の OUTPUT_SHEET_NAME と同一値（後方互換）
 output_sheet_name: "出力一覧"
 
-# 管理番号の prefix は空文字（既存の 6桁ゼロパディング挙動をそのまま維持）
-management_number_prefix: ""
-
 # プロンプトテンプレート識別子（既存挙動）
 prompt_template: jissen_practice_case

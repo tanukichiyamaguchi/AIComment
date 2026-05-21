@@ -9,8 +9,5 @@ output_folder_id_secret: DRIVE_OUTPUT_JISSEN_2024_Q1
 # 出力一覧シート名（同一スプレッドシート内に複数シートを置く前提）
 output_sheet_name: "実践事例_2024Q1_出力一覧"
 
-# 管理番号の prefix（例: J24Q1-000001）
-management_number_prefix: "J24Q1-"
-
 # プロンプトテンプレート識別子（今回は全プロファイル共通）
 prompt_template: jissen_practice_case

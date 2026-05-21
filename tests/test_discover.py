@@ -138,7 +138,6 @@ class TestResolveContext(unittest.TestCase):
         # （input_root と output_root の files() は同じ mock を共有しているが、
         #  output_folder 用の find_or_create で作成パスに入って "created_output_id"）
         self.assertEqual(ctx.output_sheet_name, "2024_Q1_実践事例")
-        self.assertEqual(ctx.management_number_prefix, "2024_Q1_実践事例-")
 
     def test_resolves_with_whitespace_variation(self):
         """表記揺れ（半角空白の有無）を吸収する。"""
@@ -157,7 +156,8 @@ class TestResolveContext(unittest.TestCase):
         # マッチした場合は Drive 上の元表記を採用
         self.assertEqual(ctx.target_folder_name, "2024 Q1 実践事例")
         self.assertEqual(ctx.input_folder_id, "input_id")
-        self.assertEqual(ctx.management_number_prefix, "2024 Q1 実践事例-")
+        # シートタブ名も Drive 上の元表記から派生する
+        self.assertEqual(ctx.output_sheet_name, "2024 Q1 実践事例")
 
     def test_resolves_with_fullwidth_variation(self):
         """全角/半角の表記揺れも吸収する（NFKC 正規化）。"""

@@ -1,12 +1,12 @@
 """Drive フォルダ自動検出システム。
 
 INPUT_ROOT 配下のサブフォルダから動的に処理対象を解決し、
-出力フォルダ・スプレッドシートタブ・管理番号 prefix を自動派生する。
+出力フォルダ・スプレッドシートタブを自動派生する。
 
 設計コンセプト（Convention over Configuration）:
     [現状] プロファイル YAML + Secret 追加が新セミナーごとに必要
     [新規] INPUT_ROOT 直下のサブフォルダを auto-discover、出力フォルダ・
-           シートタブ・管理番号 prefix を自動派生
+           シートタブを自動派生
 
 ユーザーの作業:
     1. Drive で ``DRIVE_INPUT_ROOT`` 配下にサブフォルダ作成
@@ -18,9 +18,11 @@ INPUT_ROOT 配下のサブフォルダから動的に処理対象を解決し、
        （``normalize_name_for_match`` で表記揺れ吸収）
     2. ``DRIVE_OUTPUT_ROOT`` 配下に同名フォルダを作成（既存ならスキップ）
     3. ``SPREADSHEET_ID`` に同名タブを作成（既存ならスキップ）
-    4. 管理番号 prefix を ``<target_folder>-`` で派生
-    5. 既存処理パイプライン（PDF 取得 → Claude API → コメント PDF 生成
+    4. 既存処理パイプライン（PDF 取得 → Claude API → コメント PDF 生成
        → 結合 → Drive 保存 → Sheets 追記）を実行
+
+管理番号は採番せず、実践事例 PDF のファイル名先頭（``NNN-NN-N`` 形式）から
+抽出する（``src.utils.extract_management_number`` を参照）。
 
 後方互換性:
     既存の ``--profile`` モード（``jissen_default`` / ``jissen_2024_q1`` 等）
@@ -50,13 +52,11 @@ class DiscoveredContext:
         input_folder_id: 入力サブフォルダの Drive ID。
         output_folder_id: 出力サブフォルダの Drive ID（自動作成済み）。
         output_sheet_name: スプレッドシートのタブ名。
-        management_number_prefix: 管理番号の prefix（フォルダ名 + ``"-"``）。
     """
     target_folder_name: str
     input_folder_id: str
     output_folder_id: str
     output_sheet_name: str
-    management_number_prefix: str
 
 
 @dataclass(frozen=True)
@@ -69,7 +69,6 @@ class RunConfig:
     input_folder_id: str
     output_folder_id: str
     output_sheet_name: str
-    management_number_prefix: str
 
     @classmethod
     def from_profile(cls, profile: ProfileConfig) -> "RunConfig":
@@ -81,7 +80,6 @@ class RunConfig:
             input_folder_id=profile.input_folder_id,
             output_folder_id=profile.output_folder_id,
             output_sheet_name=profile.output_sheet_name,
-            management_number_prefix=profile.management_number_prefix,
         )
 
     @classmethod
@@ -91,7 +89,6 @@ class RunConfig:
             input_folder_id=ctx.input_folder_id,
             output_folder_id=ctx.output_folder_id,
             output_sheet_name=ctx.output_sheet_name,
-            management_number_prefix=ctx.management_number_prefix,
         )
 
 
@@ -202,9 +199,8 @@ def resolve_context(
            （``normalize_name_for_match`` マッチ）。
         2. ``OUTPUT_ROOT`` 配下に同名フォルダを find_or_create。
         3. ``SPREADSHEET_ID`` に同名タブを find_or_create（実際の create は
-           ``sheets_client._ensure_output_sheet`` 経由で append/get_max 時に走る。
+           ``sheets_client._ensure_output_sheet`` 経由で append 時に走る。
            ここでは sheet 名のみ決定する）。
-        4. prefix を ``<actual_name>-`` で派生。
 
     Args:
         target_folder: ユーザー指定のフォルダ名（表記揺れ許容）
@@ -263,24 +259,19 @@ def resolve_context(
     )
 
     # 3. シートタブ名 = フォルダ名（簡素優先）。実際の addSheet は
-    #    sheets_client._ensure_output_sheet が append/get_max 時に冪等実行する。
+    #    sheets_client._ensure_output_sheet が append 時に冪等実行する。
     output_sheet_name = actual_name
-
-    # 4. prefix の派生。Drive フォルダ名そのままを使う（簡素優先、
-    #    sanitize は最小限 — Drive で許される文字は基本そのまま採用）。
-    management_number_prefix = f"{actual_name}-"
 
     ctx = DiscoveredContext(
         target_folder_name=actual_name,
         input_folder_id=input_folder_id,
         output_folder_id=output_folder_id,
         output_sheet_name=output_sheet_name,
-        management_number_prefix=management_number_prefix,
     )
     logger.info(
         f"フォルダ自動検出: target='{actual_name}' "
         f"input={input_folder_id} output={output_folder_id} "
-        f"sheet='{output_sheet_name}' prefix='{management_number_prefix}'"
+        f"sheet='{output_sheet_name}'"
     )
     return ctx
 

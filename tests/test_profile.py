@@ -53,8 +53,6 @@ class TestLoadDefaultProfile(unittest.TestCase):
         self.assertEqual(cfg.input_folder_id, "input_folder_xxx")
         self.assertEqual(cfg.output_folder_id, "output_folder_yyy")
         self.assertEqual(cfg.output_sheet_name, "出力一覧")
-        # 既存挙動：prefix なし（純粋 6桁ゼロパディング）
-        self.assertEqual(cfg.management_number_prefix, "")
         self.assertEqual(cfg.prompt_template, "jissen_practice_case")
 
 
@@ -77,7 +75,6 @@ class TestLoadQuarterlyProfiles(unittest.TestCase):
         self.assertEqual(cfg.input_folder_id, "in_q1")
         self.assertEqual(cfg.output_folder_id, "out_q1")
         self.assertEqual(cfg.output_sheet_name, "実践事例_2024Q1_出力一覧")
-        self.assertEqual(cfg.management_number_prefix, "J24Q1-")
         self.assertEqual(cfg.prompt_template, "jissen_practice_case")
 
     def test_loads_2024_q2(self):
@@ -92,7 +89,6 @@ class TestLoadQuarterlyProfiles(unittest.TestCase):
             cfg = profile_module.load_profile("jissen_2024_q2")
         self.assertEqual(cfg.period, "2024_q2")
         self.assertEqual(cfg.output_sheet_name, "実践事例_2024Q2_出力一覧")
-        self.assertEqual(cfg.management_number_prefix, "J24Q2-")
 
     def test_loads_2024_q3(self):
         with patch.dict(
@@ -105,7 +101,7 @@ class TestLoadQuarterlyProfiles(unittest.TestCase):
         ):
             cfg = profile_module.load_profile("jissen_2024_q3")
         self.assertEqual(cfg.period, "2024_q3")
-        self.assertEqual(cfg.management_number_prefix, "J24Q3-")
+        self.assertEqual(cfg.output_sheet_name, "実践事例_2024Q3_出力一覧")
 
     def test_loads_2024_q4(self):
         with patch.dict(
@@ -118,7 +114,7 @@ class TestLoadQuarterlyProfiles(unittest.TestCase):
         ):
             cfg = profile_module.load_profile("jissen_2024_q4")
         self.assertEqual(cfg.period, "2024_q4")
-        self.assertEqual(cfg.management_number_prefix, "J24Q4-")
+        self.assertEqual(cfg.output_sheet_name, "実践事例_2024Q4_出力一覧")
 
     def test_all_quarterlies_share_prompt_template(self):
         """今回は全プロファイルでプロンプトを共有する設計（jissen_practice_case）。"""

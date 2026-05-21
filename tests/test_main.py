@@ -25,7 +25,6 @@ def _make_profile(**overrides) -> ProfileConfig:
         input_folder_id="input_folder_xxx",
         output_folder_id="output_folder_yyy",
         output_sheet_name="出力一覧",
-        management_number_prefix="",
         prompt_template="jissen_practice_case",
     )
     defaults.update(overrides)
@@ -65,8 +64,29 @@ class TestArgparseProfile(unittest.TestCase):
         self.assertEqual(kwargs["test_count"], 3)
 
 
+def _install_run_mocks(
+    mock_drive, mock_gen, mock_reader, mock_creator, mock_merger,
+    *, pdf_files: list[dict],
+) -> None:
+    """``main.run()`` の処理ループを 1 周以上回すための標準モック。"""
+    mock_drive.list_pdfs.return_value = pdf_files
+    mock_drive.download_pdf.return_value = b"%PDF-1.4 fake"
+    mock_drive.upload_pdf_to_clinic_person.return_value = {
+        "webViewLink": "https://drive.google.com/fake",
+    }
+    mock_reader.extract_text.return_value = "PDFテキスト"
+    mock_gen.generate_comment_with_metadata.return_value = {
+        "clinic_name": "山田歯科",
+        "person_name": "田中太郎",
+        "sample_title": "事例タイトル",
+        "comment": "コメント本文",
+    }
+    mock_merger.make_output_filename.return_value = "out.pdf"
+
+
 class TestRunUsesProfile(unittest.TestCase):
-    """``run()`` がプロファイルから入力フォルダ・出力フォルダ・シート・prefix を受け取る。"""
+    """``run()`` がプロファイルから入力フォルダ・出力フォルダ・シートを受け取り、
+    管理番号は PDF ファイル名先頭から抽出することを検証する。"""
 
     @patch("src.main.sheets_client")
     @patch("src.main.drive_client")
@@ -83,7 +103,6 @@ class TestRunUsesProfile(unittest.TestCase):
             input_folder_id="profile_input_id",
         )
         mock_drive_client.list_pdfs.return_value = []
-        mock_sheets_client.get_max_management_number.return_value = 0
 
         main_module.run(test_count=0, profile_name="jissen_default")
 
@@ -91,53 +110,110 @@ class TestRunUsesProfile(unittest.TestCase):
             folder_id="profile_input_id",
         )
 
+    @patch("src.main.ensure_fonts")
+    @patch("src.main.pdf_merger")
+    @patch("src.main.pdf_creator")
+    @patch("src.main.pdf_reader")
+    @patch("src.main.comment_generator")
     @patch("src.main.sheets_client")
     @patch("src.main.drive_client")
     @patch("src.discover.load_profile")
-    @patch("src.main.ensure_fonts")
-    def test_passes_profile_sheet_and_prefix_to_get_max_mgmt_number(
+    def test_passes_profile_sheet_name_to_append_record(
         self,
-        mock_ensure_fonts,
         mock_load_profile,
         mock_drive_client,
         mock_sheets_client,
+        mock_gen,
+        mock_reader,
+        mock_creator,
+        mock_merger,
+        mock_ensure_fonts,
     ):
+        """プロファイルの ``output_sheet_name`` が ``append_output_record`` に伝搬する。"""
         mock_load_profile.return_value = _make_profile(
             output_sheet_name="実践事例_2024Q1_出力一覧",
-            management_number_prefix="J24Q1-",
         )
-        mock_drive_client.list_pdfs.return_value = []
-        mock_sheets_client.get_max_management_number.return_value = 0
+        _install_run_mocks(
+            mock_drive_client, mock_gen, mock_reader, mock_creator, mock_merger,
+            pdf_files=[{"id": "id_1", "name": "001-01-0実践事例.pdf"}],
+        )
 
         main_module.run(test_count=0, profile_name="jissen_2024_q1")
 
-        call_kwargs = mock_sheets_client.get_max_management_number.call_args.kwargs
+        call_kwargs = mock_sheets_client.append_output_record.call_args.kwargs
         self.assertEqual(call_kwargs["sheet_name"], "実践事例_2024Q1_出力一覧")
-        self.assertEqual(call_kwargs["prefix"], "J24Q1-")
 
+    @patch("src.main.ensure_fonts")
+    @patch("src.main.pdf_merger")
+    @patch("src.main.pdf_creator")
+    @patch("src.main.pdf_reader")
+    @patch("src.main.comment_generator")
     @patch("src.main.sheets_client")
     @patch("src.main.drive_client")
     @patch("src.discover.load_profile")
-    @patch("src.main.ensure_fonts")
-    def test_default_profile_passes_empty_prefix_as_none(
+    def test_management_number_extracted_from_pdf_filename(
         self,
-        mock_ensure_fonts,
         mock_load_profile,
         mock_drive_client,
         mock_sheets_client,
+        mock_gen,
+        mock_reader,
+        mock_creator,
+        mock_merger,
+        mock_ensure_fonts,
     ):
-        """既存挙動互換：jissen_default の prefix='' は None として渡される（純粋数値で集計）。"""
-        mock_load_profile.return_value = _make_profile(
-            management_number_prefix="",
+        """管理番号は PDF ファイル名先頭（NNN-NN-N）から抽出され、自動採番しない。"""
+        mock_load_profile.return_value = _make_profile()
+        _install_run_mocks(
+            mock_drive_client, mock_gen, mock_reader, mock_creator, mock_merger,
+            pdf_files=[
+                {"id": "id_1", "name": "012-03-4実践事例タイトル.pdf"},
+                {"id": "id_2", "name": "012-03-5_別の事例.pdf"},
+            ],
         )
-        mock_drive_client.list_pdfs.return_value = []
-        mock_sheets_client.get_max_management_number.return_value = 0
 
         main_module.run(test_count=0, profile_name="jissen_default")
 
-        call_kwargs = mock_sheets_client.get_max_management_number.call_args.kwargs
-        # 既存テスト互換性のため prefix=None で渡す
-        self.assertIsNone(call_kwargs["prefix"])
+        mgmt_nums = [
+            c.kwargs["management_number"]
+            for c in mock_sheets_client.append_output_record.call_args_list
+        ]
+        self.assertEqual(mgmt_nums, ["012-03-4", "012-03-5"])
+
+    @patch("src.main.ensure_fonts")
+    @patch("src.main.pdf_merger")
+    @patch("src.main.pdf_creator")
+    @patch("src.main.pdf_reader")
+    @patch("src.main.comment_generator")
+    @patch("src.main.sheets_client")
+    @patch("src.main.drive_client")
+    @patch("src.discover.load_profile")
+    def test_unextractable_filename_yields_empty_with_warning(
+        self,
+        mock_load_profile,
+        mock_drive_client,
+        mock_sheets_client,
+        mock_gen,
+        mock_reader,
+        mock_creator,
+        mock_merger,
+        mock_ensure_fonts,
+    ):
+        """先頭が NNN-NN-N でないファイルは管理番号が空文字列になり、warning が出る。"""
+        mock_load_profile.return_value = _make_profile()
+        _install_run_mocks(
+            mock_drive_client, mock_gen, mock_reader, mock_creator, mock_merger,
+            pdf_files=[{"id": "id_1", "name": "管理番号なし.pdf"}],
+        )
+
+        with self.assertLogs("jissen_comment", level="WARNING") as log_ctx:
+            main_module.run(test_count=0, profile_name="jissen_default")
+
+        call_kwargs = mock_sheets_client.append_output_record.call_args.kwargs
+        self.assertEqual(call_kwargs["management_number"], "")
+        # warning にファイル名が含まれる（サイレントにしない）
+        joined = "\n".join(log_ctx.output)
+        self.assertIn("管理番号なし.pdf", joined)
 
 
 class TestArgparseTargetFolder(unittest.TestCase):
@@ -201,7 +277,7 @@ class TestRunListMode(unittest.TestCase):
 
         - ``ensure_fonts`` は呼ばれない（フォント DL は不要）
         - ``drive_client.list_pdfs`` は呼ばれない
-        - ``sheets_client.get_max_management_number`` も呼ばれない
+        - ``sheets_client.append_output_record`` も呼ばれない
         """
         mock_list_names.return_value = ["a", "b"]
 
@@ -211,7 +287,7 @@ class TestRunListMode(unittest.TestCase):
         mock_list_names.assert_called_once_with("fake_root_id")
         mock_ensure_fonts.assert_not_called()
         mock_drive_client.list_pdfs.assert_not_called()
-        mock_sheets_client.get_max_management_number.assert_not_called()
+        mock_sheets_client.append_output_record.assert_not_called()
 
     @patch("src.main.drive_client")
     @patch("src.main.sheets_client")
@@ -235,30 +311,39 @@ class TestRunListMode(unittest.TestCase):
 class TestRunUsesTargetFolder(unittest.TestCase):
     """``--target-folder`` 指定時、``resolve_context`` 経由で設定が解決される。"""
 
+    @patch("src.main.ensure_fonts")
+    @patch("src.main.pdf_merger")
+    @patch("src.main.pdf_creator")
+    @patch("src.main.pdf_reader")
+    @patch("src.main.comment_generator")
     @patch("src.main.sheets_client")
     @patch("src.main.drive_client")
     @patch("src.discover.resolve_context")
-    @patch("src.main.ensure_fonts")
     def test_target_folder_resolves_context_and_uses_it(
         self,
-        mock_ensure_fonts,
         mock_resolve_context,
         mock_drive_client,
         mock_sheets_client,
+        mock_gen,
+        mock_reader,
+        mock_creator,
+        mock_merger,
+        mock_ensure_fonts,
     ):
         """``target_folder`` 指定時、``discover.resolve_context`` が呼ばれ、
-        その戻り値の各 ID / シート名 / prefix が ``drive_client`` / ``sheets_client``
-        に正しく伝搬する。
+        その戻り値の各 ID / シート名が ``drive_client`` / ``sheets_client``
+        に正しく伝搬する。管理番号はファイル名先頭から抽出する。
         """
         mock_resolve_context.return_value = DiscoveredContext(
             target_folder_name="2024_Q1_実践事例",
             input_folder_id="auto_input_id",
             output_folder_id="auto_output_id",
             output_sheet_name="2024_Q1_実践事例",
-            management_number_prefix="2024_Q1_実践事例-",
         )
-        mock_drive_client.list_pdfs.return_value = []
-        mock_sheets_client.get_max_management_number.return_value = 0
+        _install_run_mocks(
+            mock_drive_client, mock_gen, mock_reader, mock_creator, mock_merger,
+            pdf_files=[{"id": "id_1", "name": "007-08-9実践事例.pdf"}],
+        )
 
         with patch("src.config.DRIVE_INPUT_ROOT", "input_root"), \
              patch("src.config.DRIVE_OUTPUT_ROOT", "output_root"), \
@@ -277,10 +362,11 @@ class TestRunUsesTargetFolder(unittest.TestCase):
             folder_id="auto_input_id",
         )
 
-        # sheets_client.get_max_management_number が context のシート / prefix を受ける
-        sheets_kwargs = mock_sheets_client.get_max_management_number.call_args.kwargs
+        # sheets_client.append_output_record が context のシート名と
+        # ファイル名抽出の管理番号を受ける
+        sheets_kwargs = mock_sheets_client.append_output_record.call_args.kwargs
         self.assertEqual(sheets_kwargs["sheet_name"], "2024_Q1_実践事例")
-        self.assertEqual(sheets_kwargs["prefix"], "2024_Q1_実践事例-")
+        self.assertEqual(sheets_kwargs["management_number"], "007-08-9")
 
     @patch("src.main.sheets_client")
     @patch("src.main.drive_client")
@@ -301,10 +387,8 @@ class TestRunUsesTargetFolder(unittest.TestCase):
             input_folder_id="x_in",
             output_folder_id="x_out",
             output_sheet_name="x",
-            management_number_prefix="x-",
         )
         mock_drive_client.list_pdfs.return_value = []
-        mock_sheets_client.get_max_management_number.return_value = 0
 
         with patch("src.config.DRIVE_INPUT_ROOT", "ir"), \
              patch("src.config.DRIVE_OUTPUT_ROOT", "or"), \
@@ -334,7 +418,6 @@ class TestRunUsesTargetFolder(unittest.TestCase):
         """両引数省略時は ``load_profile("jissen_default")`` が呼ばれる（既存挙動）。"""
         mock_load_profile.return_value = _make_profile()
         mock_drive_client.list_pdfs.return_value = []
-        mock_sheets_client.get_max_management_number.return_value = 0
 
         main_module.run(test_count=0)
 

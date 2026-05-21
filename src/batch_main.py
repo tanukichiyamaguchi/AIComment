@@ -4,13 +4,15 @@
 Claude APIで医院名・氏名・実践事例タイトル・コメントを抽出/生成、
 コメント付きPDFをDriveに「医院名/個人名/」階層で保存し、出力一覧シートに記録する。
 
+管理番号は実践事例 PDF のファイル名先頭（``NNN-NN-N`` 形式）から抽出する。
+
 実行モード:
     1. プロファイル（``--profile <name>``）— ``profiles/<name>.yaml`` を読み込み、
-       入力フォルダ・出力フォルダ・出力シート名・管理番号 prefix を切り替える。
+       入力フォルダ・出力フォルダ・出力シート名を切り替える。
        既存挙動を完全維持する後方互換モード。
     2. フォルダ自動検出（``--target-folder <name>``）— ``DRIVE_INPUT_ROOT``
-       配下の同名サブフォルダを auto-discover し、出力フォルダ・シートタブ・
-       管理番号 prefix を自動派生する。Secret/YAML 追加なしで新セミナーに対応。
+       配下の同名サブフォルダを auto-discover し、出力フォルダ・シートタブを
+       自動派生する。Secret/YAML 追加なしで新セミナーに対応。
     3. ``--target-folder __list__`` — 候補名を列挙して即終了。
 
     両方省略時は ``--profile jissen_default``（既存挙動）。
@@ -24,7 +26,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from src.utils import setup_logging, ensure_fonts
+from src.utils import setup_logging, ensure_fonts, extract_management_number
 from src.config import LOGS_DIR
 from src import discover, drive_client, sheets_client
 from src import pdf_reader, comment_generator, pdf_creator, pdf_merger
@@ -176,19 +178,7 @@ def step4_generate_pdfs(
         prep_file = LOGS_DIR / "batch_prep.json"
         items = json.loads(prep_file.read_text())
 
-    # 管理番号の採番起点：既存シートの最大値を取得し、以降の連番はこの値+1から発行する
-    initial_max = sheets_client.get_max_management_number(
-        sheet_name=profile.output_sheet_name,
-        prefix=profile.management_number_prefix or None,
-    )
-    prefix = profile.management_number_prefix
-    logger.info(
-        f"管理番号 採番起点: {initial_max} "
-        f"(次の発行は {prefix}{initial_max + 1:06d})"
-    )
-
     stats = {"success": 0, "error": 0, "missing": 0}
-    processed = 0  # シートに書き込んだ件数（success と独立して管理番号採番に使う）
 
     for item in items:
         custom_id = item["custom_id"]
@@ -235,7 +225,12 @@ def step4_generate_pdfs(
                     file_name=output_filename,
                 )
 
-            mgmt_num = f"{prefix}{initial_max + processed + 1:06d}"
+            mgmt_num = extract_management_number(pdf_file_name)
+            if not mgmt_num:
+                logger.warning(
+                    f"管理番号をファイル名から抽出できません"
+                    f"（先頭が NNN-NN-N 形式でない）: {pdf_file_name}"
+                )
             sheets_client.append_output_record(
                 management_number=mgmt_num,
                 clinic_name=clinic_name,
@@ -244,7 +239,6 @@ def step4_generate_pdfs(
                 drive_url=upload_result["webViewLink"],
                 sheet_name=profile.output_sheet_name,
             )
-            processed += 1
             logger.info(
                 f"完了: {mgmt_num} / {clinic_name} / {person_name} / {sample_title}"
             )
