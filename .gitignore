@@ -8,7 +8,6 @@ __pycache__/
 *.pyo
 assets/NotoSansJP-Regular.ttf
 assets/NotoSansJP-Bold.ttf
-assets/jissen_kun.png
 logs/
 *.egg-info/
 
