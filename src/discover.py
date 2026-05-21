@@ -37,6 +37,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from src import drive_client
+from src.config import GOOGLE_API_NUM_RETRIES
 from src.profile import ProfileConfig, load_profile
 from src.utils import normalize_name_for_match
 
@@ -171,7 +172,7 @@ def list_input_subfolders(
             pageToken=page_token,
             supportsAllDrives=True,
             includeItemsFromAllDrives=True,
-        ).execute()
+        ).execute(num_retries=GOOGLE_API_NUM_RETRIES)
         all_folders.extend(response.get("files", []))
         page_token = response.get("nextPageToken")
         if not page_token:
