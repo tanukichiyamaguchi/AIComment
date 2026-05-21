@@ -38,13 +38,23 @@ def step1_prepare(
     profile: ProfileConfig | RunConfig,
     test_count: int = 0,
 ) -> list[dict]:
-    """Step 1: 準備 — PDF取得・テキスト抽出。
+    """Step 1: 準備 — PDF取得・重複判定・テキスト抽出。
+
+    増分処理（重複検知）対応:
+        管理番号（ファイル名先頭の ``NNN-NN-N``）をキーに、出力一覧シートに
+        既存の PDF はスキップ対象に分類し ``items`` に含めない（無条件、bypass
+        なし）。Batch API に投げない＝コスト削減になる。管理番号を持たない
+        PDF も同様にスキップする（重複検知が原理的に不可能なため）。
+        既に処理済みの PDF を再処理したい場合は、出力一覧シートの該当行を
+        手動で削除すれば、その管理番号は「未処理」扱いに戻り次回実行で
+        再処理される。
 
     Args:
         profile: 実行時設定（``ProfileConfig`` または ``RunConfig``）。
             後方互換のため ``ProfileConfig`` を受けるが、内部では ``RunConfig``
             と同じフィールドのみ参照する。
-        test_count: テスト件数（0=全件処理）
+        test_count: 新規 PDF を N 件まで処理（0=全件処理）。重複・管理番号
+            なしを除外した「処理対象の新規 PDF」に対して適用される。
 
     Returns:
         Batch APIに投入可能なアイテムのリスト
@@ -53,16 +63,48 @@ def step1_prepare(
     logger.info("=== Step 1: 準備 ===")
 
     pdf_files = drive_client.list_pdfs(folder_id=profile.input_folder_id)
+    logger.info(f"PDF一覧: {len(pdf_files)}件")
+
+    # 重複判定（増分処理）— Batch API への投入前に実施する。
+    # 管理番号はファイル名から取れるため、download / Claude 投入の前に分類できる。
+    # 重複スキップは無条件（bypass なし）。再処理が必要なら出力シートの行を手動削除する。
+    processed = sheets_client.get_processed_management_numbers(
+        sheet_name=profile.output_sheet_name,
+    )
+
+    skip_no_number = 0
+    skip_processed = 0
+    targets: list[dict] = []
+    for pdf_file in pdf_files:
+        file_name = pdf_file["name"]
+        mgmt_num = extract_management_number(file_name)
+        if not mgmt_num:
+            logger.warning(
+                f"管理番号をファイル名から抽出できないためスキップ"
+                f"（先頭が NNN-NN-N 形式でない / 重複検知不可）: {file_name}"
+            )
+            skip_no_number += 1
+            continue
+        if mgmt_num in processed:
+            logger.info(f"処理済みのためスキップ: {mgmt_num} ({file_name})")
+            skip_processed += 1
+            continue
+        targets.append(pdf_file)
+
     if test_count > 0:
-        pdf_files = pdf_files[:test_count]
-        logger.info(f"テストモード: {test_count}件に制限")
-    logger.info(f"処理対象: {len(pdf_files)}件のPDF")
+        targets = targets[:test_count]
+        logger.info(f"テストモード: 新規対象を{test_count}件に制限")
+    logger.info(
+        f"処理対象: {len(targets)}件のPDF（新規） / "
+        f"管理番号なしスキップ {skip_no_number}件, "
+        f"処理済みスキップ {skip_processed}件"
+    )
 
     items = []
-    for i, pdf_file in enumerate(pdf_files, start=1):
+    for i, pdf_file in enumerate(targets, start=1):
         file_id = pdf_file["id"]
         file_name = pdf_file["name"]
-        logger.info(f"[{i}/{len(pdf_files)}] {file_name}")
+        logger.info(f"[{i}/{len(targets)}] {file_name}")
 
         try:
             pdf_data = drive_client.download_pdf(file_id)
@@ -271,7 +313,8 @@ def run(
 
     Args:
         batch_mode: Batch API使用（Falseなら通常モードにフォールバック）
-        test_count: テスト件数（0=全件）
+        test_count: 新規 PDF を N 件まで処理（0=全件）。重複・管理番号なしを
+            除外した「処理対象の新規 PDF」に対して適用される。
         batch_id: 既存のバッチID（Step 3から再開する場合）
         step: 実行するステップ ("all", "prepare", "submit", "results", "pdfs")
         profile_name: プロファイル名（``profiles/<name>.yaml``）。
@@ -334,7 +377,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--test-count", type=int, default=0,
-        help="テスト件数（0=全件処理）",
+        help="テスト件数（0=全件処理）。重複・管理番号なしを除外した新規 PDF に適用",
     )
     parser.add_argument(
         "--batch-id", type=str, default=None,

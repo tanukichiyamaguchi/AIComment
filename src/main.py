@@ -33,16 +33,18 @@ def run(
     test_count: int = 0,
     profile_name: str | None = None,
     target_folder: str | None = None,
-    force_reprocess: bool = False,
 ) -> None:
     """通常モードのメイン処理。
 
     増分処理（重複検知）対応:
         入力フォルダに PDF を継続追加して再実行する運用で、出力先の重複を
         防ぐ。管理番号（ファイル名先頭の ``NNN-NN-N``）をキーに、出力一覧
-        シートに既存の PDF は download / Claude API 呼び出しの前にスキップ
-        する。管理番号を持たない PDF は重複検知が原理的に不可能なため、
-        毎回再処理せず警告つきでスキップする（fail-loud）。
+        シートに既存の PDF は download / Claude API 呼び出しの前に無条件で
+        スキップする。管理番号を持たない PDF は重複検知が原理的に不可能な
+        ため、毎回再処理せず警告つきでスキップする（fail-loud）。
+        既に処理済みの PDF を再処理したい場合は、出力一覧シートの該当行を
+        手動で削除すれば、その管理番号は「未処理」扱いに戻り次回実行で
+        再処理される。
 
     Args:
         test_count: 新規 PDF を N 件まで処理（0=全件処理）。重複・管理番号
@@ -51,8 +53,6 @@ def run(
             省略時かつ ``target_folder`` も無指定なら ``jissen_default``。
         target_folder: フォルダ自動検出モードのフォルダ名。
             ``__list__`` 指定時は候補列挙のみ行い即 return。
-        force_reprocess: ``True`` のとき重複チェックを無視して処理済み
-            管理番号の PDF も再処理する。管理番号なしスキップは維持する。
     """
     logger = setup_logging()
     logger.info("=== じっせん君コメントシステム（通常モード）開始 ===")
@@ -80,13 +80,10 @@ def run(
 
     # 重複判定（増分処理）— download / Claude API 呼び出しの前に実施する。
     # 管理番号はファイル名から取れるため、コストのかかる処理に入る前に分類できる。
-    if force_reprocess:
-        logger.info("強制再実行モード: 重複チェックをスキップします")
-        processed: set[str] = set()
-    else:
-        processed = sheets_client.get_processed_management_numbers(
-            sheet_name=cfg.output_sheet_name,
-        )
+    # 重複スキップは無条件（bypass なし）。再処理が必要なら出力シートの行を手動削除する。
+    processed = sheets_client.get_processed_management_numbers(
+        sheet_name=cfg.output_sheet_name,
+    )
 
     targets: list[dict] = []
     for pdf_file in pdf_files:
@@ -99,7 +96,7 @@ def run(
             )
             stats["skip_no_number"] += 1
             continue
-        if not force_reprocess and mgmt_num in processed:
+        if mgmt_num in processed:
             logger.info(f"処理済みのためスキップ: {mgmt_num} ({file_name})")
             stats["skip_processed"] += 1
             continue
@@ -197,10 +194,6 @@ def main() -> None:
         "--test-count", type=int, default=0,
         help="テスト件数（0=全件処理）。重複・管理番号なしを除外した新規 PDF に適用",
     )
-    parser.add_argument(
-        "--force-reprocess", action="store_true",
-        help="処理済み（出力一覧シートに記録済み）の PDF も再処理する",
-    )
     group = parser.add_mutually_exclusive_group()
     group.add_argument(
         "--profile", type=str, default=None,
@@ -221,7 +214,6 @@ def main() -> None:
         test_count=args.test_count,
         profile_name=args.profile,
         target_folder=args.target_folder,
-        force_reprocess=args.force_reprocess,
     )
 
 
