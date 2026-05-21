@@ -86,27 +86,51 @@ def sanitize_filename(
 
 
 # 実践事例 PDF のファイル名先頭に埋め込まれた管理番号のパターン。
-# ``NNN-NN-N``（数字3 - 数字2 - 数字1、ハイフン込みで計 8 文字）。
-_MANAGEMENT_NUMBER_PATTERN = re.compile(r"^\d{3}-\d{2}-\d")
+# ``<3〜5桁>-<2桁>-<1桁>``（先頭セグメント = 医院番号は 3〜5 桁可変、
+# 2・3 番目のセグメントは桁数固定）。先頭セグメントの ``(...)`` は
+# ``extract_clinic_number`` が医院番号として再利用する。
+_MANAGEMENT_NUMBER_PATTERN = re.compile(r"^(\d{3,5})-\d{2}-\d")
 
 
 def extract_management_number(filename: str) -> str:
     """PDFファイル名の先頭から管理番号を抽出する。
 
-    実践事例 PDF はファイル名の先頭に ``NNN-NN-N`` 形式（数字3-数字2-数字1、
-    計8文字）の管理番号が埋め込まれている。例: ``001-01-0実践事例.pdf`` → ``001-01-0``。
+    実践事例 PDF はファイル名の先頭に ``NNN-NN-N`` 形式
+    （先頭セグメント 3〜5 桁 - 数字2 - 数字1）の管理番号が埋め込まれている。
+    例: ``001-01-0実践事例.pdf`` → ``001-01-0``、``00123-45-6.pdf`` → ``00123-45-6``。
 
     Args:
         filename: PDF のファイル名
 
     Returns:
-        抽出した8文字の管理番号。先頭がパターンに合致しない場合は空文字列。
+        抽出した管理番号（先頭セグメントの桁数に応じて 7〜9 文字）。
+        先頭がパターンに合致しない場合は空文字列。
         （呼び出し側で空文字列を検知して warning ログを出すこと）
     """
     if not isinstance(filename, str):
         filename = str(filename)
     match = _MANAGEMENT_NUMBER_PATTERN.match(filename)
     return match.group(0) if match else ""
+
+
+def extract_clinic_number(filename: str) -> str:
+    """PDFファイル名先頭の管理番号から医院番号（最初のハイフンより前）を抽出する。
+
+    管理番号 ``NNN-NN-N`` の先頭セグメント（3〜5桁）が医院番号。
+    例: ``001-01-0実践事例.pdf`` → ``001``、``00123-45-6.pdf`` → ``00123``。
+    管理番号がファイル名先頭から抽出できない場合は空文字列を返す。
+
+    Args:
+        filename: PDF のファイル名
+
+    Returns:
+        抽出した医院番号（3〜5桁の数字文字列）。
+        先頭がパターンに合致しない場合は空文字列。
+    """
+    if not isinstance(filename, str):
+        filename = str(filename)
+    match = _MANAGEMENT_NUMBER_PATTERN.match(filename)
+    return match.group(1) if match else ""
 
 
 # 添付資料 PDF をファイル名から識別するためのマーカー（全角の隅付き括弧込み）。
