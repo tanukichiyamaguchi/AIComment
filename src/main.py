@@ -27,6 +27,7 @@ from pathlib import Path
 from src.utils import (
     setup_logging,
     ensure_fonts,
+    extract_clinic_number,
     extract_management_number,
     is_attachment_filename,
 )
@@ -113,6 +114,16 @@ def run(
         sheet_name=cfg.output_sheet_name,
     )
 
+    # 医院フォルダURLシート（``<出力シート名>_医院``）の記録済み医院番号を
+    # 実行開始時に 1 回スナップショットする。ループ中に記録した医院番号は
+    # ``clinics_recorded_this_run`` で追跡し、両方に無い医院だけ追記する
+    # （同一医院をシートに重複追加しない）。
+    clinic_sheet_name = f"{cfg.output_sheet_name}_医院"
+    recorded_clinics = sheets_client.get_recorded_clinic_numbers(
+        sheet_name=clinic_sheet_name,
+    )
+    clinics_recorded_this_run: set[str] = set()
+
     targets: list[dict] = []
     for pdf_file in main_files:
         file_name = pdf_file["name"]
@@ -136,9 +147,37 @@ def run(
 
     logger.info(f"処理対象: {len(targets)}件のPDF（新規）")
 
-    # メイン処理ループで構築する管理番号 → (医院名, 個人名) の対応表。
-    # 添付資料はこの表を引いて、同じ管理番号のメインと同じ出力フォルダへコピーする。
-    case_map: dict[str, tuple[str, str]] = {}
+    # メイン処理ループで構築する管理番号 → (医院フォルダ名, 医院名, 個人名) の
+    # 対応表。添付資料はこの表を引いて、同じ管理番号のメインと同じ出力フォルダ
+    # へコピーする。医院フォルダ名は ``<医院番号>_<医院名>``（Drive のフォルダ
+    # 階層用）、医院名は AI 抽出値そのまま（出力一覧シートの医院名列用）。
+    case_map: dict[str, tuple[str, str, str]] = {}
+
+    def _record_clinic_folder(
+        clinic_number: str, clinic_name: str, clinic_folder_id: str
+    ) -> None:
+        """医院フォルダURLシートに医院を 1 行記録する（重複防止込み）。
+
+        ある医院番号が実行開始時のスナップショット（``recorded_clinics``）にも
+        同一実行内で記録済みの集合（``clinics_recorded_this_run``）にも無い
+        ときだけ追記する。医院番号が空（管理番号抽出不能）の場合は記録しない。
+        """
+        if not clinic_number:
+            return
+        if clinic_number in recorded_clinics:
+            return
+        if clinic_number in clinics_recorded_this_run:
+            return
+        clinic_folder_url = (
+            f"https://drive.google.com/drive/folders/{clinic_folder_id}"
+        )
+        sheets_client.append_clinic_folder_record(
+            clinic_number=clinic_number,
+            clinic_name=clinic_name,
+            clinic_folder_url=clinic_folder_url,
+            sheet_name=clinic_sheet_name,
+        )
+        clinics_recorded_this_run.add(clinic_number)
 
     for i, pdf_file in enumerate(targets, start=1):
         file_id = pdf_file["id"]
@@ -161,6 +200,16 @@ def run(
             person_name = metadata["person_name"] or "unknown_person"
             sample_title = metadata["sample_title"] or Path(file_name).stem
             comment = metadata["comment"]
+
+            # 医院番号（管理番号の先頭セグメント）を抽出し、医院フォルダ名を
+            # ``<医院番号>_<医院名>`` で構築する。医院番号が抽出できない場合は
+            # 医院名のみのフォルダ名にフォールバックする。
+            clinic_number = extract_clinic_number(file_name)
+            clinic_folder_name = (
+                f"{clinic_number}_{clinic_name}"
+                if clinic_number
+                else clinic_name
+            )
 
             output_filename = pdf_merger.make_output_filename(
                 clinic_name, person_name, sample_title
@@ -185,7 +234,7 @@ def run(
                 upload_result = drive_client.upload_pdf_to_clinic_person(
                     file_path=output_path,
                     output_root_folder_id=cfg.output_folder_id,
-                    clinic_name=clinic_name,
+                    clinic_name=clinic_folder_name,
                     person_name=person_name,
                     file_name=output_filename,
                 )
@@ -201,9 +250,15 @@ def run(
                 sheet_name=cfg.output_sheet_name,
             )
 
+            # 医院フォルダURLシートに医院を記録（同一医院は 1 行のみ）。
+            _record_clinic_folder(
+                clinic_number, clinic_name, upload_result["clinic_folder_id"]
+            )
+
             # 添付資料パススルー用の対応表を構築。同じ管理番号の添付資料を
-            # このメインと同じ出力フォルダへコピーするために使う。
-            case_map[mgmt_num] = (clinic_name, person_name)
+            # このメインと同じ出力フォルダへコピーするために使う。医院
+            # フォルダ名（医院番号付き）と医院名（AI 抽出値）の両方を保持する。
+            case_map[mgmt_num] = (clinic_folder_name, clinic_name, person_name)
 
             logger.info(
                 f"完了: {mgmt_num} / {clinic_name} / {person_name} / {sample_title}"
@@ -248,7 +303,10 @@ def run(
             stats["skip_attachment_orphan"] += 1
             continue
 
-        clinic_name, person_name = case
+        # case_map は (医院フォルダ名, 医院名, 個人名)。添付資料はメインと同じ
+        # 管理番号 = 同じ医院番号なので、同じ医院フォルダ（医院番号付き）へ
+        # コピーされる。出力一覧シートの医院名列は AI 抽出値（医院番号なし）。
+        clinic_folder_name, clinic_name, person_name = case
         try:
             # 元 PDF のバイト列をそのまま再アップロード（マージ・コメント
             # ページ生成はしない）。出力ファイル名は元のまま（make_output_filename
@@ -260,7 +318,7 @@ def run(
                 upload_result = drive_client.upload_pdf_to_clinic_person(
                     file_path=attachment_path,
                     output_root_folder_id=cfg.output_folder_id,
-                    clinic_name=clinic_name,
+                    clinic_name=clinic_folder_name,
                     person_name=person_name,
                     file_name=file_name,
                 )
