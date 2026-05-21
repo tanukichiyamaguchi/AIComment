@@ -163,5 +163,124 @@ class TestAppendOutputRecord(unittest.TestCase):
         self.assertEqual(append_call.kwargs["valueInputOption"], "RAW")
 
 
+class TestGetProcessedManagementNumbers(unittest.TestCase):
+    """``get_processed_management_numbers``（増分処理の重複検知キー取得）。"""
+
+    @staticmethod
+    def _build_service(
+        existing_sheet_titles: list[str],
+        a_column_values: list[list[str]] | None,
+    ) -> MagicMock:
+        """シート一覧と A2:A の値を持つ Sheets サービスのモック。
+
+        ``a_column_values`` が ``None`` のとき ``values`` キー無しを再現する。
+        """
+        service = MagicMock()
+        service.spreadsheets.return_value.get.return_value.execute.return_value = {
+            "sheets": [
+                {"properties": {"title": t}} for t in existing_sheet_titles
+            ]
+        }
+        get_result: dict = {}
+        if a_column_values is not None:
+            get_result["values"] = a_column_values
+        service.spreadsheets.return_value.values.return_value.get.return_value.execute.return_value = get_result
+        return service
+
+    @patch("src.sheets_client.get_sheets_service")
+    def test_returns_set_of_management_numbers(self, mock_get_service):
+        """複数行の A列から管理番号の集合を返す。"""
+        service = self._build_service(
+            ["出力一覧"],
+            [["001-01-0"], ["001-01-1"], ["002-03-4"]],
+        )
+        mock_get_service.return_value = service
+
+        result = sheets_client.get_processed_management_numbers(
+            spreadsheet_id="sid", sheet_name="出力一覧",
+        )
+
+        self.assertEqual(result, {"001-01-0", "001-01-1", "002-03-4"})
+        # A2:A（ヘッダー除外）で取得していること
+        get_call = service.spreadsheets.return_value.values.return_value.get.call_args
+        self.assertEqual(get_call.kwargs["range"], "出力一覧!A2:A")
+
+    @patch("src.sheets_client.get_sheets_service")
+    def test_excludes_empty_and_whitespace_cells(self, mock_get_service):
+        """空セル・空白のみセル・空行は集合から除外される。"""
+        service = self._build_service(
+            ["出力一覧"],
+            [["001-01-0"], [""], ["   "], [], ["002-03-4"]],
+        )
+        mock_get_service.return_value = service
+
+        result = sheets_client.get_processed_management_numbers(
+            spreadsheet_id="sid", sheet_name="出力一覧",
+        )
+
+        self.assertEqual(result, {"001-01-0", "002-03-4"})
+
+    @patch("src.sheets_client.get_sheets_service")
+    def test_returns_empty_set_when_sheet_not_created(self, mock_get_service):
+        """出力一覧シートが未作成なら空集合（values.get を呼ばない）。"""
+        service = self._build_service(["Sheet1"], None)
+        mock_get_service.return_value = service
+
+        result = sheets_client.get_processed_management_numbers(
+            spreadsheet_id="sid", sheet_name="出力一覧",
+        )
+
+        self.assertEqual(result, set())
+        service.spreadsheets.return_value.values.return_value.get.assert_not_called()
+
+    @patch("src.sheets_client.get_sheets_service")
+    def test_returns_empty_set_when_only_header(self, mock_get_service):
+        """ヘッダー行のみ（A2:A が空）なら空集合。"""
+        service = self._build_service(["出力一覧"], [])
+        mock_get_service.return_value = service
+
+        result = sheets_client.get_processed_management_numbers(
+            spreadsheet_id="sid", sheet_name="出力一覧",
+        )
+
+        self.assertEqual(result, set())
+
+    @patch("src.sheets_client.get_sheets_service")
+    def test_returns_empty_set_when_values_key_missing(self, mock_get_service):
+        """``values`` キーが無いレスポンスでも空集合を返す（KeyError にしない）。"""
+        service = self._build_service(["出力一覧"], None)
+        # シートは存在するが values.get が空 dict を返す状態にする
+        service.spreadsheets.return_value.values.return_value.get.return_value.execute.return_value = {}
+        mock_get_service.return_value = service
+
+        result = sheets_client.get_processed_management_numbers(
+            spreadsheet_id="sid", sheet_name="出力一覧",
+        )
+
+        self.assertEqual(result, set())
+
+    @patch("src.sheets_client.get_sheets_service")
+    def test_uses_default_sheet_name_when_omitted(self, mock_get_service):
+        """``sheet_name`` 省略時は ``OUTPUT_SHEET_NAME`` にフォールバックする。"""
+        service = self._build_service(
+            [sheets_client.OUTPUT_SHEET_NAME], [["003-04-5"]],
+        )
+        mock_get_service.return_value = service
+
+        result = sheets_client.get_processed_management_numbers(
+            spreadsheet_id="sid",
+        )
+
+        self.assertEqual(result, {"003-04-5"})
+        get_call = service.spreadsheets.return_value.values.return_value.get.call_args
+        self.assertIn(sheets_client.OUTPUT_SHEET_NAME, get_call.kwargs["range"])
+
+    def test_raises_when_spreadsheet_id_missing(self):
+        """``SPREADSHEET_ID`` 未設定なら ValueError。"""
+        with patch.object(sheets_client, "SPREADSHEET_ID", ""):
+            with self.assertRaises(ValueError):
+                sheets_client.get_processed_management_numbers()
+
+
 if __name__ == "__main__":
     unittest.main()

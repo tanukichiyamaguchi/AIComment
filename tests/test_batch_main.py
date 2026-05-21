@@ -99,15 +99,157 @@ class TestArgparseProfile(unittest.TestCase):
 class TestStep1UsesProfile(unittest.TestCase):
     """Step1 がプロファイルの入力フォルダで Drive を見にいく。"""
 
+    @patch("src.batch_main.sheets_client")
     @patch("src.batch_main.drive_client")
-    def test_step1_passes_profile_input_folder_to_list_pdfs(self, mock_drive):
+    def test_step1_passes_profile_input_folder_to_list_pdfs(
+        self, mock_drive, mock_sheets,
+    ):
         mock_drive.list_pdfs.return_value = []
+        mock_sheets.get_processed_management_numbers.return_value = set()
         profile = _make_profile(input_folder_id="profile_input_id")
 
         batch_main.step1_prepare(profile, test_count=0)
 
         mock_drive.list_pdfs.assert_called_once_with(
             folder_id="profile_input_id",
+        )
+
+
+def _install_step1_mocks(mock_drive, mock_reader) -> None:
+    """step1_prepare の download → extract_text を成功させる標準モック。"""
+    mock_drive.download_pdf.return_value = b"%PDF-1.4 fake"
+    mock_reader.extract_text.return_value = "PDFテキスト"
+
+
+class TestStep1IncrementalDedup(unittest.TestCase):
+    """``step1_prepare`` の増分処理（重複検知）。
+
+    スキップ対象（処理済み / 管理番号なし）は ``items`` に含めず、Batch API
+    に投げない（コスト削減）。重複判定は download / Claude 投入の前に行う。
+    """
+
+    @patch("src.batch_main.pdf_reader")
+    @patch("src.batch_main.sheets_client")
+    @patch("src.batch_main.drive_client")
+    def test_processed_pdf_excluded_from_items(
+        self, mock_drive, mock_sheets, mock_reader,
+    ):
+        """処理済み管理番号の PDF は items に含まれず download もされない。"""
+        mock_drive.list_pdfs.return_value = [
+            {"id": "id_1", "name": "001-01-0既存.pdf"},
+            {"id": "id_2", "name": "001-01-1新規.pdf"},
+        ]
+        mock_sheets.get_processed_management_numbers.return_value = {"001-01-0"}
+        _install_step1_mocks(mock_drive, mock_reader)
+        profile = _make_profile()
+
+        items = batch_main.step1_prepare(profile, test_count=0)
+
+        # 新規 1 件だけが items に入る
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["pdf_file_name"], "001-01-1新規.pdf")
+        # 処理済みは download されない（Batch API 投入前にスキップ）
+        mock_drive.download_pdf.assert_called_once_with("id_2")
+        # 重複判定は出力シート単位
+        mock_sheets.get_processed_management_numbers.assert_called_once_with(
+            sheet_name="出力一覧",
+        )
+
+    @patch("src.batch_main.pdf_reader")
+    @patch("src.batch_main.sheets_client")
+    @patch("src.batch_main.drive_client")
+    def test_no_management_number_pdf_excluded_from_items(
+        self, mock_drive, mock_sheets, mock_reader,
+    ):
+        """管理番号なし PDF は items に含まれず warning が出る。"""
+        mock_drive.list_pdfs.return_value = [
+            {"id": "id_1", "name": "管理番号なし.pdf"},
+            {"id": "id_2", "name": "001-01-1正常.pdf"},
+        ]
+        mock_sheets.get_processed_management_numbers.return_value = set()
+        _install_step1_mocks(mock_drive, mock_reader)
+        profile = _make_profile()
+
+        with self.assertLogs("jissen_comment", level="WARNING") as log_ctx:
+            items = batch_main.step1_prepare(profile, test_count=0)
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["pdf_file_name"], "001-01-1正常.pdf")
+        self.assertIn("管理番号なし.pdf", "\n".join(log_ctx.output))
+
+    @patch("src.batch_main.pdf_reader")
+    @patch("src.batch_main.sheets_client")
+    @patch("src.batch_main.drive_client")
+    def test_all_processed_pdfs_excluded_unconditionally(
+        self, mock_drive, mock_sheets, mock_reader,
+    ):
+        """全 PDF が処理済みなら無条件で items から除外され download もされない。
+
+        重複スキップに bypass はない。再処理は出力シートの行を手動削除して行う。
+        """
+        mock_drive.list_pdfs.return_value = [
+            {"id": "id_1", "name": "001-01-0既存.pdf"},
+            {"id": "id_2", "name": "001-01-1既存.pdf"},
+        ]
+        mock_sheets.get_processed_management_numbers.return_value = {
+            "001-01-0", "001-01-1",
+        }
+        _install_step1_mocks(mock_drive, mock_reader)
+        profile = _make_profile()
+
+        items = batch_main.step1_prepare(profile, test_count=0)
+
+        # 処理済みは無条件除外 → items は空、download も呼ばれない
+        self.assertEqual(len(items), 0)
+        mock_drive.download_pdf.assert_not_called()
+
+    @patch("src.batch_main.pdf_reader")
+    @patch("src.batch_main.sheets_client")
+    @patch("src.batch_main.drive_client")
+    def test_test_count_applies_to_new_targets_only(
+        self, mock_drive, mock_sheets, mock_reader,
+    ):
+        """``test_count`` は重複・管理番号なしを除外した新規 PDF に適用される。"""
+        mock_drive.list_pdfs.return_value = [
+            {"id": "id_0", "name": "001-01-0既存.pdf"},
+            {"id": "id_x", "name": "管理番号なし.pdf"},
+            {"id": "id_1", "name": "001-01-1新規.pdf"},
+            {"id": "id_2", "name": "001-01-2新規.pdf"},
+            {"id": "id_3", "name": "001-01-3新規.pdf"},
+        ]
+        mock_sheets.get_processed_management_numbers.return_value = {"001-01-0"}
+        _install_step1_mocks(mock_drive, mock_reader)
+        profile = _make_profile()
+
+        with self.assertLogs("jissen_comment", level="WARNING"):
+            items = batch_main.step1_prepare(profile, test_count=2)
+
+        # 新規候補 3 件の先頭 2 件のみ
+        self.assertEqual(len(items), 2)
+        names = [it["pdf_file_name"] for it in items]
+        self.assertEqual(names, ["001-01-1新規.pdf", "001-01-2新規.pdf"])
+
+    @patch("src.batch_main.pdf_reader")
+    @patch("src.batch_main.sheets_client")
+    @patch("src.batch_main.drive_client")
+    def test_dedup_uses_run_config_sheet_name(
+        self, mock_drive, mock_sheets, mock_reader,
+    ):
+        """``RunConfig`` 経由でも ``output_sheet_name`` で重複判定する。"""
+        mock_drive.list_pdfs.return_value = []
+        mock_sheets.get_processed_management_numbers.return_value = set()
+        _install_step1_mocks(mock_drive, mock_reader)
+        cfg = batch_main.RunConfig(
+            display_name="自動検出: X",
+            input_folder_id="auto_in",
+            output_folder_id="auto_out",
+            output_sheet_name="X_sheet",
+        )
+
+        batch_main.step1_prepare(cfg, test_count=0)
+
+        mock_sheets.get_processed_management_numbers.assert_called_once_with(
+            sheet_name="X_sheet",
         )
 
 

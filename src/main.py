@@ -36,8 +36,19 @@ def run(
 ) -> None:
     """通常モードのメイン処理。
 
+    増分処理（重複検知）対応:
+        入力フォルダに PDF を継続追加して再実行する運用で、出力先の重複を
+        防ぐ。管理番号（ファイル名先頭の ``NNN-NN-N``）をキーに、出力一覧
+        シートに既存の PDF は download / Claude API 呼び出しの前に無条件で
+        スキップする。管理番号を持たない PDF は重複検知が原理的に不可能な
+        ため、毎回再処理せず警告つきでスキップする（fail-loud）。
+        既に処理済みの PDF を再処理したい場合は、出力一覧シートの該当行を
+        手動で削除すれば、その管理番号は「未処理」扱いに戻り次回実行で
+        再処理される。
+
     Args:
-        test_count: テスト件数（0=全件処理）
+        test_count: 新規 PDF を N 件まで処理（0=全件処理）。重複・管理番号
+            なしを除外した「処理対象の新規 PDF」に対して適用される。
         profile_name: プロファイル名（``profiles/<name>.yaml``）。
             省略時かつ ``target_folder`` も無指定なら ``jissen_default``。
         target_folder: フォルダ自動検出モードのフォルダ名。
@@ -57,19 +68,50 @@ def run(
 
     logger.info("Step 1: PDF一覧取得")
     pdf_files = drive_client.list_pdfs(folder_id=cfg.input_folder_id)
+    logger.info(f"PDF一覧: {len(pdf_files)}件")
+
+    stats = {
+        "success": 0,
+        "skip": 0,
+        "skip_no_number": 0,
+        "skip_processed": 0,
+        "error": 0,
+    }
+
+    # 重複判定（増分処理）— download / Claude API 呼び出しの前に実施する。
+    # 管理番号はファイル名から取れるため、コストのかかる処理に入る前に分類できる。
+    # 重複スキップは無条件（bypass なし）。再処理が必要なら出力シートの行を手動削除する。
+    processed = sheets_client.get_processed_management_numbers(
+        sheet_name=cfg.output_sheet_name,
+    )
+
+    targets: list[dict] = []
+    for pdf_file in pdf_files:
+        file_name = pdf_file["name"]
+        mgmt_num = extract_management_number(file_name)
+        if not mgmt_num:
+            logger.warning(
+                f"管理番号をファイル名から抽出できないためスキップ"
+                f"（先頭が NNN-NN-N 形式でない / 重複検知不可）: {file_name}"
+            )
+            stats["skip_no_number"] += 1
+            continue
+        if mgmt_num in processed:
+            logger.info(f"処理済みのためスキップ: {mgmt_num} ({file_name})")
+            stats["skip_processed"] += 1
+            continue
+        targets.append(pdf_file)
 
     if test_count > 0:
-        pdf_files = pdf_files[:test_count]
-        logger.info(f"テストモード: {test_count}件に制限")
+        targets = targets[:test_count]
+        logger.info(f"テストモード: 新規対象を{test_count}件に制限")
 
-    logger.info(f"処理対象: {len(pdf_files)}件のPDF")
+    logger.info(f"処理対象: {len(targets)}件のPDF（新規）")
 
-    stats = {"success": 0, "skip": 0, "error": 0}
-
-    for i, pdf_file in enumerate(pdf_files, start=1):
+    for i, pdf_file in enumerate(targets, start=1):
         file_id = pdf_file["id"]
         file_name = pdf_file["name"]
-        logger.info(f"--- [{i}/{len(pdf_files)}] {file_name} ---")
+        logger.info(f"--- [{i}/{len(targets)}] {file_name} ---")
 
         try:
             pdf_data = drive_client.download_pdf(file_id)
@@ -116,12 +158,8 @@ def run(
                     file_name=output_filename,
                 )
 
+            # 管理番号は処理対象選定時に抽出・検証済み（空でないことが保証される）。
             mgmt_num = extract_management_number(file_name)
-            if not mgmt_num:
-                logger.warning(
-                    f"管理番号をファイル名から抽出できません"
-                    f"（先頭が NNN-NN-N 形式でない）: {file_name}"
-                )
             sheets_client.append_output_record(
                 management_number=mgmt_num,
                 clinic_name=clinic_name,
@@ -143,7 +181,9 @@ def run(
     logger.info("=== 処理完了 ===")
     logger.info(
         f"成功: {stats['success']}件, "
-        f"スキップ: {stats['skip']}件, "
+        f"テキスト抽出失敗: {stats['skip']}件, "
+        f"管理番号なしスキップ: {stats['skip_no_number']}件, "
+        f"処理済みスキップ: {stats['skip_processed']}件, "
         f"エラー: {stats['error']}件"
     )
 
@@ -152,7 +192,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="じっせん君コメントシステム（通常モード）")
     parser.add_argument(
         "--test-count", type=int, default=0,
-        help="テスト件数（0=全件処理）",
+        help="テスト件数（0=全件処理）。重複・管理番号なしを除外した新規 PDF に適用",
     )
     group = parser.add_mutually_exclusive_group()
     group.add_argument(
