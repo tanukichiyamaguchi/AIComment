@@ -24,7 +24,12 @@ import argparse
 import tempfile
 from pathlib import Path
 
-from src.utils import setup_logging, ensure_fonts, extract_management_number
+from src.utils import (
+    setup_logging,
+    ensure_fonts,
+    extract_management_number,
+    is_attachment_filename,
+)
 from src import discover, drive_client, sheets_client
 from src import pdf_reader, comment_generator, pdf_creator, pdf_merger
 
@@ -45,6 +50,16 @@ def run(
         既に処理済みの PDF を再処理したい場合は、出力一覧シートの該当行を
         手動で削除すれば、その管理番号は「未処理」扱いに戻り次回実行で
         再処理される。
+
+    添付資料パススルー対応:
+        ファイル名に「【添付資料】」を含む PDF は実践事例の補足資料であり、
+        AI 処理（テキスト抽出 / Claude API / コメントページ生成 / 結合）を
+        一切しない。入力をファイル名で「メイン」と「添付資料」に早期分類し、
+        添付資料は別経路で処理する（lessons.md P-016）。メイン PDF を処理
+        するループで管理番号 → ``(医院名, 個人名)`` の対応表を作り、添付資料
+        は同じ管理番号のメインと同じ ``<医院名>/<個人名>/`` フォルダへ元
+        ファイル名のままコピーし、出力一覧シートにも記録する。両経路が合流
+        するのは出力（Drive / シート）だけ。
 
     Args:
         test_count: 新規 PDF を N 件まで処理（0=全件処理）。重複・管理番号
@@ -75,18 +90,31 @@ def run(
         "skip": 0,
         "skip_no_number": 0,
         "skip_processed": 0,
+        "skip_attachment_orphan": 0,
         "error": 0,
     }
+
+    # 入力 PDF を「メイン実践事例」と「添付資料」に早期分類する（P-016）。
+    # 添付資料は AI 処理せず passthrough 経路で出力へコピーするだけなので、
+    # メインループ内の if 分岐ではなく、安価なファイル名判定で別経路に分ける。
+    main_files = [f for f in pdf_files if not is_attachment_filename(f["name"])]
+    attachment_files = [f for f in pdf_files if is_attachment_filename(f["name"])]
+    logger.info(
+        f"入力分類: メイン実践事例 {len(main_files)}件 / "
+        f"添付資料 {len(attachment_files)}件"
+    )
 
     # 重複判定（増分処理）— download / Claude API 呼び出しの前に実施する。
     # 管理番号はファイル名から取れるため、コストのかかる処理に入る前に分類できる。
     # 重複スキップは無条件（bypass なし）。再処理が必要なら出力シートの行を手動削除する。
+    # この集合は実行開始時の 1 スナップショット。メイン処理が同一実行内の添付資料
+    # 判定に影響しないよう、ループ中は更新しない。
     processed = sheets_client.get_processed_management_numbers(
         sheet_name=cfg.output_sheet_name,
     )
 
     targets: list[dict] = []
-    for pdf_file in pdf_files:
+    for pdf_file in main_files:
         file_name = pdf_file["name"]
         mgmt_num = extract_management_number(file_name)
         if not mgmt_num:
@@ -107,6 +135,10 @@ def run(
         logger.info(f"テストモード: 新規対象を{test_count}件に制限")
 
     logger.info(f"処理対象: {len(targets)}件のPDF（新規）")
+
+    # メイン処理ループで構築する管理番号 → (医院名, 個人名) の対応表。
+    # 添付資料はこの表を引いて、同じ管理番号のメインと同じ出力フォルダへコピーする。
+    case_map: dict[str, tuple[str, str]] = {}
 
     for i, pdf_file in enumerate(targets, start=1):
         file_id = pdf_file["id"]
@@ -169,6 +201,10 @@ def run(
                 sheet_name=cfg.output_sheet_name,
             )
 
+            # 添付資料パススルー用の対応表を構築。同じ管理番号の添付資料を
+            # このメインと同じ出力フォルダへコピーするために使う。
+            case_map[mgmt_num] = (clinic_name, person_name)
+
             logger.info(
                 f"完了: {mgmt_num} / {clinic_name} / {person_name} / {sample_title}"
             )
@@ -178,12 +214,84 @@ def run(
             logger.error(f"処理エラー: {file_name} - {e}", exc_info=True)
             stats["error"] += 1
 
+    # ── 添付資料パススルー経路 ──
+    # 添付資料 PDF は AI 処理（テキスト抽出 / Claude API / コメントページ生成
+    # / 結合）を一切せず、同じ管理番号のメインと同じ出力フォルダへ元ファイル
+    # のままコピーする。メイン処理が完了した後にまとめて処理する。
+    if attachment_files:
+        logger.info(f"--- 添付資料パススルー: {len(attachment_files)}件 ---")
+    for pdf_file in attachment_files:
+        file_id = pdf_file["id"]
+        file_name = pdf_file["name"]
+        mgmt_num = extract_management_number(file_name)
+
+        if not mgmt_num:
+            logger.warning(
+                f"管理番号をファイル名から抽出できないため添付資料をスキップ"
+                f"（先頭が NNN-NN-N 形式でない）: {file_name}"
+            )
+            stats["skip_no_number"] += 1
+            continue
+
+        # 重複判定は実行開始時のスナップショット（前回実行でコピー済みか）。
+        if mgmt_num in processed:
+            logger.info(f"処理済みのため添付資料をスキップ: {mgmt_num} ({file_name})")
+            stats["skip_processed"] += 1
+            continue
+
+        case = case_map.get(mgmt_num)
+        if case is None:
+            logger.warning(
+                f"対応するメイン実践事例 PDF がこの実行で処理されていないため"
+                f"スキップ: {file_name}"
+            )
+            stats["skip_attachment_orphan"] += 1
+            continue
+
+        clinic_name, person_name = case
+        try:
+            # 元 PDF のバイト列をそのまま再アップロード（マージ・コメント
+            # ページ生成はしない）。出力ファイル名は元のまま（make_output_filename
+            # は使わない＝「そのまま反映」）。
+            pdf_data = drive_client.download_pdf(file_id)
+            with tempfile.TemporaryDirectory() as tmpdir:
+                attachment_path = Path(tmpdir) / file_name
+                attachment_path.write_bytes(pdf_data)
+                upload_result = drive_client.upload_pdf_to_clinic_person(
+                    file_path=attachment_path,
+                    output_root_folder_id=cfg.output_folder_id,
+                    clinic_name=clinic_name,
+                    person_name=person_name,
+                    file_name=file_name,
+                )
+
+            sheets_client.append_output_record(
+                management_number=mgmt_num,
+                clinic_name=clinic_name,
+                person_name=person_name,
+                sample_name=f"【添付資料】{file_name}",
+                drive_url=upload_result["webViewLink"],
+                sheet_name=cfg.output_sheet_name,
+            )
+            logger.info(
+                f"添付資料コピー完了: {mgmt_num} / {clinic_name} / "
+                f"{person_name} / {file_name}"
+            )
+            stats["success"] += 1
+
+        except Exception as e:
+            logger.error(
+                f"添付資料処理エラー: {file_name} - {e}", exc_info=True
+            )
+            stats["error"] += 1
+
     logger.info("=== 処理完了 ===")
     logger.info(
-        f"成功: {stats['success']}件, "
+        f"成功: {stats['success']}件（メイン + 添付資料）, "
         f"テキスト抽出失敗: {stats['skip']}件, "
         f"管理番号なしスキップ: {stats['skip_no_number']}件, "
         f"処理済みスキップ: {stats['skip_processed']}件, "
+        f"添付資料メイン不在スキップ: {stats['skip_attachment_orphan']}件, "
         f"エラー: {stats['error']}件"
     )
 

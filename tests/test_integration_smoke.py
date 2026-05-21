@@ -1495,5 +1495,158 @@ class TestIncrementalDedupE2E(unittest.TestCase):
         self.assertEqual(mock_drive.download_pdf.call_count, 2)
 
 
+class TestAttachmentPassthroughE2E(unittest.TestCase):
+    """添付資料パススルーの E2E（mock ベース）。
+
+    ファイル名に「【添付資料】」を含む PDF は AI 処理せず、同じ管理番号の
+    メイン実践事例 PDF と同じ ``<医院名>/<個人名>/`` フォルダへ元ファイル名
+    のままコピーされる。メイン経路と passthrough 経路が出力（Drive / シート）
+    で合流することを検証する。
+    """
+
+    def setUp(self):
+        self._env_patcher = patch.dict(os.environ, _PROFILE_ENV, clear=False)
+        self._env_patcher.start()
+        # batch_main 経由のテストで batch_*.json の汚染を避けるためバックアップ
+        self._prep_file = LOGS_DIR / "batch_prep.json"
+        self._att_file = LOGS_DIR / "batch_attachments.json"
+        self._batch_id_file = LOGS_DIR / "batch_id.txt"
+        self._backups = {
+            p: (p.read_text() if p.exists() else None)
+            for p in (self._prep_file, self._att_file, self._batch_id_file)
+        }
+
+    def tearDown(self):
+        self._env_patcher.stop()
+        for path, backup in self._backups.items():
+            if backup is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.write_text(backup)
+
+    @patch("src.main.ensure_fonts")
+    @patch("src.main.pdf_merger")
+    @patch("src.main.pdf_creator")
+    @patch("src.main.pdf_reader")
+    @patch("src.main.comment_generator")
+    @patch("src.main.sheets_client")
+    @patch("src.main.drive_client")
+    def test_main_e2e_main_and_attachment_same_folder(
+        self, mock_drive, mock_sheets, mock_gen, mock_reader,
+        mock_creator, mock_merger, mock_fonts,
+    ):
+        """通常モード E2E: メイン + 添付資料が同じ管理番号・同じフォルダに出力。"""
+        mock_drive.list_pdfs.return_value = [
+            {"id": "id_main", "name": "001-01-0実践事例.pdf"},
+            {"id": "id_att", "name": "001-01-0【添付資料】補足資料.pdf"},
+        ]
+        mock_drive.download_pdf.return_value = b"%PDF-1.4 fake"
+        mock_drive.upload_pdf_to_clinic_person.return_value = {
+            "webViewLink": "https://drive.google.com/fake",
+        }
+        mock_sheets.get_processed_management_numbers.return_value = set()
+        mock_reader.extract_text.return_value = "PDFテキスト"
+        mock_gen.generate_comment_with_metadata.return_value = _make_metadata()
+        mock_merger.make_output_filename.return_value = (
+            "山田歯科＿田中太郎＿事例タイトル.pdf"
+        )
+
+        main.run(test_count=0, profile_name="jissen_default")
+
+        # メイン 1 件は Claude API に投げる、添付資料は投げない
+        self.assertEqual(mock_gen.generate_comment_with_metadata.call_count, 1)
+        # upload は 2 回、両方とも同じ医院/個人フォルダへ
+        self.assertEqual(mock_drive.upload_pdf_to_clinic_person.call_count, 2)
+        clinics = {
+            c.kwargs["clinic_name"]
+            for c in mock_drive.upload_pdf_to_clinic_person.call_args_list
+        }
+        persons = {
+            c.kwargs["person_name"]
+            for c in mock_drive.upload_pdf_to_clinic_person.call_args_list
+        }
+        self.assertEqual(clinics, {"山田歯科"})
+        self.assertEqual(persons, {"田中太郎"})
+        # シートは 2 行。両方とも管理番号 001-01-0。メイン処理が先、添付資料が後。
+        self.assertEqual(mock_sheets.append_output_record.call_count, 2)
+        rows = mock_sheets.append_output_record.call_args_list
+        self.assertEqual(
+            {r.kwargs["management_number"] for r in rows}, {"001-01-0"}
+        )
+        # メイン行（実践事例タイトル）→ 添付資料行（【添付資料】始まり）の順
+        self.assertEqual(rows[0].kwargs["sample_name"], "事例タイトル")
+        self.assertEqual(
+            rows[1].kwargs["sample_name"],
+            "【添付資料】001-01-0【添付資料】補足資料.pdf",
+        )
+
+    @patch("src.batch_main.ensure_fonts")
+    @patch("src.batch_main.pdf_merger")
+    @patch("src.batch_main.pdf_creator")
+    @patch("src.batch_main.pdf_reader")
+    @patch("src.batch_main.comment_generator")
+    @patch("src.batch_main.sheets_client")
+    @patch("src.batch_main.drive_client")
+    def test_batch_e2e_main_and_attachment_same_folder(
+        self, mock_drive, mock_sheets, mock_gen, mock_reader,
+        mock_creator, mock_merger, mock_fonts,
+    ):
+        """Batch モード E2E: 添付資料は Batch API に投げず step4 でコピーされる。"""
+        mock_drive.list_pdfs.return_value = [
+            {"id": "id_main", "name": "001-01-0実践事例.pdf"},
+            {"id": "id_att", "name": "001-01-0【添付資料】補足資料.pdf"},
+        ]
+        mock_drive.download_pdf.return_value = b"%PDF-1.4 fake"
+        mock_drive.upload_pdf_to_clinic_person.return_value = {
+            "webViewLink": "https://drive.google.com/fake",
+        }
+        mock_sheets.get_processed_management_numbers.return_value = set()
+        mock_reader.extract_text.return_value = "PDFテキスト"
+        mock_gen.submit_batch.return_value = "batch_att_001"
+        mock_gen.get_batch_status.return_value = {
+            "status": "ended",
+            "request_counts": {
+                "processing": 0, "succeeded": 1,
+                "errored": 0, "canceled": 0, "expired": 0,
+            },
+        }
+        # メインは 1 件だけ → custom_id は item_0001
+        mock_gen.get_batch_results.return_value = (
+            {"item_0001": _make_metadata()}, [],
+        )
+        mock_merger.make_output_filename.return_value = (
+            "山田歯科＿田中太郎＿事例タイトル.pdf"
+        )
+
+        with patch("src.batch_main.time.sleep"):
+            batch_main.run(
+                batch_mode=True, test_count=0, step="all",
+                profile_name="jissen_default",
+            )
+
+        # Batch API に投げられたのはメイン 1 件のみ
+        submit_arg = mock_gen.submit_batch.call_args.args[0]
+        self.assertEqual(len(submit_arg), 1)
+        self.assertEqual(submit_arg[0]["pdf_file_name"], "001-01-0実践事例.pdf")
+        # upload は 2 回（メイン + 添付資料）、両方同じ医院/個人フォルダへ
+        self.assertEqual(mock_drive.upload_pdf_to_clinic_person.call_count, 2)
+        att_upload = mock_drive.upload_pdf_to_clinic_person.call_args_list[1]
+        self.assertEqual(att_upload.kwargs["clinic_name"], "山田歯科")
+        self.assertEqual(att_upload.kwargs["person_name"], "田中太郎")
+        self.assertEqual(
+            att_upload.kwargs["file_name"], "001-01-0【添付資料】補足資料.pdf"
+        )
+        # シート 2 行、両方とも管理番号 001-01-0
+        self.assertEqual(mock_sheets.append_output_record.call_count, 2)
+        rows = mock_sheets.append_output_record.call_args_list
+        self.assertEqual(
+            {r.kwargs["management_number"] for r in rows}, {"001-01-0"}
+        )
+        self.assertEqual(
+            rows[1].kwargs["sample_name"],
+            "【添付資料】001-01-0【添付資料】補足資料.pdf",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
