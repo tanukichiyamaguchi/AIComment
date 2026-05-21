@@ -45,8 +45,21 @@ _PROFILE_ENV = {
 
 
 def _make_pdf_files(n: int) -> list[dict]:
-    """仮想 PDF メタデータを n 件返す。"""
-    return [{"id": f"id_{i:04d}", "name": f"pdf_{i:04d}.pdf"} for i in range(1, n + 1)]
+    """仮想 PDF メタデータを n 件返す。
+
+    実践事例 PDF と同様に、ファイル名先頭へ ``NNN-NN-N`` 形式の管理番号を
+    埋め込む（``extract_management_number`` の入力になる）。i 件目は
+    ``00i-00-0pdf_000i.pdf`` → 管理番号 ``00i-00-0``。
+    """
+    return [
+        {"id": f"id_{i:04d}", "name": f"{i:03d}-00-0pdf_{i:04d}.pdf"}
+        for i in range(1, n + 1)
+    ]
+
+
+def _expected_mgmt_number(i: int) -> str:
+    """``_make_pdf_files`` の i 件目（1-indexed）から抽出される管理番号。"""
+    return f"{i:03d}-00-0"
 
 
 def _make_metadata(suffix: str = "") -> dict[str, str]:
@@ -61,7 +74,7 @@ def _make_metadata(suffix: str = "") -> dict[str, str]:
 
 def _install_main_mocks(
     mock_drive, mock_sheets, mock_gen, mock_reader, mock_creator,
-    mock_merger, mock_fonts, *, pdf_count: int = 5, initial_max: int = 0,
+    mock_merger, mock_fonts, *, pdf_count: int = 5,
 ) -> None:
     """main.run() 用の標準モック挙動を一括セットアップする。"""
     mock_drive.list_pdfs.return_value = _make_pdf_files(pdf_count)
@@ -76,7 +89,6 @@ def _install_main_mocks(
     mock_merger.make_output_filename.return_value = (
         "山田歯科＿田中太郎＿事例タイトル.pdf"
     )
-    mock_sheets.get_max_management_number.return_value = initial_max
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -119,9 +131,11 @@ class TestMainE2EDefaultProfile(unittest.TestCase):
         # 各 PDF が download / upload される
         self.assertEqual(mock_drive.download_pdf.call_count, 5)
         self.assertEqual(mock_drive.upload_pdf_to_clinic_person.call_count, 5)
-        # 1 件目の管理番号は 000001（prefix なし）
+        # 1 件目の管理番号は PDF ファイル名先頭から抽出した値
         first_call = mock_sheets.append_output_record.call_args_list[0]
-        self.assertEqual(first_call.kwargs["management_number"], "000001")
+        self.assertEqual(
+            first_call.kwargs["management_number"], _expected_mgmt_number(1)
+        )
         self.assertEqual(first_call.kwargs["sheet_name"], "出力一覧")
 
     @patch("src.main.ensure_fonts")
@@ -145,13 +159,18 @@ class TestMainE2EDefaultProfile(unittest.TestCase):
         self.assertEqual(mock_sheets.append_output_record.call_count, 5)
         mock_drive.list_pdfs.assert_called_once_with(folder_id="input_q1")
         first_call = mock_sheets.append_output_record.call_args_list[0]
-        self.assertEqual(first_call.kwargs["management_number"], "J24Q1-000001")
+        # 管理番号はプロファイルに依らずファイル名先頭から抽出される
+        self.assertEqual(
+            first_call.kwargs["management_number"], _expected_mgmt_number(1)
+        )
         self.assertEqual(
             first_call.kwargs["sheet_name"], "実践事例_2024Q1_出力一覧"
         )
-        # 5 件目は ...000005
+        # 5 件目はファイル名先頭の管理番号
         fifth = mock_sheets.append_output_record.call_args_list[4]
-        self.assertEqual(fifth.kwargs["management_number"], "J24Q1-000005")
+        self.assertEqual(
+            fifth.kwargs["management_number"], _expected_mgmt_number(5)
+        )
 
     @patch("src.main.ensure_fonts")
     @patch("src.main.pdf_merger")
@@ -173,7 +192,9 @@ class TestMainE2EDefaultProfile(unittest.TestCase):
 
         mock_drive.list_pdfs.assert_called_once_with(folder_id="input_q2")
         first_call = mock_sheets.append_output_record.call_args_list[0]
-        self.assertEqual(first_call.kwargs["management_number"], "J24Q2-000001")
+        self.assertEqual(
+            first_call.kwargs["management_number"], _expected_mgmt_number(1)
+        )
         self.assertEqual(
             first_call.kwargs["sheet_name"], "実践事例_2024Q2_出力一覧"
         )
@@ -198,7 +219,9 @@ class TestMainE2EDefaultProfile(unittest.TestCase):
 
         mock_drive.list_pdfs.assert_called_once_with(folder_id="input_q3")
         first_call = mock_sheets.append_output_record.call_args_list[0]
-        self.assertEqual(first_call.kwargs["management_number"], "J24Q3-000001")
+        self.assertEqual(
+            first_call.kwargs["management_number"], _expected_mgmt_number(1)
+        )
         self.assertEqual(
             first_call.kwargs["sheet_name"], "実践事例_2024Q3_出力一覧"
         )
@@ -223,7 +246,9 @@ class TestMainE2EDefaultProfile(unittest.TestCase):
 
         mock_drive.list_pdfs.assert_called_once_with(folder_id="input_q4")
         first_call = mock_sheets.append_output_record.call_args_list[0]
-        self.assertEqual(first_call.kwargs["management_number"], "J24Q4-000001")
+        self.assertEqual(
+            first_call.kwargs["management_number"], _expected_mgmt_number(1)
+        )
         self.assertEqual(
             first_call.kwargs["sheet_name"], "実践事例_2024Q4_出力一覧"
         )
@@ -337,12 +362,16 @@ class TestProfileCrossContamination(unittest.TestCase):
 
 
 # ─────────────────────────────────────────────────────────────────────
-# 3. 管理番号採番のリグレッション防止
+# 3. 管理番号（PDF ファイル名先頭からの抽出）の結合テスト
 # ─────────────────────────────────────────────────────────────────────
 
 
-class TestManagementNumberRegression(unittest.TestCase):
-    """管理番号のフォーマット・既存最大値からの継続採番。"""
+class TestManagementNumberFromFilename(unittest.TestCase):
+    """管理番号は実践事例 PDF のファイル名先頭（NNN-NN-N）から抽出される。
+
+    自動採番は廃止済み。各 PDF の管理番号は、その PDF のファイル名先頭の
+    8 文字コードと一致しなければならない。
+    """
 
     def setUp(self):
         self._env_patcher = patch.dict(os.environ, _PROFILE_ENV, clear=False)
@@ -358,10 +387,11 @@ class TestManagementNumberRegression(unittest.TestCase):
     @patch("src.main.comment_generator")
     @patch("src.main.sheets_client")
     @patch("src.main.drive_client")
-    def test_default_profile_management_number_format(
+    def test_default_profile_extracts_each_filename_management_number(
         self, mock_drive, mock_sheets, mock_gen, mock_reader,
         mock_creator, mock_merger, mock_fonts,
     ):
+        """各 PDF の管理番号 = その PDF のファイル名先頭コード（default プロファイル）。"""
         _install_main_mocks(
             mock_drive, mock_sheets, mock_gen, mock_reader,
             mock_creator, mock_merger, mock_fonts, pdf_count=3,
@@ -373,7 +403,10 @@ class TestManagementNumberRegression(unittest.TestCase):
             c.kwargs["management_number"]
             for c in mock_sheets.append_output_record.call_args_list
         ]
-        self.assertEqual(mgmt_nums, ["000001", "000002", "000003"])
+        self.assertEqual(
+            mgmt_nums,
+            [_expected_mgmt_number(i) for i in (1, 2, 3)],
+        )
 
     @patch("src.main.ensure_fonts")
     @patch("src.main.pdf_merger")
@@ -382,10 +415,11 @@ class TestManagementNumberRegression(unittest.TestCase):
     @patch("src.main.comment_generator")
     @patch("src.main.sheets_client")
     @patch("src.main.drive_client")
-    def test_quarterly_profile_management_number_format(
+    def test_quarterly_profile_uses_same_filename_extraction(
         self, mock_drive, mock_sheets, mock_gen, mock_reader,
         mock_creator, mock_merger, mock_fonts,
     ):
+        """プロファイルに依らず管理番号はファイル名抽出（Q1 でも prefix を付けない）。"""
         _install_main_mocks(
             mock_drive, mock_sheets, mock_gen, mock_reader,
             mock_creator, mock_merger, mock_fonts, pdf_count=3,
@@ -398,7 +432,8 @@ class TestManagementNumberRegression(unittest.TestCase):
             for c in mock_sheets.append_output_record.call_args_list
         ]
         self.assertEqual(
-            mgmt_nums, ["J24Q1-000001", "J24Q1-000002", "J24Q1-000003"],
+            mgmt_nums,
+            [_expected_mgmt_number(i) for i in (1, 2, 3)],
         )
 
     @patch("src.main.ensure_fonts")
@@ -408,15 +443,22 @@ class TestManagementNumberRegression(unittest.TestCase):
     @patch("src.main.comment_generator")
     @patch("src.main.sheets_client")
     @patch("src.main.drive_client")
-    def test_management_number_continues_from_existing_max(
+    def test_management_number_preserves_existing_embedded_codes(
         self, mock_drive, mock_sheets, mock_gen, mock_reader,
         mock_creator, mock_merger, mock_fonts,
     ):
-        _install_main_mocks(
-            mock_drive, mock_sheets, mock_gen, mock_reader,
-            mock_creator, mock_merger, mock_fonts,
-            pdf_count=3, initial_max=5,
-        )
+        """ファイル名先頭の既存コードがそのまま管理番号になる（採番しない）。"""
+        mock_drive.list_pdfs.return_value = [
+            {"id": "id_a", "name": "088-12-3実践事例タイトル.pdf"},
+            {"id": "id_b", "name": "088-12-4_別タイトル.pdf"},
+        ]
+        mock_drive.download_pdf.return_value = b"%PDF-1.4 fake"
+        mock_drive.upload_pdf_to_clinic_person.return_value = {
+            "webViewLink": "https://drive.google.com/fake",
+        }
+        mock_reader.extract_text.return_value = "PDFテキスト"
+        mock_gen.generate_comment_with_metadata.return_value = _make_metadata()
+        mock_merger.make_output_filename.return_value = "out.pdf"
 
         main.run(test_count=0, profile_name="jissen_default")
 
@@ -424,8 +466,7 @@ class TestManagementNumberRegression(unittest.TestCase):
             c.kwargs["management_number"]
             for c in mock_sheets.append_output_record.call_args_list
         ]
-        # 既存最大値 5 → 次は 000006 から
-        self.assertEqual(mgmt_nums, ["000006", "000007", "000008"])
+        self.assertEqual(mgmt_nums, ["088-12-3", "088-12-4"])
 
     @patch("src.main.ensure_fonts")
     @patch("src.main.pdf_merger")
@@ -434,27 +475,37 @@ class TestManagementNumberRegression(unittest.TestCase):
     @patch("src.main.comment_generator")
     @patch("src.main.sheets_client")
     @patch("src.main.drive_client")
-    def test_quarterly_management_number_continues_from_its_own_max(
+    def test_unextractable_filename_records_empty_and_warns(
         self, mock_drive, mock_sheets, mock_gen, mock_reader,
         mock_creator, mock_merger, mock_fonts,
     ):
-        _install_main_mocks(
-            mock_drive, mock_sheets, mock_gen, mock_reader,
-            mock_creator, mock_merger, mock_fonts,
-            pdf_count=2, initial_max=10,
-        )
+        """先頭が NNN-NN-N でない PDF は管理番号が空文字列・warning にファイル名。
 
-        main.run(test_count=0, profile_name="jissen_2024_q1")
+        抽出不能でもスキップせず処理を続行する（Q2=A 仕様）。
+        """
+        mock_drive.list_pdfs.return_value = [
+            {"id": "id_a", "name": "012-03-4正常な事例.pdf"},
+            {"id": "id_b", "name": "管理番号のないファイル.pdf"},
+        ]
+        mock_drive.download_pdf.return_value = b"%PDF-1.4 fake"
+        mock_drive.upload_pdf_to_clinic_person.return_value = {
+            "webViewLink": "https://drive.google.com/fake",
+        }
+        mock_reader.extract_text.return_value = "PDFテキスト"
+        mock_gen.generate_comment_with_metadata.return_value = _make_metadata()
+        mock_merger.make_output_filename.return_value = "out.pdf"
 
-        # get_max_management_number が prefix="J24Q1-" 付きで呼ばれている
-        kwargs = mock_sheets.get_max_management_number.call_args.kwargs
-        self.assertEqual(kwargs["prefix"], "J24Q1-")
-        # 既存最大値 10 → 次は J24Q1-000011 から
+        with self.assertLogs("jissen_comment", level="WARNING") as log_ctx:
+            main.run(test_count=0, profile_name="jissen_default")
+
         mgmt_nums = [
             c.kwargs["management_number"]
             for c in mock_sheets.append_output_record.call_args_list
         ]
-        self.assertEqual(mgmt_nums, ["J24Q1-000011", "J24Q1-000012"])
+        # 2 件とも処理され（スキップしない）、抽出不能分は空文字列
+        self.assertEqual(mgmt_nums, ["012-03-4", ""])
+        # warning に抽出不能ファイル名が含まれる
+        self.assertIn("管理番号のないファイル.pdf", "\n".join(log_ctx.output))
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -525,9 +576,12 @@ class TestMainErrorPaths(unittest.TestCase):
 
         # 1 件目はエラー → シート追記なし、2-3 件目は成功
         self.assertEqual(mock_sheets.append_output_record.call_count, 2)
-        # 2 件目の管理番号は 000001（エラーは採番をスキップする）
+        # 最初の成功は 2 件目。管理番号はその PDF のファイル名先頭から抽出され、
+        # 1 件目のエラーに影響されない（採番ではなく抽出のため）。
         first_success = mock_sheets.append_output_record.call_args_list[0]
-        self.assertEqual(first_success.kwargs["management_number"], "000001")
+        self.assertEqual(
+            first_success.kwargs["management_number"], _expected_mgmt_number(2)
+        )
 
     @patch("src.main.ensure_fonts")
     @patch("src.main.pdf_merger")
@@ -642,7 +696,6 @@ class TestBatchE2E(unittest.TestCase):
         mock_merger.make_output_filename.return_value = (
             "山田歯科＿田中太郎＿事例タイトル.pdf"
         )
-        mock_sheets.get_max_management_number.return_value = 0
 
     @patch("src.batch_main.ensure_fonts")
     @patch("src.batch_main.pdf_merger")
@@ -677,10 +730,12 @@ class TestBatchE2E(unittest.TestCase):
         mock_gen.submit_batch.assert_called_once()
         mock_gen.get_batch_status.assert_called()
         mock_gen.get_batch_results.assert_called_once_with("batch_test_001")
-        # シート名 / prefix は default
+        # シート名は default、管理番号はファイル名先頭から抽出
         first_call = mock_sheets.append_output_record.call_args_list[0]
         self.assertEqual(first_call.kwargs["sheet_name"], "出力一覧")
-        self.assertEqual(first_call.kwargs["management_number"], "000001")
+        self.assertEqual(
+            first_call.kwargs["management_number"], _expected_mgmt_number(1)
+        )
 
     @patch("src.batch_main.ensure_fonts")
     @patch("src.batch_main.pdf_merger")
@@ -710,7 +765,7 @@ class TestBatchE2E(unittest.TestCase):
             first_call.kwargs["sheet_name"], "実践事例_2024Q1_出力一覧",
         )
         self.assertEqual(
-            first_call.kwargs["management_number"], "J24Q1-000001",
+            first_call.kwargs["management_number"], _expected_mgmt_number(1),
         )
 
     @patch("src.batch_main.ensure_fonts")
@@ -733,7 +788,7 @@ class TestBatchE2E(unittest.TestCase):
         items = [
             {"custom_id": f"item_{i:04d}",
              "pdf_data_id": f"id_{i:04d}",
-             "pdf_file_name": f"pdf_{i:04d}.pdf"}
+             "pdf_file_name": f"{i:03d}-00-0pdf_{i:04d}.pdf"}
             for i in range(1, 4)
         ]
         results = {
@@ -748,6 +803,12 @@ class TestBatchE2E(unittest.TestCase):
 
         # シート追記は 2 件のみ（欠落分はスキップ）
         self.assertEqual(mock_sheets.append_output_record.call_count, 2)
+        # 管理番号は各 item の pdf_file_name 先頭から抽出（item_0002 欠落の影響なし）
+        mgmt_nums = [
+            c.kwargs["management_number"]
+            for c in mock_sheets.append_output_record.call_args_list
+        ]
+        self.assertEqual(mgmt_nums, ["001-00-0", "003-00-0"])
 
     @patch("src.batch_main.ensure_fonts")
     @patch("src.batch_main.pdf_merger")
@@ -902,11 +963,16 @@ class TestLegacyBehaviorRegression(unittest.TestCase):
     @patch("src.main.comment_generator")
     @patch("src.main.sheets_client")
     @patch("src.main.drive_client")
-    def test_no_management_number_prefix_for_default_matches_legacy_output(
+    def test_management_number_is_eight_char_code_from_filename(
         self, mock_drive, mock_sheets, mock_gen, mock_reader,
         mock_creator, mock_merger, mock_fonts,
     ):
-        """jissen_default の管理番号は PR #17 以前と一致（prefix なし、6 桁）。"""
+        """管理番号は PDF ファイル名先頭の 8 文字 NNN-NN-N コードと一致する。
+
+        自動採番（6 桁ゼロパディング連番）は廃止済み。
+        """
+        import re
+        _pattern = re.compile(r"^\d{3}-\d{2}-\d$")
         _install_main_mocks(
             mock_drive, mock_sheets, mock_gen, mock_reader,
             mock_creator, mock_merger, mock_fonts, pdf_count=2,
@@ -916,12 +982,9 @@ class TestLegacyBehaviorRegression(unittest.TestCase):
 
         for c in mock_sheets.append_output_record.call_args_list:
             mgmt = c.kwargs["management_number"]
-            # prefix なし、6 桁ゼロパディング、純粋数値
-            self.assertEqual(len(mgmt), 6)
-            self.assertTrue(mgmt.isdigit())
-            # アルファベットや - が混入していない
-            self.assertNotIn("-", mgmt)
-            self.assertNotIn("Q", mgmt)
+            # NNN-NN-N 形式、計 8 文字
+            self.assertEqual(len(mgmt), 8)
+            self.assertRegex(mgmt, _pattern)
 
     @patch("src.main.ensure_fonts")
     @patch("src.main.pdf_creator")
@@ -949,7 +1012,6 @@ class TestLegacyBehaviorRegression(unittest.TestCase):
             "sample_title": "売上向上の取り組み",
             "comment": "コメント本文",
         }
-        mock_sheets.get_max_management_number.return_value = 0
 
         # pdf_merger は merge_pdfs だけモックし、make_output_filename は本物を使う
         with patch("src.main.pdf_merger.merge_pdfs"):
@@ -1055,7 +1117,6 @@ class TestTargetFolderE2E(unittest.TestCase):
             input_folder_id="auto_input_id",
             output_folder_id="auto_output_id",
             output_sheet_name="2024_Q1_実践事例",
-            management_number_prefix="2024_Q1_実践事例-",
         )
 
     @patch("src.discover.resolve_context")
@@ -1070,7 +1131,10 @@ class TestTargetFolderE2E(unittest.TestCase):
         self, mock_drive, mock_sheets, mock_gen, mock_reader,
         mock_creator, mock_merger, mock_fonts, mock_resolve_context,
     ):
-        """target_folder 指定で 5 件処理 → シートに 5 行追記、自動派生 prefix。"""
+        """target_folder 指定で 5 件処理 → シートに 5 行追記。
+
+        管理番号は target_folder モードでも PDF ファイル名先頭から抽出する。
+        """
         _install_main_mocks(
             mock_drive, mock_sheets, mock_gen, mock_reader,
             mock_creator, mock_merger, mock_fonts,
@@ -1087,10 +1151,10 @@ class TestTargetFolderE2E(unittest.TestCase):
         upload_kwargs = mock_drive.upload_pdf_to_clinic_person.call_args_list
         upload_folders = {c.kwargs["output_root_folder_id"] for c in upload_kwargs}
         self.assertEqual(upload_folders, {"auto_output_id"})
-        # 自動派生した prefix で管理番号が発番される
+        # 管理番号は PDF ファイル名先頭から抽出（自動採番ではない）
         first = mock_sheets.append_output_record.call_args_list[0]
         self.assertEqual(
-            first.kwargs["management_number"], "2024_Q1_実践事例-000001",
+            first.kwargs["management_number"], _expected_mgmt_number(1),
         )
         # シート名は自動派生（フォルダ名そのまま）
         self.assertEqual(first.kwargs["sheet_name"], "2024_Q1_実践事例")
@@ -1130,7 +1194,6 @@ class TestTargetFolderE2E(unittest.TestCase):
         mock_merger.make_output_filename.return_value = (
             "山田歯科＿田中太郎＿事例タイトル.pdf"
         )
-        mock_sheets.get_max_management_number.return_value = 0
         self._install_discovery_mocks(mock_resolve_context)
 
         with patch("src.batch_main.time.sleep"):
@@ -1144,7 +1207,7 @@ class TestTargetFolderE2E(unittest.TestCase):
         mock_drive.list_pdfs.assert_called_once_with(folder_id="auto_input_id")
         first = mock_sheets.append_output_record.call_args_list[0]
         self.assertEqual(
-            first.kwargs["management_number"], "2024_Q1_実践事例-000001",
+            first.kwargs["management_number"], _expected_mgmt_number(1),
         )
         self.assertEqual(first.kwargs["sheet_name"], "2024_Q1_実践事例")
 
@@ -1156,32 +1219,38 @@ class TestTargetFolderE2E(unittest.TestCase):
     @patch("src.main.comment_generator")
     @patch("src.main.sheets_client")
     @patch("src.main.drive_client")
-    def test_target_folder_continues_from_existing_max(
+    def test_target_folder_management_number_from_filename(
         self, mock_drive, mock_sheets, mock_gen, mock_reader,
         mock_creator, mock_merger, mock_fonts, mock_resolve_context,
     ):
-        """target_folder モードでも既存シートの最大値から連番継続。"""
-        _install_main_mocks(
-            mock_drive, mock_sheets, mock_gen, mock_reader,
-            mock_creator, mock_merger, mock_fonts,
-            pdf_count=2, initial_max=42,
-        )
+        """target_folder モードでも管理番号は PDF ファイル名先頭から抽出される。
+
+        フォルダ名から prefix を派生する旧挙動は廃止済み。
+        """
+        mock_drive.list_pdfs.return_value = [
+            {"id": "id_a", "name": "077-08-9事例A.pdf"},
+            {"id": "id_b", "name": "077-08-9事例B再提出.pdf"},
+        ]
+        mock_drive.download_pdf.return_value = b"%PDF-1.4 fake"
+        mock_drive.upload_pdf_to_clinic_person.return_value = {
+            "webViewLink": "https://drive.google.com/fake",
+        }
+        mock_reader.extract_text.return_value = "PDFテキスト"
+        mock_gen.generate_comment_with_metadata.return_value = _make_metadata()
+        mock_merger.make_output_filename.return_value = "out.pdf"
         self._install_discovery_mocks(mock_resolve_context)
 
         main.run(test_count=0, target_folder="2024_Q1_実践事例")
 
-        # get_max が prefix 付きで呼ばれている（既存挙動互換）
-        kwargs = mock_sheets.get_max_management_number.call_args.kwargs
-        self.assertEqual(kwargs["prefix"], "2024_Q1_実践事例-")
-        # 既存最大値 42 → 次は 000043 から
+        # 管理番号はフォルダ名 prefix ではなく PDF ファイル名先頭コード
         mgmt_nums = [
             c.kwargs["management_number"]
             for c in mock_sheets.append_output_record.call_args_list
         ]
-        self.assertEqual(
-            mgmt_nums,
-            ["2024_Q1_実践事例-000043", "2024_Q1_実践事例-000044"],
-        )
+        self.assertEqual(mgmt_nums, ["077-08-9", "077-08-9"])
+        # シート名は自動派生（フォルダ名そのまま）
+        for c in mock_sheets.append_output_record.call_args_list:
+            self.assertEqual(c.kwargs["sheet_name"], "2024_Q1_実践事例")
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -1220,9 +1289,11 @@ class TestProfileModeRegressionAfterDiscoveryAdded(unittest.TestCase):
         main.run(test_count=0, profile_name="jissen_2024_q1")
 
         mock_resolve_context.assert_not_called()
-        # 既存挙動と同じ管理番号 / シート
+        # 管理番号はファイル名抽出、シートはプロファイル定義
         first = mock_sheets.append_output_record.call_args_list[0]
-        self.assertEqual(first.kwargs["management_number"], "J24Q1-000001")
+        self.assertEqual(
+            first.kwargs["management_number"], _expected_mgmt_number(1)
+        )
         self.assertEqual(first.kwargs["sheet_name"], "実践事例_2024Q1_出力一覧")
 
     @patch("src.discover.resolve_context")
@@ -1248,8 +1319,10 @@ class TestProfileModeRegressionAfterDiscoveryAdded(unittest.TestCase):
         mock_resolve_context.assert_not_called()
         mock_drive.list_pdfs.assert_called_once_with(folder_id="input_default")
         first = mock_sheets.append_output_record.call_args_list[0]
-        # default は prefix 空 → 純粋数値 6 桁
-        self.assertEqual(first.kwargs["management_number"], "000001")
+        # 管理番号は PDF ファイル名先頭から抽出される
+        self.assertEqual(
+            first.kwargs["management_number"], _expected_mgmt_number(1)
+        )
         self.assertEqual(first.kwargs["sheet_name"], "出力一覧")
 
     @patch("src.discover.resolve_context")
@@ -1287,7 +1360,6 @@ class TestProfileModeRegressionAfterDiscoveryAdded(unittest.TestCase):
             [],
         )
         mock_merger.make_output_filename.return_value = "f.pdf"
-        mock_sheets.get_max_management_number.return_value = 0
 
         with patch("src.batch_main.time.sleep"):
             batch_main.run(

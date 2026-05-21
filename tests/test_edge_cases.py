@@ -3,7 +3,6 @@
 最近マージされた以下のモジュールを重点的にカバーする:
 
 - ``src/profile.py``           : PR #19 で新規追加されたプロファイル loader
-- ``src/sheets_client.py``     : PR #17 / #19 で管理番号 prefix 対応・出力一覧シート対応
 - ``src/drive_client.py``      : PR #15 で正規化マッチング追加
 - ``src/utils.py``             : PR #15 で normalize_name_for_match 追加
 - ``src/pdf_merger.py``        : PR #14 で make_output_filename 拡張
@@ -29,7 +28,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import yaml
 
-from src import drive_client, profile as profile_module, sheets_client
+from src import drive_client, profile as profile_module
 from src.pdf_merger import make_output_filename
 from src.profile import ProfileConfig
 from src.utils import normalize_name_for_match
@@ -85,7 +84,7 @@ class TestProfileLoaderEdgeCases(unittest.TestCase):
         self.assertIn("必須フィールド欠落", msg)
         # 欠落キーが具体的に列挙されていること
         self.assertIn("document_type", msg)
-        self.assertIn("management_number_prefix", msg)
+        self.assertIn("prompt_template", msg)
 
     def test_empty_string_env_var_treated_as_unset(self):
         """環境変数値が空文字（``""``）でも未設定と同じ ValueError になる。"""
@@ -187,9 +186,9 @@ class TestProfileConfigFrozen(unittest.TestCase):
         with self.assertRaises(FrozenInstanceError):
             self._cfg().input_folder_id = "z"  # type: ignore[misc]
 
-    def test_management_number_prefix_immutable(self):
+    def test_output_sheet_name_immutable(self):
         with self.assertRaises(FrozenInstanceError):
-            self._cfg().management_number_prefix = "X-"  # type: ignore[misc]
+            self._cfg().output_sheet_name = "X"  # type: ignore[misc]
 
     def test_display_name_immutable(self):
         with self.assertRaises(FrozenInstanceError):
@@ -202,180 +201,7 @@ class TestProfileConfigFrozen(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# 2. sheets_client.get_max_management_number エッジケース
-# ---------------------------------------------------------------------------
-
-
-def _make_sheets_service_with_values(values: list[list[Any]]) -> MagicMock:
-    """``_ensure_output_sheet`` を通過させつつ A 列の取得結果を任意に与えるヘルパ。"""
-    service = MagicMock()
-    # _ensure_output_sheet 用：シートは既存、ヘッダーも既存
-    service.spreadsheets.return_value.get.return_value.execute.return_value = {
-        "sheets": [{"properties": {"title": "out"}}]
-    }
-    service.spreadsheets.return_value.values.return_value.get.return_value.execute.side_effect = [
-        {"values": [["管理番号"]]},  # _ensure_output_sheet 内のヘッダー読み取り
-        {"values": values},          # 実際の A 列読み取り
-    ]
-    return service
-
-
-class TestGetMaxManagementNumberEdgeCases(unittest.TestCase):
-    """``get_max_management_number`` の prefix / 異常データ / 境界。"""
-
-    @patch("src.sheets_client.get_sheets_service")
-    def test_prefix_none_and_empty_string_are_equivalent(self, mock_service):
-        """``prefix=None`` と ``prefix=""`` が同一挙動（jissen_default 互換）。"""
-        data = [["管理番号"], ["000003"], ["J24Q1-999999"], ["000012"]]
-
-        mock_service.return_value = _make_sheets_service_with_values(data)
-        none_result = sheets_client.get_max_management_number(
-            spreadsheet_id="s", sheet_name="out", prefix=None
-        )
-
-        mock_service.return_value = _make_sheets_service_with_values(data)
-        empty_result = sheets_client.get_max_management_number(
-            spreadsheet_id="s", sheet_name="out", prefix=""
-        )
-
-        self.assertEqual(none_result, empty_result)
-        self.assertEqual(none_result, 12)
-
-    @patch("src.sheets_client.get_sheets_service")
-    def test_prefix_excludes_pure_numeric_rows(self, mock_service):
-        """``prefix="J24Q1-"`` 指定時は prefix なしの純粋数値行が混入しない。"""
-        mock_service.return_value = _make_sheets_service_with_values([
-            ["管理番号"],
-            ["J24Q1-000005"],
-            ["000999"],  # 既存 legacy 形式 → 無視されるべき
-            ["J24Q1-000003"],
-        ])
-        result = sheets_client.get_max_management_number(
-            spreadsheet_id="s", sheet_name="out", prefix="J24Q1-"
-        )
-        self.assertEqual(result, 5)
-
-    @patch("src.sheets_client.get_sheets_service")
-    def test_prefix_ignores_other_quarter_prefix(self, mock_service):
-        """``prefix="J24Q1-"`` 指定時、別四半期 ``J24Q2-`` は除外される。"""
-        mock_service.return_value = _make_sheets_service_with_values([
-            ["管理番号"],
-            ["J24Q1-000010"],
-            ["J24Q2-000999"],
-            ["J24Q3-099999"],
-            ["J24Q1-000008"],
-        ])
-        result = sheets_client.get_max_management_number(
-            spreadsheet_id="s", sheet_name="out", prefix="J24Q1-"
-        )
-        self.assertEqual(result, 10)
-
-    @patch("src.sheets_client.get_sheets_service")
-    def test_strip_handles_leading_trailing_whitespace_in_cell(self, mock_service):
-        """セル値 ``" J24Q1-000005 "`` （前後空白）も正しく解釈される。"""
-        mock_service.return_value = _make_sheets_service_with_values([
-            ["管理番号"],
-            [" J24Q1-000005 "],
-            ["J24Q1-000003"],
-        ])
-        result = sheets_client.get_max_management_number(
-            spreadsheet_id="s", sheet_name="out", prefix="J24Q1-"
-        )
-        self.assertEqual(result, 5)
-
-    @patch("src.sheets_client.get_sheets_service")
-    def test_fullwidth_digits_in_cell_are_not_treated_as_match(self, mock_service):
-        """全角数字 ``Ｊ２４Ｑ１ー００００５`` は ASCII prefix と一致しないので 0。
-
-        全角文字は半角 ``J24Q1-`` で startswith しないため対象外となる。
-        （これは仕様：表示文字列が違うものは混ぜない方が安全）
-        """
-        mock_service.return_value = _make_sheets_service_with_values([
-            ["管理番号"],
-            ["Ｊ２４Ｑ１ー００００５"],  # 全角
-        ])
-        result = sheets_client.get_max_management_number(
-            spreadsheet_id="s", sheet_name="out", prefix="J24Q1-"
-        )
-        self.assertEqual(result, 0)
-
-    @patch("src.sheets_client.get_sheets_service")
-    def test_boundary_999999_then_one_million(self, mock_service):
-        """999999 + 1 = 1000000 — 7 桁になっても int としては正常に最大値を取れる。
-
-        書式（6 桁 vs 7 桁）の責務は呼び出し側（main.py / batch_main.py の f"{n:06d}"）
-        にあるため、ここでは数値として 1000000 を返せること自体を検証する。
-        """
-        mock_service.return_value = _make_sheets_service_with_values([
-            ["管理番号"],
-            ["J24Q1-999999"],
-            ["J24Q1-1000000"],
-        ])
-        result = sheets_client.get_max_management_number(
-            spreadsheet_id="s", sheet_name="out", prefix="J24Q1-"
-        )
-        self.assertEqual(result, 1000000)
-
-    @patch("src.sheets_client.get_sheets_service")
-    def test_negative_numeric_part_is_lower_than_zero_so_max_stays_zero(self, mock_service):
-        """負数 ``J24Q1--000001`` は int() 上 -1 として解釈されるが 0 より小さいので max は 0。"""
-        mock_service.return_value = _make_sheets_service_with_values([
-            ["管理番号"],
-            ["J24Q1--000001"],  # int('-000001') == -1
-            ["J24Q1--000099"],
-        ])
-        result = sheets_client.get_max_management_number(
-            spreadsheet_id="s", sheet_name="out", prefix="J24Q1-"
-        )
-        self.assertEqual(result, 0)
-
-    @patch("src.sheets_client.get_sheets_service")
-    def test_decimal_numeric_part_is_skipped(self, mock_service):
-        """``J24Q1-000005.5`` のような小数は int() に失敗してスキップ。"""
-        mock_service.return_value = _make_sheets_service_with_values([
-            ["管理番号"],
-            ["J24Q1-000005.5"],
-            ["J24Q1-000003"],
-        ])
-        result = sheets_client.get_max_management_number(
-            spreadsheet_id="s", sheet_name="out", prefix="J24Q1-"
-        )
-        self.assertEqual(result, 3)
-
-    @patch("src.sheets_client.get_sheets_service")
-    def test_non_string_cell_is_coerced(self, mock_service):
-        """セル値が int 型のままで来た場合も str に変換して処理される。"""
-        mock_service.return_value = _make_sheets_service_with_values([
-            ["管理番号"],
-            [12345],  # int 型
-            ["000099"],
-        ])
-        result = sheets_client.get_max_management_number(
-            spreadsheet_id="s", sheet_name="out", prefix=None
-        )
-        self.assertEqual(result, 12345)
-
-    @patch("src.sheets_client.get_sheets_service")
-    def test_one_million_rows_completes_quickly_o_n(self, mock_service):
-        """100 万行を超える Sheet（mock）でも O(n) で完走すること。
-
-        基準：5 秒以内（CI 環境を考慮して非常に緩い閾値）。
-        """
-        import time
-        large_data = [["管理番号"]] + [[f"J24Q1-{i:07d}"] for i in range(1_000_001)]
-        mock_service.return_value = _make_sheets_service_with_values(large_data)
-
-        start = time.perf_counter()
-        result = sheets_client.get_max_management_number(
-            spreadsheet_id="s", sheet_name="out", prefix="J24Q1-"
-        )
-        elapsed = time.perf_counter() - start
-        self.assertEqual(result, 1_000_000)
-        self.assertLess(elapsed, 5.0, f"100万行処理に {elapsed:.2f} 秒（O(n) を逸脱）")
-
-
-# ---------------------------------------------------------------------------
-# 3. normalize_name_for_match エッジケース
+# 2. normalize_name_for_match エッジケース
 # ---------------------------------------------------------------------------
 
 
@@ -475,7 +301,7 @@ class TestNormalizeNameEdgeCases(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# 4. make_output_filename エッジケース
+# 3. make_output_filename エッジケース
 # ---------------------------------------------------------------------------
 
 
@@ -594,7 +420,7 @@ class TestMakeOutputFilenameEdgeCases(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# 5. find_or_create_folder エッジケース
+# 4. find_or_create_folder エッジケース
 # ---------------------------------------------------------------------------
 
 
@@ -725,62 +551,7 @@ class TestFindOrCreateFolderEdgeCases(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# 6. 管理番号 prefix 衝突
-# ---------------------------------------------------------------------------
-
-
-class TestManagementNumberPrefixCollision(unittest.TestCase):
-    """profile A と profile B の prefix が「片方が他方の前方一致」になる場合。
-
-    例: A=``J24Q1-`` vs B=``J24Q1-X-`` の場合、A は B の行を巻き込んで
-    最大値を計算してしまう可能性がある（``J24Q1-X-...`` は ``J24Q1-`` で
-    startswith するため）。
-
-    NOTE: 仕様上 prefix の一意性は profile-system-architect エージェントが
-    検知すべき。本テストは「実装が現に何を返すか」を固定し、defect として
-    認識できるようにする目的のもの。
-    """
-
-    @patch("src.sheets_client.get_sheets_service")
-    def test_shorter_prefix_picks_up_longer_prefix_rows(self, mock_service):
-        """A の prefix='J24Q1-' は B='J24Q1-X-' の行 'J24Q1-X-000005' を
-        誤って取り込もうとするが、``int('X-000005')`` 失敗でスキップされる。
-        結果として実害なしで 0 になることを確認する。
-        """
-        mock_service.return_value = _make_sheets_service_with_values([
-            ["管理番号"],
-            ["J24Q1-X-000005"],
-            ["J24Q1-X-000099"],
-        ])
-        result = sheets_client.get_max_management_number(
-            spreadsheet_id="s", sheet_name="out", prefix="J24Q1-"
-        )
-        # int('X-000005') は ValueError → スキップされて 0 のまま
-        self.assertEqual(result, 0)
-
-    @patch("src.sheets_client.get_sheets_service")
-    def test_prefix_substring_without_separator_creates_collision(self, mock_service):
-        """A='J24Q1' (区切り無し) は B='J24Q1-X-' の行を `'J24Q1' + '-X-...'` と
-        解釈して数値部 '-X-000005' を int() しようとして失敗するため安全。
-
-        ただし B='J24Q100005' のような数値直結 prefix だと collision が起き得る
-        ことを示す（実害ケース）。
-        """
-        mock_service.return_value = _make_sheets_service_with_values([
-            ["管理番号"],
-            ["J24Q100005"],  # 仮にこの prefix を持つプロファイルが存在したら衝突
-        ])
-        result = sheets_client.get_max_management_number(
-            spreadsheet_id="s", sheet_name="out", prefix="J24Q1"
-        )
-        # 数値部 '00005' → 5
-        self.assertEqual(result, 5)
-        # WARNING: prefix の一意性を YAML schema で担保すべき（test_profile_yaml_sanity
-        # で検証）。
-
-
-# ---------------------------------------------------------------------------
-# 7. YAML プロファイル全件 sanity test
+# 5. YAML プロファイル全件 sanity test
 # ---------------------------------------------------------------------------
 
 
@@ -802,7 +573,7 @@ class TestProfileYAMLSanity(unittest.TestCase):
                 self.assertIsInstance(data, dict, f"{name}: ルートが dict でない")
 
     def test_all_profiles_have_required_fields(self):
-        """全プロファイルが必須 8 フィールドを持つ。"""
+        """全プロファイルが必須 7 フィールドを持つ。"""
         required = (
             "display_name",
             "document_type",
@@ -810,40 +581,12 @@ class TestProfileYAMLSanity(unittest.TestCase):
             "input_folder_id_secret",
             "output_folder_id_secret",
             "output_sheet_name",
-            "management_number_prefix",
             "prompt_template",
         )
         for name, data in self.profiles.items():
             with self.subTest(profile=name):
                 missing = [k for k in required if k not in data]
                 self.assertEqual(missing, [], f"{name}: 欠落 {missing}")
-
-    def test_management_number_prefix_is_unique(self):
-        """同一 management_number_prefix を持つプロファイルが複数ないこと。
-
-        prefix が衝突すると採番が混じり、別四半期に同一管理番号が振られる。
-        """
-        seen: dict[str, list[str]] = {}
-        for name, data in self.profiles.items():
-            prefix = data["management_number_prefix"]
-            # 空文字は jissen_default のみ許容する仕様。それ以外で空はエラー。
-            seen.setdefault(prefix, []).append(name)
-        duplicates = {k: v for k, v in seen.items() if len(v) > 1}
-        # 空文字 prefix は jissen_default 1 つだけ
-        empty_prefix_owners = seen.get("", [])
-        self.assertLessEqual(
-            len(empty_prefix_owners),
-            1,
-            f"空 prefix を複数 profile が持っている: {empty_prefix_owners}",
-        )
-        # 空文字以外は完全に一意
-        non_empty_duplicates = {
-            k: v for k, v in duplicates.items() if k != ""
-        }
-        self.assertEqual(
-            non_empty_duplicates, {},
-            f"management_number_prefix が重複: {non_empty_duplicates}",
-        )
 
     def test_output_sheet_name_is_unique(self):
         """同一 output_sheet_name を持つプロファイルが複数ないこと。
@@ -893,29 +636,6 @@ class TestProfileYAMLSanity(unittest.TestCase):
             f"output_folder_id_secret が重複: {duplicates}",
         )
 
-    def test_no_prefix_is_a_strict_prefix_of_another(self):
-        """ある profile の prefix が別 profile の prefix の前方一致になっていないこと。
-
-        例: A=``J24Q1-`` vs B=``J24Q1-X-`` の組合せ。
-        A の sheet を読む際に B の行を誤って巻き込む可能性がある（数値解析で
-        ほぼ失敗するが、防御的に schema レベルで弾く）。
-        """
-        prefixes = [
-            (name, data["management_number_prefix"])
-            for name, data in self.profiles.items()
-            if data["management_number_prefix"]  # 空文字は除外
-        ]
-        for a_name, a_prefix in prefixes:
-            for b_name, b_prefix in prefixes:
-                if a_name == b_name:
-                    continue
-                with self.subTest(a=a_name, b=b_name):
-                    self.assertFalse(
-                        a_prefix != b_prefix and b_prefix.startswith(a_prefix),
-                        f"prefix '{a_prefix}' ({a_name}) は "
-                        f"'{b_prefix}' ({b_name}) の前方一致になっている",
-                    )
-
     def test_period_value_is_unique(self):
         """同一 period を持つプロファイルが複数ないこと（display 上の混乱防止）。"""
         seen: dict[str, list[str]] = {}
@@ -930,7 +650,7 @@ class TestProfileYAMLSanity(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# 8. profile load の sanity（実 YAML 全件）
+# 6. profile load の sanity（実 YAML 全件）
 # ---------------------------------------------------------------------------
 
 
