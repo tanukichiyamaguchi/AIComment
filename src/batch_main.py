@@ -26,12 +26,23 @@ import tempfile
 import time
 from pathlib import Path
 
-from src.utils import setup_logging, ensure_fonts, extract_management_number
+from src.utils import (
+    setup_logging,
+    ensure_fonts,
+    extract_management_number,
+    is_attachment_filename,
+)
 from src.config import LOGS_DIR
 from src import discover, drive_client, sheets_client
 from src import pdf_reader, comment_generator, pdf_creator, pdf_merger
 from src.discover import RunConfig
 from src.profile import ProfileConfig
+
+
+# 添付資料 PDF の情報（file id / file name / 管理番号）を Step1→Step4 で
+# 受け渡すための JSON ファイル。``batch_prep.json``（メイン PDF の準備データ）
+# とは別ファイルにして、既存の prep 形式を壊さずに passthrough 情報を運ぶ。
+_BATCH_ATTACHMENTS_FILE = "batch_attachments.json"
 
 
 def step1_prepare(
@@ -49,6 +60,14 @@ def step1_prepare(
         手動で削除すれば、その管理番号は「未処理」扱いに戻り次回実行で
         再処理される。
 
+    添付資料パススルー対応:
+        ファイル名に「【添付資料】」を含む PDF は実践事例の補足資料であり、
+        Claude API に投げない。メイン PDF のみを ``items`` に入れて従来通り
+        バッチ投入し、添付資料の情報（file id / file name / 管理番号）は
+        ``batch_attachments.json`` に別途保存して Step4 に引き継ぐ
+        （lessons.md P-016）。添付資料にも重複判定（処理済みスキップ・
+        管理番号なしスキップ）をこの時点で適用し、スキップ対象は保存しない。
+
     Args:
         profile: 実行時設定（``ProfileConfig`` または ``RunConfig``）。
             後方互換のため ``ProfileConfig`` を受けるが、内部では ``RunConfig``
@@ -65,6 +84,16 @@ def step1_prepare(
     pdf_files = drive_client.list_pdfs(folder_id=profile.input_folder_id)
     logger.info(f"PDF一覧: {len(pdf_files)}件")
 
+    # 入力 PDF を「メイン実践事例」と「添付資料」に早期分類する（P-016）。
+    # 添付資料は Claude API に投げず、Step4 で出力へコピーするだけなので、
+    # メインのバッチ投入経路（items）には含めない。
+    main_files = [f for f in pdf_files if not is_attachment_filename(f["name"])]
+    attachment_files = [f for f in pdf_files if is_attachment_filename(f["name"])]
+    logger.info(
+        f"入力分類: メイン実践事例 {len(main_files)}件 / "
+        f"添付資料 {len(attachment_files)}件"
+    )
+
     # 重複判定（増分処理）— Batch API への投入前に実施する。
     # 管理番号はファイル名から取れるため、download / Claude 投入の前に分類できる。
     # 重複スキップは無条件（bypass なし）。再処理が必要なら出力シートの行を手動削除する。
@@ -75,7 +104,7 @@ def step1_prepare(
     skip_no_number = 0
     skip_processed = 0
     targets: list[dict] = []
-    for pdf_file in pdf_files:
+    for pdf_file in main_files:
         file_name = pdf_file["name"]
         mgmt_num = extract_management_number(file_name)
         if not mgmt_num:
@@ -100,6 +129,30 @@ def step1_prepare(
         f"処理済みスキップ {skip_processed}件"
     )
 
+    # 添付資料の情報を収集し batch_attachments.json に保存（Step4 で使用）。
+    # 重複判定（処理済みスキップ・管理番号なしスキップ）は添付資料にもこの
+    # 時点で適用し、スキップ対象は保存しない。
+    attachment_records: list[dict] = []
+    for pdf_file in attachment_files:
+        file_name = pdf_file["name"]
+        mgmt_num = extract_management_number(file_name)
+        if not mgmt_num:
+            logger.warning(
+                f"管理番号をファイル名から抽出できないため添付資料をスキップ"
+                f"（先頭が NNN-NN-N 形式でない）: {file_name}"
+            )
+            continue
+        if mgmt_num in processed:
+            logger.info(
+                f"処理済みのため添付資料をスキップ: {mgmt_num} ({file_name})"
+            )
+            continue
+        attachment_records.append({
+            "file_id": pdf_file["id"],
+            "file_name": file_name,
+            "management_number": mgmt_num,
+        })
+
     items = []
     for i, pdf_file in enumerate(targets, start=1):
         file_id = pdf_file["id"]
@@ -123,15 +176,26 @@ def step1_prepare(
             "pdf_text": pdf_text,
         })
 
-    logger.info(f"Step 1完了: {len(items)}件が処理可能")
+    logger.info(
+        f"Step 1完了: メイン {len(items)}件が処理可能 / "
+        f"添付資料 {len(attachment_records)}件をパススルー予約"
+    )
 
     # 準備データをJSONに保存（Step 4でも使用）
-    prep_file = LOGS_DIR / "batch_prep.json"
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    prep_file = LOGS_DIR / "batch_prep.json"
     # pdf_textは大きいので保存しない（Step2用にはバッチリクエスト作成時に使う）
     save_items = [{k: v for k, v in item.items() if k != "pdf_text"} for item in items]
     prep_file.write_text(json.dumps(save_items, ensure_ascii=False, indent=2))
     logger.info(f"準備データ保存: {prep_file}")
+
+    # 添付資料の情報を別ファイルに保存（既存の prep 形式を壊さない）。
+    # Step4 がこのファイルを読み、メインと同じフォルダへコピーする。
+    attachments_file = LOGS_DIR / _BATCH_ATTACHMENTS_FILE
+    attachments_file.write_text(
+        json.dumps(attachment_records, ensure_ascii=False, indent=2)
+    )
+    logger.info(f"添付資料データ保存: {attachments_file}")
 
     return items
 
@@ -206,6 +270,15 @@ def step4_generate_pdfs(
 ) -> None:
     """Step 4: PDF生成 → Drive保存 → 出力一覧シート追記。
 
+    添付資料パススルー対応:
+        メイン PDF の結果処理ループで管理番号 → ``(医院名, 個人名)`` の対応表
+        を構築する。ループ後、``batch_attachments.json`` を読み、各添付資料を
+        対応表で引いて、同じ管理番号のメインと同じ ``<医院名>/<個人名>/``
+        フォルダへ元ファイル名のままコピーし、出力一覧シートに記録する
+        （lessons.md P-016）。対応表に無い添付資料は警告つきでスキップする。
+        ``batch_attachments.json`` が存在しない（添付資料ゼロ）場合は何も
+        しない。
+
     Args:
         profile: 実行時設定（``ProfileConfig`` または ``RunConfig``）
         results: ``{custom_id: {clinic_name, person_name, sample_title, comment}}``
@@ -221,6 +294,10 @@ def step4_generate_pdfs(
         items = json.loads(prep_file.read_text())
 
     stats = {"success": 0, "error": 0, "missing": 0}
+
+    # 添付資料パススルー用の対応表。メイン PDF の処理ループで構築し、
+    # ループ後に添付資料をこの表で引いて同じ出力フォルダへコピーする。
+    case_map: dict[str, tuple[str, str]] = {}
 
     for item in items:
         custom_id = item["custom_id"]
@@ -281,6 +358,10 @@ def step4_generate_pdfs(
                 drive_url=upload_result["webViewLink"],
                 sheet_name=profile.output_sheet_name,
             )
+            # 添付資料パススルー用の対応表を構築。同じ管理番号の添付資料を
+            # このメインと同じ出力フォルダへコピーするために使う。
+            if mgmt_num:
+                case_map[mgmt_num] = (clinic_name, person_name)
             logger.info(
                 f"完了: {mgmt_num} / {clinic_name} / {person_name} / {sample_title}"
             )
@@ -293,12 +374,98 @@ def step4_generate_pdfs(
             )
             stats["error"] += 1
 
+    # ── 添付資料パススルー経路 ──
+    # batch_attachments.json を読み、各添付資料を case_map で引いて、同じ管理
+    # 番号のメインと同じ出力フォルダへ元ファイル名のままコピーする。AI 処理
+    # （Claude API / コメントページ生成 / 結合）は一切しない。ファイルが
+    # 存在しない（添付資料ゼロ）場合は何もしない。
+    _process_attachments(profile, case_map, stats)
+
     total = stats["success"] + stats["error"] + stats["missing"]
     logger.info(
         f"Step 4完了: 成功 {stats['success']}/{total}件, "
         f"エラー {stats['error']}/{total}件, "
         f"未取得 {stats['missing']}/{total}件"
     )
+
+
+def _process_attachments(
+    profile: ProfileConfig | RunConfig,
+    case_map: dict[str, tuple[str, str]],
+    stats: dict[str, int],
+) -> None:
+    """``batch_attachments.json`` を読み、添付資料をメインと同じ出力先へコピーする。
+
+    AI 処理（Claude API / コメントページ生成 / 結合）は一切しない。元 PDF の
+    バイト列をそのまま再アップロードし、出力一覧シートに「【添付資料】<元名>」
+    で記録する。``case_map`` に対応するメインが無い添付資料は警告スキップ。
+
+    Args:
+        profile: 実行時設定（出力フォルダ ID / シート名を参照）
+        case_map: メイン処理で構築した管理番号 → ``(医院名, 個人名)`` の対応表
+        stats: Step4 の統計 dict（``success`` / ``error`` をインプレース更新）
+    """
+    logger = setup_logging()
+    attachments_file = LOGS_DIR / _BATCH_ATTACHMENTS_FILE
+    if not attachments_file.exists():
+        logger.info("添付資料データなし（batch_attachments.json 不在）")
+        return
+
+    attachment_records: list[dict] = json.loads(attachments_file.read_text())
+    if not attachment_records:
+        logger.info("添付資料 0 件")
+        return
+
+    logger.info(f"--- 添付資料パススルー: {len(attachment_records)}件 ---")
+    for record in attachment_records:
+        file_id = record["file_id"]
+        file_name = record["file_name"]
+        mgmt_num = record["management_number"]
+
+        case = case_map.get(mgmt_num)
+        if case is None:
+            logger.warning(
+                f"対応するメイン実践事例 PDF がこの実行で処理されていないため"
+                f"スキップ: {file_name}"
+            )
+            stats["error"] += 1
+            continue
+
+        clinic_name, person_name = case
+        try:
+            # 元 PDF のバイト列をそのまま再アップロード（マージ・コメント
+            # ページ生成はしない）。出力ファイル名は元のまま。
+            pdf_data = drive_client.download_pdf(file_id)
+            with tempfile.TemporaryDirectory() as tmpdir:
+                attachment_path = Path(tmpdir) / file_name
+                attachment_path.write_bytes(pdf_data)
+                upload_result = drive_client.upload_pdf_to_clinic_person(
+                    file_path=attachment_path,
+                    output_root_folder_id=profile.output_folder_id,
+                    clinic_name=clinic_name,
+                    person_name=person_name,
+                    file_name=file_name,
+                )
+
+            sheets_client.append_output_record(
+                management_number=mgmt_num,
+                clinic_name=clinic_name,
+                person_name=person_name,
+                sample_name=f"【添付資料】{file_name}",
+                drive_url=upload_result["webViewLink"],
+                sheet_name=profile.output_sheet_name,
+            )
+            logger.info(
+                f"添付資料コピー完了: {mgmt_num} / {clinic_name} / "
+                f"{person_name} / {file_name}"
+            )
+            stats["success"] += 1
+
+        except Exception as e:
+            logger.error(
+                f"添付資料処理エラー: {file_name} - {e}", exc_info=True
+            )
+            stats["error"] += 1
 
 
 def run(
