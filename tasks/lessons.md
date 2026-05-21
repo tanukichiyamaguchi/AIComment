@@ -48,6 +48,17 @@ PR #8 added `supportsAllDrives=True` to every Drive API call assuming that would
 ### P-015: 重複検知は無条件で有効にし、bypass オプションを足さない（再処理は状態の手動修正で行う）
 入力フォルダに PDF を継続追加して再実行する運用では、出力一覧シートに既存の管理番号（NNN-NN-N）を持つ PDF を毎回スキップする増分処理が必要になる。このとき「強制再実行（force_reprocess）」のような重複チェックを丸ごと無効化するフラグを足したくなるが、それはコストのかかる download / Claude API 呼び出しを全件で再実行させる足元の地雷であり、CLI フラグ・workflow input・フォーム質問・Apps Script payload と複数レイヤーに分岐を波及させる。重複検知の真の source of truth は「出力一覧シートに行があるか」であって、コードのフラグではない。**Rule**: 重複検知は無条件で有効にする（bypass パスを設けない）。再処理が必要な場合は、出力シートの該当行を手動削除すれば、その管理番号は「未処理」扱いに戻り次回実行で再処理される。状態（シートの行）を直せば挙動が変わる設計にしておけば、コード側に分岐を増やさずに済む。判定は download / API 呼び出しの前に行い、無駄なコストを発生させないこと。
 
+### P-017: 外部 API 呼び出しは一過性エラーへのリトライを最初から組み込む
+本番実行中、Google Sheets API が 503（The service is currently unavailable）を
+1 回返しただけでワークフロー全体がクラッシュした。Google / 外部 API は 5xx・
+429 を一定確率で必ず返す前提で設計すべきで、「1 回叩いて 1 回成功する」ことを
+仮定したコードは長時間バッチで必ず破綻する。**Rule**: 外部 API のクライアントは、
+一過性エラー（5xx / 429 / タイムアウト）に対する指数バックオフ・リトライを
+最初から組み込む。`googleapiclient` なら `execute(num_retries=N)` /
+`next_chunk(num_retries=N)`、Anthropic SDK なら組み込みリトライを使う。
+リトライ対象は一過性エラーのみ（401/403/404 のような恒久エラーは即座に
+失敗させ、無駄な再試行をしない）。
+
 ## Session Log
 - **2026-03-16**: Project initialized with workflow orchestration architecture.
 - **2026-05-01**: Added 5-agent team and 3 deterministic check scripts to handle 1000+ PDF scale. Each agent owns one of the failure modes in P-001 through P-005. See `tasks/todo.md` Phase 6 for the standard operating sequence.
@@ -56,3 +67,4 @@ PR #8 added `supportsAllDrives=True` to every Drive API call assuming that would
 - **2026-05-17**: フォルダ自動検出モードを追加（`src/discover.py` + `--target-folder` 引数）。Convention over Configuration の方針で、Drive のサブフォルダを作るだけで新セミナーに対応可能。必要な Secret は `DRIVE_INPUT_ROOT` / `DRIVE_OUTPUT_ROOT` の 2 つだけで、新セミナー追加時の YAML/Secret/workflow 編集が不要に。既存の `--profile` モードは完全に後方互換維持。P-013 を追加。テスト 265 → 309 件（discover.py 単体 20 件、main/batch_main 拡張 9 件、integration smoke 6 件、profile mode regression 3 件、その他境界 6 件）。
 - **2026-05-21**: 管理番号を自動採番からファイル名抽出に変更。実践事例 PDF のファイル名先頭に既存の管理番号（`NNN-NN-N` 形式）が埋め込まれていたため、自動採番（二重管理になる）を廃止し `src/utils.extract_management_number` で抽出する方式に。dead code（`sheets_client.get_max_management_number` / 全 `management_number_prefix` フィールド / `profiles/*.yaml` の prefix 行）を完全削除。全モード（`--profile` / `--target-folder`）共通でファイル名抽出。抽出不能ファイルは空文字列 + `logger.warning`。P-014 を追加。テスト 309 → 302 件（dead code テスト約 26 件削除、`extract_management_number` 等 19 件追加）。
 - **2026-05-21**: 増分処理（管理番号での重複検知）を追加。出力一覧シートに既存の管理番号を持つ PDF は download / Claude API 呼び出しの前にスキップし、新規 PDF のみ処理する。仕様確定の際に「強制再実行（`force_reprocess` / `--force-reprocess`）」オプションは不要と判断し、一度実装しかけた `force_reprocess` 経路（`main.py` / `batch_main.py` の引数・argparse フラグ・分岐）を完全撤去。重複検知は無条件で有効とし、再処理は出力シートの該当行を手動削除して行う運用に統一。管理番号なし PDF は重複検知不可のためスキップ（fail-loud）。P-015 を追加。
+- **2026-05-21**: Google Sheets/Drive API に一過性エラーの自動リトライを追加。本番のフォルダ自動検出モード実行中、`sheets_client.get_processed_management_numbers` 内の `spreadsheets().get(...).execute()` が Sheets API の 503（The service is currently unavailable）でクラッシュした。RCA: Google API クライアント（`sheets_client.py` / `drive_client.py` / `discover.py`）はリトライ機構を持たず、5xx・429 が 1 回起きるとワークフロー全体が落ちる。修正: `config.py` に `GOOGLE_API_NUM_RETRIES = 5` を定義し、grep で洗い出した全 14 件の `.execute()`（sheets 9・drive 4・discover 1）と `download_pdf` の `next_chunk` 1 件に `num_retries` を付与。`googleapiclient` が 5xx/429 を指数バックオフ + ジッターで自動再試行する（4xx の恒久エラーはリトライしない正しい挙動）。P-017 を追加。テスト 319 → 327 件（リトライ引数検証 8 件追加）。
