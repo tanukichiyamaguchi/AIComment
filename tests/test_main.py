@@ -370,6 +370,321 @@ class TestRunIncrementalDedup(unittest.TestCase):
         self.assertEqual(mgmt_nums, ["001-01-1", "001-01-2"])
 
 
+class TestRunAttachmentPassthrough(unittest.TestCase):
+    """``run()`` の添付資料パススルー（AI 処理せず出力へコピー）。
+
+    ファイル名に「【添付資料】」を含む PDF は実践事例の補足資料であり、
+    AI 処理（テキスト抽出 / Claude API / コメントページ生成 / 結合）を
+    一切せず、同じ管理番号のメイン実践事例 PDF と同じ ``<医院名>/<個人名>/``
+    フォルダへ元ファイル名のままコピーする。出力一覧シートにも記録する。
+    """
+
+    @patch("src.main.ensure_fonts")
+    @patch("src.main.pdf_merger")
+    @patch("src.main.pdf_creator")
+    @patch("src.main.pdf_reader")
+    @patch("src.main.comment_generator")
+    @patch("src.main.sheets_client")
+    @patch("src.main.drive_client")
+    @patch("src.discover.load_profile")
+    def test_attachment_copied_to_same_folder_as_main(
+        self,
+        mock_load_profile,
+        mock_drive_client,
+        mock_sheets_client,
+        mock_gen,
+        mock_reader,
+        mock_creator,
+        mock_merger,
+        mock_ensure_fonts,
+    ):
+        """添付資料は同じ管理番号のメインと同じ医院/個人フォルダにコピーされる。"""
+        mock_load_profile.return_value = _make_profile()
+        mock_sheets_client.get_processed_management_numbers.return_value = set()
+        _install_run_mocks(
+            mock_drive_client, mock_gen, mock_reader, mock_creator, mock_merger,
+            pdf_files=[
+                {"id": "id_main", "name": "001-01-0実践事例.pdf"},
+                {"id": "id_att", "name": "001-01-0【添付資料】補足データ.pdf"},
+            ],
+        )
+
+        main_module.run(test_count=0, profile_name="jissen_default")
+
+        # upload は 2 回（メイン + 添付資料）。両方とも同じ医院/個人フォルダへ。
+        self.assertEqual(
+            mock_drive_client.upload_pdf_to_clinic_person.call_count, 2
+        )
+        for call in mock_drive_client.upload_pdf_to_clinic_person.call_args_list:
+            self.assertEqual(call.kwargs["clinic_name"], "山田歯科")
+            self.assertEqual(call.kwargs["person_name"], "田中太郎")
+            self.assertEqual(
+                call.kwargs["output_root_folder_id"], "output_folder_yyy"
+            )
+
+    @patch("src.main.ensure_fonts")
+    @patch("src.main.pdf_merger")
+    @patch("src.main.pdf_creator")
+    @patch("src.main.pdf_reader")
+    @patch("src.main.comment_generator")
+    @patch("src.main.sheets_client")
+    @patch("src.main.drive_client")
+    @patch("src.discover.load_profile")
+    def test_attachment_not_sent_to_claude_api(
+        self,
+        mock_load_profile,
+        mock_drive_client,
+        mock_sheets_client,
+        mock_gen,
+        mock_reader,
+        mock_creator,
+        mock_merger,
+        mock_ensure_fonts,
+    ):
+        """添付資料は Claude API に投げられない（generate_comment_with_metadata
+        がメイン分しか呼ばれず、添付資料のファイル名では呼ばれない）。"""
+        mock_load_profile.return_value = _make_profile()
+        mock_sheets_client.get_processed_management_numbers.return_value = set()
+        _install_run_mocks(
+            mock_drive_client, mock_gen, mock_reader, mock_creator, mock_merger,
+            pdf_files=[
+                {"id": "id_main", "name": "001-01-0実践事例.pdf"},
+                {"id": "id_att", "name": "001-01-0【添付資料】補足データ.pdf"},
+            ],
+        )
+
+        main_module.run(test_count=0, profile_name="jissen_default")
+
+        # Claude API はメイン 1 件分のみ
+        self.assertEqual(mock_gen.generate_comment_with_metadata.call_count, 1)
+        called_filenames = [
+            c.kwargs["pdf_filename"]
+            for c in mock_gen.generate_comment_with_metadata.call_args_list
+        ]
+        self.assertNotIn(
+            "001-01-0【添付資料】補足データ.pdf", called_filenames
+        )
+        # コメントページ生成・マージも添付資料に対しては行われない（メイン1件分のみ）
+        self.assertEqual(mock_creator.create_comment_page.call_count, 1)
+        self.assertEqual(mock_merger.merge_pdfs.call_count, 1)
+
+    @patch("src.main.ensure_fonts")
+    @patch("src.main.pdf_merger")
+    @patch("src.main.pdf_creator")
+    @patch("src.main.pdf_reader")
+    @patch("src.main.comment_generator")
+    @patch("src.main.sheets_client")
+    @patch("src.main.drive_client")
+    @patch("src.discover.load_profile")
+    def test_attachment_recorded_in_sheet_with_prefix(
+        self,
+        mock_load_profile,
+        mock_drive_client,
+        mock_sheets_client,
+        mock_gen,
+        mock_reader,
+        mock_creator,
+        mock_merger,
+        mock_ensure_fonts,
+    ):
+        """添付資料は出力一覧シートに「【添付資料】<元名>」で記録される。"""
+        mock_load_profile.return_value = _make_profile()
+        mock_sheets_client.get_processed_management_numbers.return_value = set()
+        _install_run_mocks(
+            mock_drive_client, mock_gen, mock_reader, mock_creator, mock_merger,
+            pdf_files=[
+                {"id": "id_main", "name": "001-01-0実践事例.pdf"},
+                {"id": "id_att", "name": "001-01-0【添付資料】補足データ.pdf"},
+            ],
+        )
+
+        main_module.run(test_count=0, profile_name="jissen_default")
+
+        # append は 2 回。添付資料行は sample_name が「【添付資料】<元名>」、
+        # 管理番号・医院名・個人名はメインと同じ。
+        self.assertEqual(mock_sheets_client.append_output_record.call_count, 2)
+        att_call = mock_sheets_client.append_output_record.call_args_list[1]
+        self.assertEqual(
+            att_call.kwargs["sample_name"],
+            "【添付資料】001-01-0【添付資料】補足データ.pdf",
+        )
+        self.assertEqual(att_call.kwargs["management_number"], "001-01-0")
+        self.assertEqual(att_call.kwargs["clinic_name"], "山田歯科")
+        self.assertEqual(att_call.kwargs["person_name"], "田中太郎")
+
+    @patch("src.main.ensure_fonts")
+    @patch("src.main.pdf_merger")
+    @patch("src.main.pdf_creator")
+    @patch("src.main.pdf_reader")
+    @patch("src.main.comment_generator")
+    @patch("src.main.sheets_client")
+    @patch("src.main.drive_client")
+    @patch("src.discover.load_profile")
+    def test_attachment_output_filename_is_original(
+        self,
+        mock_load_profile,
+        mock_drive_client,
+        mock_sheets_client,
+        mock_gen,
+        mock_reader,
+        mock_creator,
+        mock_merger,
+        mock_ensure_fonts,
+    ):
+        """添付資料の出力ファイル名は元のまま（make_output_filename を使わない）。"""
+        mock_load_profile.return_value = _make_profile()
+        mock_sheets_client.get_processed_management_numbers.return_value = set()
+        _install_run_mocks(
+            mock_drive_client, mock_gen, mock_reader, mock_creator, mock_merger,
+            pdf_files=[
+                {"id": "id_main", "name": "001-01-0実践事例.pdf"},
+                {"id": "id_att", "name": "001-01-0【添付資料】補足データ.pdf"},
+            ],
+        )
+
+        main_module.run(test_count=0, profile_name="jissen_default")
+
+        # 添付資料 upload の file_name は元ファイル名そのまま
+        att_upload = mock_drive_client.upload_pdf_to_clinic_person.call_args_list[1]
+        self.assertEqual(
+            att_upload.kwargs["file_name"],
+            "001-01-0【添付資料】補足データ.pdf",
+        )
+        # make_output_filename は添付資料には使われない（メイン1件分のみ）
+        self.assertEqual(mock_merger.make_output_filename.call_count, 1)
+
+    @patch("src.main.ensure_fonts")
+    @patch("src.main.pdf_merger")
+    @patch("src.main.pdf_creator")
+    @patch("src.main.pdf_reader")
+    @patch("src.main.comment_generator")
+    @patch("src.main.sheets_client")
+    @patch("src.main.drive_client")
+    @patch("src.discover.load_profile")
+    def test_orphan_attachment_skipped_with_warning(
+        self,
+        mock_load_profile,
+        mock_drive_client,
+        mock_sheets_client,
+        mock_gen,
+        mock_reader,
+        mock_creator,
+        mock_merger,
+        mock_ensure_fonts,
+    ):
+        """対応するメインがこの実行に無い添付資料はスキップされ warning が出る。"""
+        mock_load_profile.return_value = _make_profile()
+        mock_sheets_client.get_processed_management_numbers.return_value = set()
+        # 添付資料の管理番号 002-02-0 に対応するメインは入力に無い
+        _install_run_mocks(
+            mock_drive_client, mock_gen, mock_reader, mock_creator, mock_merger,
+            pdf_files=[
+                {"id": "id_main", "name": "001-01-0実践事例.pdf"},
+                {"id": "id_att", "name": "002-02-0【添付資料】孤児.pdf"},
+            ],
+        )
+
+        with self.assertLogs("jissen_comment", level="WARNING") as log_ctx:
+            main_module.run(test_count=0, profile_name="jissen_default")
+
+        # メイン 1 件だけ append、孤児添付資料は append されない
+        self.assertEqual(mock_sheets_client.append_output_record.call_count, 1)
+        appended = mock_sheets_client.append_output_record.call_args.kwargs
+        self.assertEqual(appended["management_number"], "001-01-0")
+        # 孤児添付資料は download されない（メイン不在判定が先）
+        mock_drive_client.download_pdf.assert_called_once_with("id_main")
+        joined = "\n".join(log_ctx.output)
+        self.assertIn("002-02-0【添付資料】孤児.pdf", joined)
+        self.assertIn("メイン実践事例 PDF がこの実行で処理されていない", joined)
+
+    @patch("src.main.ensure_fonts")
+    @patch("src.main.pdf_merger")
+    @patch("src.main.pdf_creator")
+    @patch("src.main.pdf_reader")
+    @patch("src.main.comment_generator")
+    @patch("src.main.sheets_client")
+    @patch("src.main.drive_client")
+    @patch("src.discover.load_profile")
+    def test_attachment_with_processed_mgmt_number_skipped(
+        self,
+        mock_load_profile,
+        mock_drive_client,
+        mock_sheets_client,
+        mock_gen,
+        mock_reader,
+        mock_creator,
+        mock_merger,
+        mock_ensure_fonts,
+    ):
+        """前回実行で処理済みの管理番号を持つ添付資料はスキップされる。
+
+        重複判定セットは実行開始時のスナップショット。同一実行内のメイン処理
+        がこのスナップショットを変えないことも確認する。
+        """
+        mock_load_profile.return_value = _make_profile()
+        # 001-01-0 は前回処理済み（添付資料も前回コピー済みと見なす）
+        mock_sheets_client.get_processed_management_numbers.return_value = {
+            "001-01-0",
+        }
+        _install_run_mocks(
+            mock_drive_client, mock_gen, mock_reader, mock_creator, mock_merger,
+            pdf_files=[
+                {"id": "id_main", "name": "001-01-0実践事例.pdf"},
+                {"id": "id_att", "name": "001-01-0【添付資料】補足.pdf"},
+            ],
+        )
+
+        main_module.run(test_count=0, profile_name="jissen_default")
+
+        # メインも添付資料も処理済みスキップ → append / download なし
+        mock_sheets_client.append_output_record.assert_not_called()
+        mock_drive_client.download_pdf.assert_not_called()
+
+    @patch("src.main.ensure_fonts")
+    @patch("src.main.pdf_merger")
+    @patch("src.main.pdf_creator")
+    @patch("src.main.pdf_reader")
+    @patch("src.main.comment_generator")
+    @patch("src.main.sheets_client")
+    @patch("src.main.drive_client")
+    @patch("src.discover.load_profile")
+    def test_test_count_does_not_apply_to_attachments(
+        self,
+        mock_load_profile,
+        mock_drive_client,
+        mock_sheets_client,
+        mock_gen,
+        mock_reader,
+        mock_creator,
+        mock_merger,
+        mock_ensure_fonts,
+    ):
+        """``test_count`` はメイン PDF にのみ適用される。添付資料は対応する
+        メインがこの実行で処理されていれば test_count に関わらずコピーされる。"""
+        mock_load_profile.return_value = _make_profile()
+        mock_sheets_client.get_processed_management_numbers.return_value = set()
+        _install_run_mocks(
+            mock_drive_client, mock_gen, mock_reader, mock_creator, mock_merger,
+            pdf_files=[
+                {"id": "id_m1", "name": "001-01-1実践事例.pdf"},
+                {"id": "id_m2", "name": "001-01-2実践事例.pdf"},
+                {"id": "id_a1", "name": "001-01-1【添付資料】補足.pdf"},
+            ],
+        )
+
+        # test_count=1 → メインは 001-01-1 のみ処理。添付資料 001-01-1 は
+        # 対応メインが処理されたのでコピーされる。
+        main_module.run(test_count=1, profile_name="jissen_default")
+
+        # append は 2 回（メイン 001-01-1 + 添付資料 001-01-1）
+        self.assertEqual(mock_sheets_client.append_output_record.call_count, 2)
+        mgmt_nums = [
+            c.kwargs["management_number"]
+            for c in mock_sheets_client.append_output_record.call_args_list
+        ]
+        self.assertEqual(mgmt_nums, ["001-01-1", "001-01-1"])
+
+
 class TestArgparseTargetFolder(unittest.TestCase):
     """``--target-folder`` 引数のパースと ``--profile`` との排他制御。"""
 
