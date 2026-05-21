@@ -475,18 +475,20 @@ class TestManagementNumberFromFilename(unittest.TestCase):
     @patch("src.main.comment_generator")
     @patch("src.main.sheets_client")
     @patch("src.main.drive_client")
-    def test_unextractable_filename_records_empty_and_warns(
+    def test_unextractable_filename_is_skipped_and_warns(
         self, mock_drive, mock_sheets, mock_gen, mock_reader,
         mock_creator, mock_merger, mock_fonts,
     ):
-        """先頭が NNN-NN-N でない PDF は管理番号が空文字列・warning にファイル名。
+        """先頭が NNN-NN-N でない PDF はスキップされ、warning にファイル名が出る。
 
-        抽出不能でもスキップせず処理を続行する（Q2=A 仕様）。
+        管理番号を持たない PDF は重複検知が原理的に不可能なため、再実行のたび
+        サイレントに再処理せずスキップして可視化する（増分処理 / Q1=B 仕様）。
         """
         mock_drive.list_pdfs.return_value = [
             {"id": "id_a", "name": "012-03-4正常な事例.pdf"},
             {"id": "id_b", "name": "管理番号のないファイル.pdf"},
         ]
+        mock_sheets.get_processed_management_numbers.return_value = set()
         mock_drive.download_pdf.return_value = b"%PDF-1.4 fake"
         mock_drive.upload_pdf_to_clinic_person.return_value = {
             "webViewLink": "https://drive.google.com/fake",
@@ -502,8 +504,11 @@ class TestManagementNumberFromFilename(unittest.TestCase):
             c.kwargs["management_number"]
             for c in mock_sheets.append_output_record.call_args_list
         ]
-        # 2 件とも処理され（スキップしない）、抽出不能分は空文字列
-        self.assertEqual(mgmt_nums, ["012-03-4", ""])
+        # 管理番号ありの 1 件だけ処理され、管理番号なしはスキップ
+        self.assertEqual(mgmt_nums, ["012-03-4"])
+        # スキップされた PDF は download すらされない（コスト削減）
+        download_ids = [c.args[0] for c in mock_drive.download_pdf.call_args_list]
+        self.assertEqual(download_ids, ["id_a"])
         # warning に抽出不能ファイル名が含まれる
         self.assertIn("管理番号のないファイル.pdf", "\n".join(log_ctx.output))
 

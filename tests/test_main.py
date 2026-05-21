@@ -188,7 +188,7 @@ class TestRunUsesProfile(unittest.TestCase):
     @patch("src.main.sheets_client")
     @patch("src.main.drive_client")
     @patch("src.discover.load_profile")
-    def test_unextractable_filename_yields_empty_with_warning(
+    def test_unextractable_filename_is_skipped_with_warning(
         self,
         mock_load_profile,
         mock_drive_client,
@@ -199,8 +199,13 @@ class TestRunUsesProfile(unittest.TestCase):
         mock_merger,
         mock_ensure_fonts,
     ):
-        """先頭が NNN-NN-N でないファイルは管理番号が空文字列になり、warning が出る。"""
+        """先頭が NNN-NN-N でないファイルはスキップされ、warning が出る（増分処理）。
+
+        管理番号を持たない PDF は重複検知が原理的に不可能なため、毎回再処理
+        せずスキップして可視化する（Q1=B / fail-loud）。
+        """
         mock_load_profile.return_value = _make_profile()
+        mock_sheets_client.get_processed_management_numbers.return_value = set()
         _install_run_mocks(
             mock_drive_client, mock_gen, mock_reader, mock_creator, mock_merger,
             pdf_files=[{"id": "id_1", "name": "管理番号なし.pdf"}],
@@ -209,11 +214,160 @@ class TestRunUsesProfile(unittest.TestCase):
         with self.assertLogs("jissen_comment", level="WARNING") as log_ctx:
             main_module.run(test_count=0, profile_name="jissen_default")
 
-        call_kwargs = mock_sheets_client.append_output_record.call_args.kwargs
-        self.assertEqual(call_kwargs["management_number"], "")
+        # スキップされるため append / download / Claude 呼び出しは一切なし
+        mock_sheets_client.append_output_record.assert_not_called()
+        mock_drive_client.download_pdf.assert_not_called()
+        mock_gen.generate_comment_with_metadata.assert_not_called()
         # warning にファイル名が含まれる（サイレントにしない）
         joined = "\n".join(log_ctx.output)
         self.assertIn("管理番号なし.pdf", joined)
+
+
+class TestRunIncrementalDedup(unittest.TestCase):
+    """``run()`` の増分処理（重複検知）。
+
+    管理番号をキーに、出力一覧シートに既存の PDF は download / Claude API
+    呼び出しの前に無条件でスキップする（bypass なし）。再処理が必要な場合は
+    出力一覧シートの該当行を手動削除すれば、その管理番号は次回実行で再処理
+    される。
+    """
+
+    @patch("src.main.ensure_fonts")
+    @patch("src.main.pdf_merger")
+    @patch("src.main.pdf_creator")
+    @patch("src.main.pdf_reader")
+    @patch("src.main.comment_generator")
+    @patch("src.main.sheets_client")
+    @patch("src.main.drive_client")
+    @patch("src.discover.load_profile")
+    def test_processed_pdf_is_skipped_before_download(
+        self,
+        mock_load_profile,
+        mock_drive_client,
+        mock_sheets_client,
+        mock_gen,
+        mock_reader,
+        mock_creator,
+        mock_merger,
+        mock_ensure_fonts,
+    ):
+        """処理済み管理番号の PDF はスキップされ、download / Claude を呼ばない。"""
+        mock_load_profile.return_value = _make_profile()
+        # 001-01-0 は処理済み、001-01-1 は新規
+        mock_sheets_client.get_processed_management_numbers.return_value = {
+            "001-01-0",
+        }
+        _install_run_mocks(
+            mock_drive_client, mock_gen, mock_reader, mock_creator, mock_merger,
+            pdf_files=[
+                {"id": "id_1", "name": "001-01-0既存.pdf"},
+                {"id": "id_2", "name": "001-01-1新規.pdf"},
+            ],
+        )
+
+        main_module.run(test_count=0, profile_name="jissen_default")
+
+        # 新規 1 件だけ処理される
+        self.assertEqual(mock_sheets_client.append_output_record.call_count, 1)
+        appended = mock_sheets_client.append_output_record.call_args.kwargs
+        self.assertEqual(appended["management_number"], "001-01-1")
+        # download は新規 1 件分のみ（処理済みは download すらしない＝コスト削減）
+        self.assertEqual(mock_drive_client.download_pdf.call_count, 1)
+        mock_drive_client.download_pdf.assert_called_once_with("id_2")
+        # 重複判定は出力シート単位
+        mock_sheets_client.get_processed_management_numbers.assert_called_once_with(
+            sheet_name="出力一覧",
+        )
+
+    @patch("src.main.ensure_fonts")
+    @patch("src.main.pdf_merger")
+    @patch("src.main.pdf_creator")
+    @patch("src.main.pdf_reader")
+    @patch("src.main.comment_generator")
+    @patch("src.main.sheets_client")
+    @patch("src.main.drive_client")
+    @patch("src.discover.load_profile")
+    def test_all_processed_pdfs_are_skipped_unconditionally(
+        self,
+        mock_load_profile,
+        mock_drive_client,
+        mock_sheets_client,
+        mock_gen,
+        mock_reader,
+        mock_creator,
+        mock_merger,
+        mock_ensure_fonts,
+    ):
+        """全 PDF が処理済みなら無条件でスキップされ、download / Claude を呼ばない。
+
+        重複スキップに bypass はない。再処理は出力シートの行を手動削除して行う。
+        """
+        mock_load_profile.return_value = _make_profile()
+        mock_sheets_client.get_processed_management_numbers.return_value = {
+            "001-01-0",
+            "001-01-1",
+        }
+        _install_run_mocks(
+            mock_drive_client, mock_gen, mock_reader, mock_creator, mock_merger,
+            pdf_files=[
+                {"id": "id_1", "name": "001-01-0既存.pdf"},
+                {"id": "id_2", "name": "001-01-1既存.pdf"},
+            ],
+        )
+
+        main_module.run(test_count=0, profile_name="jissen_default")
+
+        # 処理済みは無条件スキップ → append / download / Claude は一切なし
+        mock_sheets_client.append_output_record.assert_not_called()
+        mock_drive_client.download_pdf.assert_not_called()
+        mock_gen.generate_comment_with_metadata.assert_not_called()
+
+    @patch("src.main.ensure_fonts")
+    @patch("src.main.pdf_merger")
+    @patch("src.main.pdf_creator")
+    @patch("src.main.pdf_reader")
+    @patch("src.main.comment_generator")
+    @patch("src.main.sheets_client")
+    @patch("src.main.drive_client")
+    @patch("src.discover.load_profile")
+    def test_test_count_applies_to_new_targets_only(
+        self,
+        mock_load_profile,
+        mock_drive_client,
+        mock_sheets_client,
+        mock_gen,
+        mock_reader,
+        mock_creator,
+        mock_merger,
+        mock_ensure_fonts,
+    ):
+        """``test_count`` は重複・管理番号なしを除外した新規 PDF に適用される。"""
+        mock_load_profile.return_value = _make_profile()
+        # 001-01-0 は処理済み。新規候補は 001-01-1 / 001-01-2 / 001-01-3。
+        mock_sheets_client.get_processed_management_numbers.return_value = {
+            "001-01-0",
+        }
+        _install_run_mocks(
+            mock_drive_client, mock_gen, mock_reader, mock_creator, mock_merger,
+            pdf_files=[
+                {"id": "id_0", "name": "001-01-0既存.pdf"},
+                {"id": "id_x", "name": "管理番号なし.pdf"},
+                {"id": "id_1", "name": "001-01-1新規.pdf"},
+                {"id": "id_2", "name": "001-01-2新規.pdf"},
+                {"id": "id_3", "name": "001-01-3新規.pdf"},
+            ],
+        )
+
+        with self.assertLogs("jissen_comment", level="WARNING"):
+            main_module.run(test_count=2, profile_name="jissen_default")
+
+        # test_count=2 → 新規候補（3 件）の先頭 2 件のみ処理
+        self.assertEqual(mock_sheets_client.append_output_record.call_count, 2)
+        mgmt_nums = [
+            c.kwargs["management_number"]
+            for c in mock_sheets_client.append_output_record.call_args_list
+        ]
+        self.assertEqual(mgmt_nums, ["001-01-1", "001-01-2"])
 
 
 class TestArgparseTargetFolder(unittest.TestCase):
