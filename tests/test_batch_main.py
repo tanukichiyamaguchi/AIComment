@@ -5,11 +5,13 @@
 
 from __future__ import annotations
 
+import json
 import sys
 import unittest
 from unittest.mock import patch
 
 from src import batch_main
+from src.config import LOGS_DIR
 from src.discover import DiscoveredContext
 from src.profile import ProfileConfig
 
@@ -487,6 +489,225 @@ class TestStep4WithRunConfig(unittest.TestCase):
         kwargs = mock_sheets.append_output_record.call_args.kwargs
         self.assertEqual(kwargs["sheet_name"], "X_sheet")
         self.assertEqual(kwargs["management_number"], "200-30-4")
+
+
+class TestStep1AttachmentClassification(unittest.TestCase):
+    """``step1_prepare`` の添付資料分類。
+
+    ファイル名に「【添付資料】」を含む PDF は Claude API に投げず、
+    ``items``（バッチ投入対象）には含めない。添付資料の情報は
+    ``batch_attachments.json`` に別途保存する。
+    """
+
+    def setUp(self):
+        # batch_prep.json / batch_attachments.json の汚染を避けるためバックアップ
+        self._prep_file = LOGS_DIR / "batch_prep.json"
+        self._att_file = LOGS_DIR / "batch_attachments.json"
+        self._prep_backup = (
+            self._prep_file.read_text() if self._prep_file.exists() else None
+        )
+        self._att_backup = (
+            self._att_file.read_text() if self._att_file.exists() else None
+        )
+
+    def tearDown(self):
+        for path, backup in (
+            (self._prep_file, self._prep_backup),
+            (self._att_file, self._att_backup),
+        ):
+            if backup is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.write_text(backup)
+
+    @patch("src.batch_main.pdf_reader")
+    @patch("src.batch_main.sheets_client")
+    @patch("src.batch_main.drive_client")
+    def test_attachment_excluded_from_batch_items(
+        self, mock_drive, mock_sheets, mock_reader,
+    ):
+        """添付資料は items に含まれず（Batch API に投げられず）、
+        batch_attachments.json に保存される。"""
+        mock_drive.list_pdfs.return_value = [
+            {"id": "id_main", "name": "001-01-0実践事例.pdf"},
+            {"id": "id_att", "name": "001-01-0【添付資料】補足.pdf"},
+        ]
+        mock_sheets.get_processed_management_numbers.return_value = set()
+        _install_step1_mocks(mock_drive, mock_reader)
+        profile = _make_profile()
+
+        items = batch_main.step1_prepare(profile, test_count=0)
+
+        # メイン 1 件だけが items に入る（添付資料は除外）
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["pdf_file_name"], "001-01-0実践事例.pdf")
+        # 添付資料は download されない（Claude 投入経路に乗らない）
+        mock_drive.download_pdf.assert_called_once_with("id_main")
+        # batch_attachments.json に添付資料情報が保存される
+        records = json.loads(self._att_file.read_text())
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["file_id"], "id_att")
+        self.assertEqual(records[0]["file_name"], "001-01-0【添付資料】補足.pdf")
+        self.assertEqual(records[0]["management_number"], "001-01-0")
+
+    @patch("src.batch_main.pdf_reader")
+    @patch("src.batch_main.sheets_client")
+    @patch("src.batch_main.drive_client")
+    def test_processed_attachment_not_saved(
+        self, mock_drive, mock_sheets, mock_reader,
+    ):
+        """処理済み管理番号の添付資料は batch_attachments.json に保存されない。"""
+        mock_drive.list_pdfs.return_value = [
+            {"id": "id_att", "name": "001-01-0【添付資料】補足.pdf"},
+        ]
+        mock_sheets.get_processed_management_numbers.return_value = {"001-01-0"}
+        _install_step1_mocks(mock_drive, mock_reader)
+        profile = _make_profile()
+
+        batch_main.step1_prepare(profile, test_count=0)
+
+        records = json.loads(self._att_file.read_text())
+        self.assertEqual(records, [])
+
+    @patch("src.batch_main.pdf_reader")
+    @patch("src.batch_main.sheets_client")
+    @patch("src.batch_main.drive_client")
+    def test_attachment_without_mgmt_number_not_saved(
+        self, mock_drive, mock_sheets, mock_reader,
+    ):
+        """管理番号なしの添付資料は保存されず warning が出る。"""
+        mock_drive.list_pdfs.return_value = [
+            {"id": "id_att", "name": "【添付資料】管理番号なし.pdf"},
+        ]
+        mock_sheets.get_processed_management_numbers.return_value = set()
+        _install_step1_mocks(mock_drive, mock_reader)
+        profile = _make_profile()
+
+        with self.assertLogs("jissen_comment", level="WARNING") as log_ctx:
+            batch_main.step1_prepare(profile, test_count=0)
+
+        records = json.loads(self._att_file.read_text())
+        self.assertEqual(records, [])
+        self.assertIn("【添付資料】管理番号なし.pdf", "\n".join(log_ctx.output))
+
+
+class TestStep4AttachmentPassthrough(unittest.TestCase):
+    """``step4_generate_pdfs`` の添付資料パススルー。
+
+    メイン結果処理ループで case_map を構築し、batch_attachments.json を
+    読んで添付資料をメインと同じフォルダへコピーする。
+    """
+
+    def setUp(self):
+        self._att_file = LOGS_DIR / "batch_attachments.json"
+        self._att_backup = (
+            self._att_file.read_text() if self._att_file.exists() else None
+        )
+        LOGS_DIR.mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self):
+        if self._att_backup is None:
+            self._att_file.unlink(missing_ok=True)
+        else:
+            self._att_file.write_text(self._att_backup)
+
+    @patch("src.batch_main.pdf_merger")
+    @patch("src.batch_main.pdf_creator")
+    @patch("src.batch_main.drive_client")
+    @patch("src.batch_main.sheets_client")
+    @patch("src.batch_main.ensure_fonts")
+    def test_step4_copies_attachment_to_main_folder(
+        self, mock_fonts, mock_sheets, mock_drive, mock_creator, mock_merger,
+    ):
+        """添付資料は同じ管理番号のメインと同じ医院/個人フォルダにコピーされる。"""
+        _install_step4_mocks(mock_drive, mock_merger)
+        self._att_file.write_text(json.dumps([
+            {
+                "file_id": "id_att",
+                "file_name": "111-22-3【添付資料】補足.pdf",
+                "management_number": "111-22-3",
+            }
+        ]))
+        profile = _make_profile()
+
+        batch_main.step4_generate_pdfs(
+            profile,
+            results=_make_batch_results(1),
+            items=_make_batch_items(["111-22-3実践事例.pdf"]),
+        )
+
+        # upload は 2 回（メイン + 添付資料）。添付資料は同じ医院/個人フォルダへ、
+        # 元ファイル名のまま。
+        self.assertEqual(mock_drive.upload_pdf_to_clinic_person.call_count, 2)
+        att_upload = mock_drive.upload_pdf_to_clinic_person.call_args_list[1]
+        self.assertEqual(att_upload.kwargs["clinic_name"], "山田歯科")
+        self.assertEqual(att_upload.kwargs["person_name"], "田中太郎")
+        self.assertEqual(
+            att_upload.kwargs["file_name"], "111-22-3【添付資料】補足.pdf"
+        )
+        # シートに「【添付資料】<元名>」で記録
+        att_row = mock_sheets.append_output_record.call_args_list[1]
+        self.assertEqual(
+            att_row.kwargs["sample_name"],
+            "【添付資料】111-22-3【添付資料】補足.pdf",
+        )
+        self.assertEqual(att_row.kwargs["management_number"], "111-22-3")
+        # コメントページ生成・マージは添付資料には行われない（メイン1件分のみ）
+        self.assertEqual(mock_creator.create_comment_page.call_count, 1)
+        self.assertEqual(mock_merger.merge_pdfs.call_count, 1)
+
+    @patch("src.batch_main.pdf_merger")
+    @patch("src.batch_main.pdf_creator")
+    @patch("src.batch_main.drive_client")
+    @patch("src.batch_main.sheets_client")
+    @patch("src.batch_main.ensure_fonts")
+    def test_step4_orphan_attachment_skipped_with_warning(
+        self, mock_fonts, mock_sheets, mock_drive, mock_creator, mock_merger,
+    ):
+        """対応するメインが results に無い添付資料はスキップされ warning が出る。"""
+        _install_step4_mocks(mock_drive, mock_merger)
+        self._att_file.write_text(json.dumps([
+            {
+                "file_id": "id_orphan",
+                "file_name": "999-99-9【添付資料】孤児.pdf",
+                "management_number": "999-99-9",
+            }
+        ]))
+        profile = _make_profile()
+
+        with self.assertLogs("jissen_comment", level="WARNING") as log_ctx:
+            batch_main.step4_generate_pdfs(
+                profile,
+                results=_make_batch_results(1),
+                items=_make_batch_items(["111-22-3実践事例.pdf"]),
+            )
+
+        # メイン 1 件のみ upload。孤児添付資料はコピーされない。
+        self.assertEqual(mock_drive.upload_pdf_to_clinic_person.call_count, 1)
+        self.assertIn("999-99-9【添付資料】孤児.pdf", "\n".join(log_ctx.output))
+
+    @patch("src.batch_main.pdf_merger")
+    @patch("src.batch_main.pdf_creator")
+    @patch("src.batch_main.drive_client")
+    @patch("src.batch_main.sheets_client")
+    @patch("src.batch_main.ensure_fonts")
+    def test_step4_no_attachments_file_does_nothing(
+        self, mock_fonts, mock_sheets, mock_drive, mock_creator, mock_merger,
+    ):
+        """batch_attachments.json が存在しない場合、添付資料処理は何もしない。"""
+        _install_step4_mocks(mock_drive, mock_merger)
+        self._att_file.unlink(missing_ok=True)
+        profile = _make_profile()
+
+        batch_main.step4_generate_pdfs(
+            profile,
+            results=_make_batch_results(1),
+            items=_make_batch_items(["111-22-3実践事例.pdf"]),
+        )
+
+        # メイン 1 件のみ。添付資料経路は何もしない。
+        self.assertEqual(mock_drive.upload_pdf_to_clinic_person.call_count, 1)
+        self.assertEqual(mock_sheets.append_output_record.call_count, 1)
 
 
 if __name__ == "__main__":
