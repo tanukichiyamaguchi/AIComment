@@ -302,6 +302,77 @@ class TestSharedDriveSupport(unittest.TestCase):
         self.assertTrue(get_media_kwargs.get("supportsAllDrives"))
 
 
+class TestGoogleApiRetry(unittest.TestCase):
+    """Drive API 呼び出しが ``num_retries`` 付きで実行されることを検証する。
+
+    Drive API も 503 / 429 などの一過性エラーを返すため、
+    ``execute(num_retries=N)`` / ``next_chunk(num_retries=N)`` で
+    指数バックオフ・リトライさせる（P-017）。
+    """
+
+    @patch("src.drive_client.get_drive_service")
+    def test_list_pdfs_passes_num_retries(self, mock_get_service):
+        """``list_pdfs`` の files.list.execute に num_retries が渡る。"""
+        service = MagicMock()
+        mock_get_service.return_value = service
+        service.files.return_value.list.return_value.execute.return_value = {
+            "files": []
+        }
+
+        drive_client.list_pdfs(folder_id="folder_id")
+
+        list_execute = service.files.return_value.list.return_value.execute
+        self.assertEqual(
+            list_execute.call_args.kwargs.get("num_retries"),
+            drive_client.GOOGLE_API_NUM_RETRIES,
+        )
+
+    def test_find_or_create_folder_list_passes_num_retries(self):
+        """``find_or_create_folder`` の files.list.execute に num_retries が渡る。"""
+        service = MagicMock()
+        service.files.return_value.list.return_value.execute.return_value = {
+            "files": [{"id": "id", "name": "X"}]
+        }
+
+        drive_client.find_or_create_folder("X", "parent_id", service=service)
+
+        list_execute = service.files.return_value.list.return_value.execute
+        self.assertEqual(
+            list_execute.call_args.kwargs.get("num_retries"),
+            drive_client.GOOGLE_API_NUM_RETRIES,
+        )
+
+    def test_find_or_create_folder_create_passes_num_retries(self):
+        """``find_or_create_folder`` の files.create.execute に num_retries が渡る。"""
+        service = MagicMock()
+        service.files.return_value.list.return_value.execute.return_value = {
+            "files": []
+        }
+        service.files.return_value.create.return_value.execute.return_value = {
+            "id": "new_id"
+        }
+
+        drive_client.find_or_create_folder("Y", "parent_id", service=service)
+
+        create_execute = service.files.return_value.create.return_value.execute
+        self.assertEqual(create_execute.call_args.kwargs.get("num_retries"), 5)
+
+    @patch("src.drive_client.get_drive_service")
+    def test_download_pdf_passes_num_retries_to_next_chunk(self, mock_get_service):
+        """``download_pdf`` の next_chunk に num_retries が渡る。"""
+        service = MagicMock()
+        mock_get_service.return_value = service
+        chunk_mock = MagicMock()
+        chunk_mock.next_chunk.return_value = (None, True)
+        with patch("src.drive_client.MediaIoBaseDownload", return_value=chunk_mock):
+            drive_client.download_pdf("file_xxx")
+
+        self.assertEqual(
+            chunk_mock.next_chunk.call_args.kwargs.get("num_retries"),
+            drive_client.GOOGLE_API_NUM_RETRIES,
+        )
+
+
 class TestCredentialPriority(unittest.TestCase):
     """認証情報の選択優先順位を検証する。
 

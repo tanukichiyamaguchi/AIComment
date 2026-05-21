@@ -85,6 +85,21 @@ class TestListInputSubfolders(unittest.TestCase):
         self.assertTrue(list_kwargs.get("supportsAllDrives"))
         self.assertTrue(list_kwargs.get("includeItemsFromAllDrives"))
 
+    def test_passes_num_retries_for_transient_errors(self):
+        """一過性エラー対策: files.list.execute に num_retries が渡る（P-017）。"""
+        service = MagicMock()
+        service.files.return_value.list.return_value.execute.return_value = {
+            "files": []
+        }
+
+        discover.list_input_subfolders("root_id", service=service)
+
+        list_execute = service.files.return_value.list.return_value.execute
+        self.assertEqual(
+            list_execute.call_args.kwargs.get("num_retries"),
+            discover.GOOGLE_API_NUM_RETRIES,
+        )
+
     def test_query_filters_to_folder_mime_type_only(self):
         service = MagicMock()
         service.files.return_value.list.return_value.execute.return_value = {
