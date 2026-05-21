@@ -158,6 +158,9 @@ class TestAppendOutputRecord(unittest.TestCase):
         self.assertEqual(appended_row[3], "title.pdf")
         self.assertEqual(appended_row[4], "https://drive.example/view")
         self.assertEqual(appended_row[5], "2026-05-17 10:00:00")
+        # RAW で書き込むこと。USER_ENTERED だと処理日時が日付シリアル値に
+        # 変換され、生の数値（46163.23... 等）として表示されてしまう。
+        self.assertEqual(append_call.kwargs["valueInputOption"], "RAW")
 
 
 if __name__ == "__main__":

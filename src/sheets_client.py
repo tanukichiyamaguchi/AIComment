@@ -246,7 +246,10 @@ def append_output_record(
     service.spreadsheets().values().append(
         spreadsheetId=spreadsheet_id,
         range=f"{sheet_name}!A:F",
-        valueInputOption="USER_ENTERED",
+        # RAW: 各値を入力された文字列のまま格納する。USER_ENTERED だと
+        # 処理日時 "2026-05-21 14:28:42" が日付シリアル値（46163.23... など）に
+        # 変換され、列の書式次第で生の数値が表示されてしまう。
+        valueInputOption="RAW",
         insertDataOption="INSERT_ROWS",
         body={
             "values": [
