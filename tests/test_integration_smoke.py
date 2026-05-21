@@ -1376,5 +1376,124 @@ class TestProfileModeRegressionAfterDiscoveryAdded(unittest.TestCase):
         mock_drive.list_pdfs.assert_called_once_with(folder_id="input_q2")
 
 
+# ─────────────────────────────────────────────────────────────────────
+# 10. 増分処理（重複検知）の E2E スモークテスト
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestIncrementalDedupE2E(unittest.TestCase):
+    """増分処理（管理番号での重複検知）の結合テスト。
+
+    入力フォルダに PDF を継続追加して再実行する運用を再現する:
+        1 回目は全件処理、2 回目は出力一覧シートに既存の管理番号をスキップし、
+        新規追加分だけを処理する。重複判定は download / Claude API 呼び出しの
+        前に行われ、処理済み PDF にはコストが発生しない。
+    """
+
+    def setUp(self):
+        self._env_patcher = patch.dict(os.environ, _PROFILE_ENV, clear=False)
+        self._env_patcher.start()
+
+    def tearDown(self):
+        self._env_patcher.stop()
+
+    @patch("src.main.ensure_fonts")
+    @patch("src.main.pdf_merger")
+    @patch("src.main.pdf_creator")
+    @patch("src.main.pdf_reader")
+    @patch("src.main.comment_generator")
+    @patch("src.main.sheets_client")
+    @patch("src.main.drive_client")
+    def test_first_run_all_then_second_run_skips_duplicates(
+        self, mock_drive, mock_sheets, mock_gen, mock_reader,
+        mock_creator, mock_merger, mock_fonts,
+    ):
+        """1 回目: 全 3 件処理。2 回目: 既存 3 件 + 新規 2 件のうち新規だけ処理。"""
+        _install_main_mocks(
+            mock_drive, mock_sheets, mock_gen, mock_reader,
+            mock_creator, mock_merger, mock_fonts,
+        )
+
+        # ── 1 回目: 出力一覧シートは空 → 3 件すべて新規 ──
+        mock_drive.list_pdfs.return_value = _make_pdf_files(3)
+        mock_sheets.get_processed_management_numbers.return_value = set()
+
+        main.run(test_count=0, profile_name="jissen_default")
+
+        # 3 件すべて処理（download / シート追記）
+        self.assertEqual(mock_sheets.append_output_record.call_count, 3)
+        self.assertEqual(mock_drive.download_pdf.call_count, 3)
+        first_run_mgmt = [
+            c.kwargs["management_number"]
+            for c in mock_sheets.append_output_record.call_args_list
+        ]
+        self.assertEqual(
+            first_run_mgmt, [_expected_mgmt_number(i) for i in (1, 2, 3)],
+        )
+
+        # ── 2 回目: PDF が 2 件追加され計 5 件。最初の 3 件は処理済み ──
+        mock_drive.reset_mock()
+        mock_sheets.reset_mock()
+        mock_gen.reset_mock()
+        _install_main_mocks(
+            mock_drive, mock_sheets, mock_gen, mock_reader,
+            mock_creator, mock_merger, mock_fonts,
+        )
+        mock_drive.list_pdfs.return_value = _make_pdf_files(5)
+        # 1 回目で記録された 3 件が処理済み集合になっている
+        mock_sheets.get_processed_management_numbers.return_value = {
+            _expected_mgmt_number(i) for i in (1, 2, 3)
+        }
+
+        main.run(test_count=0, profile_name="jissen_default")
+
+        # 新規 2 件（4, 5 件目）だけ処理される
+        self.assertEqual(mock_sheets.append_output_record.call_count, 2)
+        second_run_mgmt = [
+            c.kwargs["management_number"]
+            for c in mock_sheets.append_output_record.call_args_list
+        ]
+        self.assertEqual(
+            second_run_mgmt, [_expected_mgmt_number(i) for i in (4, 5)],
+        )
+        # 処理済み 3 件は download / Claude API を呼ばない（コスト削減）
+        self.assertEqual(mock_drive.download_pdf.call_count, 2)
+        self.assertEqual(mock_gen.generate_comment_with_metadata.call_count, 2)
+
+    @patch("src.batch_main.ensure_fonts")
+    @patch("src.batch_main.pdf_merger")
+    @patch("src.batch_main.pdf_creator")
+    @patch("src.batch_main.pdf_reader")
+    @patch("src.batch_main.comment_generator")
+    @patch("src.batch_main.sheets_client")
+    @patch("src.batch_main.drive_client")
+    def test_batch_step1_excludes_processed_from_batch(
+        self, mock_drive, mock_sheets, mock_gen, mock_reader,
+        mock_creator, mock_merger, mock_fonts,
+    ):
+        """Batch モード: 処理済み PDF は Step1 で除外され Batch API に投げない。"""
+        mock_drive.list_pdfs.return_value = _make_pdf_files(5)
+        mock_drive.download_pdf.return_value = b"%PDF-1.4 fake"
+        mock_reader.extract_text.return_value = "PDFテキスト"
+        # 最初の 3 件は処理済み
+        mock_sheets.get_processed_management_numbers.return_value = {
+            _expected_mgmt_number(i) for i in (1, 2, 3)
+        }
+        from src.profile import load_profile
+        profile = load_profile("jissen_default")
+
+        items = batch_main.step1_prepare(profile, test_count=0)
+
+        # 新規 2 件だけが Batch 投入対象
+        self.assertEqual(len(items), 2)
+        names = [it["pdf_file_name"] for it in items]
+        self.assertEqual(
+            names,
+            [f"{i:03d}-00-0pdf_{i:04d}.pdf" for i in (4, 5)],
+        )
+        # 処理済み 3 件は download すらされない
+        self.assertEqual(mock_drive.download_pdf.call_count, 2)
+
+
 if __name__ == "__main__":
     unittest.main()
