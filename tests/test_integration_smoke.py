@@ -1009,5 +1009,295 @@ class TestLegacyBehaviorRegression(unittest.TestCase):
         self.assertEqual(clinics[1], "医療法人かがやき")
 
 
+# ─────────────────────────────────────────────────────────────────────
+# 8. フォルダ自動検出モード E2E（target_folder）
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestTargetFolderE2E(unittest.TestCase):
+    """``--target-folder`` 指定時の E2E スモークテスト。
+
+    discover.resolve_context を mock しつつ、main.run() / batch_main.run()
+    の全パイプラインが「自動検出した設定」を正しく伝搬することを検証する。
+    """
+
+    def setUp(self):
+        # target_folder モードは config の 3 つの ROOT/ID を必要とする
+        self._env_patcher = patch.dict(
+            os.environ,
+            {
+                **_PROFILE_ENV,
+                "DRIVE_INPUT_ROOT": "discover_input_root",
+                "DRIVE_OUTPUT_ROOT": "discover_output_root",
+            },
+            clear=False,
+        )
+        self._env_patcher.start()
+        # config モジュールはモジュールロード時に env を読むため patch で上書き
+        self._cfg_patches = [
+            patch("src.config.DRIVE_INPUT_ROOT", "discover_input_root"),
+            patch("src.config.DRIVE_OUTPUT_ROOT", "discover_output_root"),
+            patch("src.config.SPREADSHEET_ID", "test_sheet_id"),
+        ]
+        for p in self._cfg_patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self._cfg_patches:
+            p.stop()
+        self._env_patcher.stop()
+
+    def _install_discovery_mocks(self, mock_resolve_context):
+        """discover.resolve_context をモック化し、固定の DiscoveredContext を返す。"""
+        from src.discover import DiscoveredContext
+        mock_resolve_context.return_value = DiscoveredContext(
+            target_folder_name="2024_Q1_実践事例",
+            input_folder_id="auto_input_id",
+            output_folder_id="auto_output_id",
+            output_sheet_name="2024_Q1_実践事例",
+            management_number_prefix="2024_Q1_実践事例-",
+        )
+
+    @patch("src.discover.resolve_context")
+    @patch("src.main.ensure_fonts")
+    @patch("src.main.pdf_merger")
+    @patch("src.main.pdf_creator")
+    @patch("src.main.pdf_reader")
+    @patch("src.main.comment_generator")
+    @patch("src.main.sheets_client")
+    @patch("src.main.drive_client")
+    def test_main_e2e_target_folder_smoke(
+        self, mock_drive, mock_sheets, mock_gen, mock_reader,
+        mock_creator, mock_merger, mock_fonts, mock_resolve_context,
+    ):
+        """target_folder 指定で 5 件処理 → シートに 5 行追記、自動派生 prefix。"""
+        _install_main_mocks(
+            mock_drive, mock_sheets, mock_gen, mock_reader,
+            mock_creator, mock_merger, mock_fonts,
+        )
+        self._install_discovery_mocks(mock_resolve_context)
+
+        main.run(test_count=0, target_folder="2024_Q1_実践事例")
+
+        # 5 件処理 → シート 5 件
+        self.assertEqual(mock_sheets.append_output_record.call_count, 5)
+        # 自動検出した input_folder_id が drive_client に渡る
+        mock_drive.list_pdfs.assert_called_once_with(folder_id="auto_input_id")
+        # 自動検出した output_folder_id が upload に渡る
+        upload_kwargs = mock_drive.upload_pdf_to_clinic_person.call_args_list
+        upload_folders = {c.kwargs["output_root_folder_id"] for c in upload_kwargs}
+        self.assertEqual(upload_folders, {"auto_output_id"})
+        # 自動派生した prefix で管理番号が発番される
+        first = mock_sheets.append_output_record.call_args_list[0]
+        self.assertEqual(
+            first.kwargs["management_number"], "2024_Q1_実践事例-000001",
+        )
+        # シート名は自動派生（フォルダ名そのまま）
+        self.assertEqual(first.kwargs["sheet_name"], "2024_Q1_実践事例")
+
+    @patch("src.discover.resolve_context")
+    @patch("src.batch_main.ensure_fonts")
+    @patch("src.batch_main.pdf_merger")
+    @patch("src.batch_main.pdf_creator")
+    @patch("src.batch_main.pdf_reader")
+    @patch("src.batch_main.comment_generator")
+    @patch("src.batch_main.sheets_client")
+    @patch("src.batch_main.drive_client")
+    def test_batch_e2e_target_folder_smoke(
+        self, mock_drive, mock_sheets, mock_gen, mock_reader,
+        mock_creator, mock_merger, mock_fonts, mock_resolve_context,
+    ):
+        """Batch モード + target_folder の E2E。"""
+        mock_drive.list_pdfs.return_value = _make_pdf_files(3)
+        mock_drive.download_pdf.return_value = b"%PDF-1.4 fake"
+        mock_drive.upload_pdf_to_clinic_person.return_value = {
+            "webViewLink": "https://drive.google.com/fake",
+        }
+        mock_reader.extract_text.return_value = "PDFテキスト"
+        mock_gen.submit_batch.return_value = "batch_test_001"
+        mock_gen.get_batch_status.return_value = {
+            "status": "ended",
+            "request_counts": {
+                "processing": 0, "succeeded": 3,
+                "errored": 0, "canceled": 0, "expired": 0,
+            },
+        }
+        results = {
+            f"item_{i:04d}": _make_metadata(suffix=f"_{i}")
+            for i in range(1, 4)
+        }
+        mock_gen.get_batch_results.return_value = (results, [])
+        mock_merger.make_output_filename.return_value = (
+            "山田歯科＿田中太郎＿事例タイトル.pdf"
+        )
+        mock_sheets.get_max_management_number.return_value = 0
+        self._install_discovery_mocks(mock_resolve_context)
+
+        with patch("src.batch_main.time.sleep"):
+            batch_main.run(
+                batch_mode=True, test_count=0, step="all",
+                target_folder="2024_Q1_実践事例",
+            )
+
+        # 3 件処理 → シート 3 件
+        self.assertEqual(mock_sheets.append_output_record.call_count, 3)
+        mock_drive.list_pdfs.assert_called_once_with(folder_id="auto_input_id")
+        first = mock_sheets.append_output_record.call_args_list[0]
+        self.assertEqual(
+            first.kwargs["management_number"], "2024_Q1_実践事例-000001",
+        )
+        self.assertEqual(first.kwargs["sheet_name"], "2024_Q1_実践事例")
+
+    @patch("src.discover.resolve_context")
+    @patch("src.main.ensure_fonts")
+    @patch("src.main.pdf_merger")
+    @patch("src.main.pdf_creator")
+    @patch("src.main.pdf_reader")
+    @patch("src.main.comment_generator")
+    @patch("src.main.sheets_client")
+    @patch("src.main.drive_client")
+    def test_target_folder_continues_from_existing_max(
+        self, mock_drive, mock_sheets, mock_gen, mock_reader,
+        mock_creator, mock_merger, mock_fonts, mock_resolve_context,
+    ):
+        """target_folder モードでも既存シートの最大値から連番継続。"""
+        _install_main_mocks(
+            mock_drive, mock_sheets, mock_gen, mock_reader,
+            mock_creator, mock_merger, mock_fonts,
+            pdf_count=2, initial_max=42,
+        )
+        self._install_discovery_mocks(mock_resolve_context)
+
+        main.run(test_count=0, target_folder="2024_Q1_実践事例")
+
+        # get_max が prefix 付きで呼ばれている（既存挙動互換）
+        kwargs = mock_sheets.get_max_management_number.call_args.kwargs
+        self.assertEqual(kwargs["prefix"], "2024_Q1_実践事例-")
+        # 既存最大値 42 → 次は 000043 から
+        mgmt_nums = [
+            c.kwargs["management_number"]
+            for c in mock_sheets.append_output_record.call_args_list
+        ]
+        self.assertEqual(
+            mgmt_nums,
+            ["2024_Q1_実践事例-000043", "2024_Q1_実践事例-000044"],
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 9. フォルダ自動検出モード追加に伴う既存 profile モードのリグレッション
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestProfileModeRegressionAfterDiscoveryAdded(unittest.TestCase):
+    """``target_folder`` 引数追加後も ``--profile`` モードが完全に従来通り動く。"""
+
+    def setUp(self):
+        self._env_patcher = patch.dict(os.environ, _PROFILE_ENV, clear=False)
+        self._env_patcher.start()
+
+    def tearDown(self):
+        self._env_patcher.stop()
+
+    @patch("src.discover.resolve_context")
+    @patch("src.main.ensure_fonts")
+    @patch("src.main.pdf_merger")
+    @patch("src.main.pdf_creator")
+    @patch("src.main.pdf_reader")
+    @patch("src.main.comment_generator")
+    @patch("src.main.sheets_client")
+    @patch("src.main.drive_client")
+    def test_profile_mode_does_not_call_discover(
+        self, mock_drive, mock_sheets, mock_gen, mock_reader,
+        mock_creator, mock_merger, mock_fonts, mock_resolve_context,
+    ):
+        """``--profile`` 指定時、``discover.resolve_context`` は一切呼ばれない。"""
+        _install_main_mocks(
+            mock_drive, mock_sheets, mock_gen, mock_reader,
+            mock_creator, mock_merger, mock_fonts, pdf_count=2,
+        )
+
+        main.run(test_count=0, profile_name="jissen_2024_q1")
+
+        mock_resolve_context.assert_not_called()
+        # 既存挙動と同じ管理番号 / シート
+        first = mock_sheets.append_output_record.call_args_list[0]
+        self.assertEqual(first.kwargs["management_number"], "J24Q1-000001")
+        self.assertEqual(first.kwargs["sheet_name"], "実践事例_2024Q1_出力一覧")
+
+    @patch("src.discover.resolve_context")
+    @patch("src.main.ensure_fonts")
+    @patch("src.main.pdf_merger")
+    @patch("src.main.pdf_creator")
+    @patch("src.main.pdf_reader")
+    @patch("src.main.comment_generator")
+    @patch("src.main.sheets_client")
+    @patch("src.main.drive_client")
+    def test_default_profile_unchanged_after_discovery_added(
+        self, mock_drive, mock_sheets, mock_gen, mock_reader,
+        mock_creator, mock_merger, mock_fonts, mock_resolve_context,
+    ):
+        """``--profile`` 省略時も従来通り ``jissen_default``、discover は呼ばれない。"""
+        _install_main_mocks(
+            mock_drive, mock_sheets, mock_gen, mock_reader,
+            mock_creator, mock_merger, mock_fonts, pdf_count=2,
+        )
+
+        main.run(test_count=0)
+
+        mock_resolve_context.assert_not_called()
+        mock_drive.list_pdfs.assert_called_once_with(folder_id="input_default")
+        first = mock_sheets.append_output_record.call_args_list[0]
+        # default は prefix 空 → 純粋数値 6 桁
+        self.assertEqual(first.kwargs["management_number"], "000001")
+        self.assertEqual(first.kwargs["sheet_name"], "出力一覧")
+
+    @patch("src.discover.resolve_context")
+    @patch("src.batch_main.ensure_fonts")
+    @patch("src.batch_main.pdf_merger")
+    @patch("src.batch_main.pdf_creator")
+    @patch("src.batch_main.pdf_reader")
+    @patch("src.batch_main.comment_generator")
+    @patch("src.batch_main.sheets_client")
+    @patch("src.batch_main.drive_client")
+    def test_batch_profile_mode_does_not_call_discover(
+        self, mock_drive, mock_sheets, mock_gen, mock_reader,
+        mock_creator, mock_merger, mock_fonts, mock_resolve_context,
+    ):
+        """Batch モードでも ``--profile`` 指定時は discover を呼ばない。"""
+        mock_drive.list_pdfs.return_value = _make_pdf_files(2)
+        mock_drive.download_pdf.return_value = b"%PDF-1.4 fake"
+        mock_drive.upload_pdf_to_clinic_person.return_value = {
+            "webViewLink": "url",
+        }
+        mock_reader.extract_text.return_value = "テキスト"
+        mock_gen.submit_batch.return_value = "batch_001"
+        mock_gen.get_batch_status.return_value = {
+            "status": "ended",
+            "request_counts": {
+                "processing": 0, "succeeded": 2,
+                "errored": 0, "canceled": 0, "expired": 0,
+            },
+        }
+        mock_gen.get_batch_results.return_value = (
+            {
+                f"item_{i:04d}": _make_metadata(suffix=f"_{i}")
+                for i in range(1, 3)
+            },
+            [],
+        )
+        mock_merger.make_output_filename.return_value = "f.pdf"
+        mock_sheets.get_max_management_number.return_value = 0
+
+        with patch("src.batch_main.time.sleep"):
+            batch_main.run(
+                batch_mode=True, test_count=0, step="all",
+                profile_name="jissen_2024_q2",
+            )
+
+        mock_resolve_context.assert_not_called()
+        mock_drive.list_pdfs.assert_called_once_with(folder_id="input_q2")
+
+
 if __name__ == "__main__":
     unittest.main()

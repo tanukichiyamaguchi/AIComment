@@ -4,10 +4,16 @@ PDFを読み取り、Claude APIで医院名・氏名・実践事例タイトル�
 コメント付きPDFをDriveに「医院名/個人名/」階層で保存し、出力一覧シートに記録する。
 事前のスプレッドシート入力（Sheet1）は不要。
 
-プロファイル制度:
-    ``--profile <name>`` で profiles/<name>.yaml を読み込み、
-    入力フォルダ・出力フォルダ・出力シート名・管理番号 prefix を切り替える。
-    デフォルトの ``jissen_default`` は既存挙動を完全維持する。
+実行モード:
+    1. プロファイル（``--profile <name>``）— ``profiles/<name>.yaml`` を読み込み、
+       入力フォルダ・出力フォルダ・出力シート名・管理番号 prefix を切り替える。
+       既存挙動を完全維持する後方互換モード。
+    2. フォルダ自動検出（``--target-folder <name>``）— ``DRIVE_INPUT_ROOT``
+       配下の同名サブフォルダを auto-discover し、出力フォルダ・シートタブ・
+       管理番号 prefix を自動派生する。Secret/YAML 追加なしで新セミナーに対応。
+    3. ``--target-folder __list__`` — 候補名を列挙して即終了（ユーザー向け補助）。
+
+    両方省略時は ``--profile jissen_default``（既存挙動）。
 """
 
 from __future__ import annotations
@@ -17,31 +23,38 @@ import tempfile
 from pathlib import Path
 
 from src.utils import setup_logging, ensure_fonts
-from src import drive_client, sheets_client
+from src import discover, drive_client, sheets_client
 from src import pdf_reader, comment_generator, pdf_creator, pdf_merger
-from src.profile import load_profile
 
 
-def run(test_count: int = 0, profile_name: str = "jissen_default") -> None:
+def run(
+    test_count: int = 0,
+    profile_name: str | None = None,
+    target_folder: str | None = None,
+) -> None:
     """通常モードのメイン処理。
 
     Args:
         test_count: テスト件数（0=全件処理）
-        profile_name: プロファイル名（``profiles/<name>.yaml``）
+        profile_name: プロファイル名（``profiles/<name>.yaml``）。
+            省略時かつ ``target_folder`` も無指定なら ``jissen_default``。
+        target_folder: フォルダ自動検出モードのフォルダ名。
+            ``__list__`` 指定時は候補列挙のみ行い即 return。
     """
     logger = setup_logging()
     logger.info("=== じっせん君コメントシステム（通常モード）開始 ===")
 
-    profile = load_profile(profile_name)
-    logger.info(
-        f"プロファイル: {profile.display_name} ({profile.name}, "
-        f"document_type={profile.document_type}, period={profile.period})"
-    )
+    if target_folder == "__list__":
+        discover.handle_list_mode(logger)
+        return
+
+    cfg = discover.resolve_run_config(profile_name, target_folder)
+    logger.info(cfg.display_name)
 
     ensure_fonts()
 
     logger.info("Step 1: PDF一覧取得")
-    pdf_files = drive_client.list_pdfs(folder_id=profile.input_folder_id)
+    pdf_files = drive_client.list_pdfs(folder_id=cfg.input_folder_id)
 
     if test_count > 0:
         pdf_files = pdf_files[:test_count]
@@ -51,10 +64,10 @@ def run(test_count: int = 0, profile_name: str = "jissen_default") -> None:
 
     # 管理番号の採番起点：既存シートの最大値を取得し、以降の連番はこの値+1から発行する
     initial_max = sheets_client.get_max_management_number(
-        sheet_name=profile.output_sheet_name,
-        prefix=profile.management_number_prefix or None,
+        sheet_name=cfg.output_sheet_name,
+        prefix=cfg.management_number_prefix or None,
     )
-    prefix = profile.management_number_prefix
+    prefix = cfg.management_number_prefix
     logger.info(
         f"管理番号 採番起点: {initial_max} "
         f"(次の発行は {prefix}{initial_max + 1:06d})"
@@ -107,7 +120,7 @@ def run(test_count: int = 0, profile_name: str = "jissen_default") -> None:
 
                 upload_result = drive_client.upload_pdf_to_clinic_person(
                     file_path=output_path,
-                    output_root_folder_id=profile.output_folder_id,
+                    output_root_folder_id=cfg.output_folder_id,
                     clinic_name=clinic_name,
                     person_name=person_name,
                     file_name=output_filename,
@@ -120,7 +133,7 @@ def run(test_count: int = 0, profile_name: str = "jissen_default") -> None:
                 person_name=person_name,
                 sample_name=sample_title,
                 drive_url=upload_result["webViewLink"],
-                sheet_name=profile.output_sheet_name,
+                sheet_name=cfg.output_sheet_name,
             )
             processed += 1
 
@@ -147,15 +160,27 @@ def main() -> None:
         "--test-count", type=int, default=0,
         help="テスト件数（0=全件処理）",
     )
-    parser.add_argument(
-        "--profile", type=str, default="jissen_default",
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--profile", type=str, default=None,
         help=(
             "プロファイル名（profiles/<name>.yaml）。"
-            "省略時は jissen_default（既存挙動）"
+            "省略時かつ --target-folder も無指定なら jissen_default（既存挙動）"
+        ),
+    )
+    group.add_argument(
+        "--target-folder", type=str, default=None,
+        help=(
+            "DRIVE_INPUT_ROOT 配下のサブフォルダ名（フォルダ自動検出モード）。"
+            "'__list__' で候補を列挙して即終了"
         ),
     )
     args = parser.parse_args()
-    run(test_count=args.test_count, profile_name=args.profile)
+    run(
+        test_count=args.test_count,
+        profile_name=args.profile,
+        target_folder=args.target_folder,
+    )
 
 
 if __name__ == "__main__":

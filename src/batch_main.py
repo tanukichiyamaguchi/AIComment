@@ -4,10 +4,16 @@
 Claude APIで医院名・氏名・実践事例タイトル・コメントを抽出/生成、
 コメント付きPDFをDriveに「医院名/個人名/」階層で保存し、出力一覧シートに記録する。
 
-プロファイル制度:
-    ``--profile <name>`` で profiles/<name>.yaml を読み込み、
-    入力フォルダ・出力フォルダ・出力シート名・管理番号 prefix を切り替える。
-    デフォルトの ``jissen_default`` は既存挙動を完全維持する。
+実行モード:
+    1. プロファイル（``--profile <name>``）— ``profiles/<name>.yaml`` を読み込み、
+       入力フォルダ・出力フォルダ・出力シート名・管理番号 prefix を切り替える。
+       既存挙動を完全維持する後方互換モード。
+    2. フォルダ自動検出（``--target-folder <name>``）— ``DRIVE_INPUT_ROOT``
+       配下の同名サブフォルダを auto-discover し、出力フォルダ・シートタブ・
+       管理番号 prefix を自動派生する。Secret/YAML 追加なしで新セミナーに対応。
+    3. ``--target-folder __list__`` — 候補名を列挙して即終了。
+
+    両方省略時は ``--profile jissen_default``（既存挙動）。
 """
 
 from __future__ import annotations
@@ -20,19 +26,22 @@ from pathlib import Path
 
 from src.utils import setup_logging, ensure_fonts
 from src.config import LOGS_DIR
-from src import drive_client, sheets_client
+from src import discover, drive_client, sheets_client
 from src import pdf_reader, comment_generator, pdf_creator, pdf_merger
-from src.profile import ProfileConfig, load_profile
+from src.discover import RunConfig
+from src.profile import ProfileConfig
 
 
 def step1_prepare(
-    profile: ProfileConfig,
+    profile: ProfileConfig | RunConfig,
     test_count: int = 0,
 ) -> list[dict]:
     """Step 1: 準備 — PDF取得・テキスト抽出。
 
     Args:
-        profile: 実行時プロファイル
+        profile: 実行時設定（``ProfileConfig`` または ``RunConfig``）。
+            後方互換のため ``ProfileConfig`` を受けるが、内部では ``RunConfig``
+            と同じフィールドのみ参照する。
         test_count: テスト件数（0=全件処理）
 
     Returns:
@@ -147,14 +156,14 @@ def step3_wait_and_get_results(
 
 
 def step4_generate_pdfs(
-    profile: ProfileConfig,
+    profile: ProfileConfig | RunConfig,
     results: dict[str, dict[str, str]],
     items: list[dict] | None = None,
 ) -> None:
     """Step 4: PDF生成 → Drive保存 → 出力一覧シート追記。
 
     Args:
-        profile: 実行時プロファイル
+        profile: 実行時設定（``ProfileConfig`` または ``RunConfig``）
         results: ``{custom_id: {clinic_name, person_name, sample_title, comment}}``
         items: 準備データ（Noneの場合はファイルから読み込み）
     """
@@ -261,7 +270,8 @@ def run(
     test_count: int = 0,
     batch_id: str | None = None,
     step: str = "all",
-    profile_name: str = "jissen_default",
+    profile_name: str | None = None,
+    target_folder: str | None = None,
 ) -> None:
     """Batchモードのメイン処理。
 
@@ -270,27 +280,35 @@ def run(
         test_count: テスト件数（0=全件）
         batch_id: 既存のバッチID（Step 3から再開する場合）
         step: 実行するステップ ("all", "prepare", "submit", "results", "pdfs")
-        profile_name: プロファイル名（``profiles/<name>.yaml``）
+        profile_name: プロファイル名（``profiles/<name>.yaml``）。
+            省略時かつ ``target_folder`` も無指定なら ``jissen_default``。
+        target_folder: フォルダ自動検出モードのフォルダ名。
+            ``__list__`` 指定時は候補列挙のみ行い即 return。
     """
     logger = setup_logging()
     logger.info("=== じっせん君コメントシステム（Batchモード）開始 ===")
 
-    if not batch_mode:
-        from src.main import run as run_normal
-        run_normal(test_count=test_count, profile_name=profile_name)
+    if target_folder == "__list__":
+        discover.handle_list_mode(logger)
         return
 
-    profile = load_profile(profile_name)
-    logger.info(
-        f"プロファイル: {profile.display_name} ({profile.name}, "
-        f"document_type={profile.document_type}, period={profile.period})"
-    )
+    if not batch_mode:
+        from src.main import run as run_normal
+        run_normal(
+            test_count=test_count,
+            profile_name=profile_name,
+            target_folder=target_folder,
+        )
+        return
+
+    cfg = discover.resolve_run_config(profile_name, target_folder)
+    logger.info(cfg.display_name)
 
     items: list[dict] | None = None
     results: dict[str, dict[str, str]] | None = None
 
     if step in ("all", "prepare"):
-        items = step1_prepare(profile, test_count=test_count)
+        items = step1_prepare(cfg, test_count=test_count)
 
     if step in ("all", "submit"):
         if items is None:
@@ -309,7 +327,7 @@ def run(
     if step in ("all", "pdfs"):
         if results is None:
             raise RuntimeError("results が未取得です。step=results を先に実行してください")
-        step4_generate_pdfs(profile, results, items=items)
+        step4_generate_pdfs(cfg, results, items=items)
 
     logger.info("=== Batchモード処理完了 ===")
 
@@ -333,11 +351,19 @@ def main() -> None:
         choices=["all", "prepare", "submit", "results", "pdfs"],
         help="実行するステップ",
     )
-    parser.add_argument(
-        "--profile", type=str, default="jissen_default",
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--profile", type=str, default=None,
         help=(
             "プロファイル名（profiles/<name>.yaml）。"
-            "省略時は jissen_default（既存挙動）"
+            "省略時かつ --target-folder も無指定なら jissen_default（既存挙動）"
+        ),
+    )
+    group.add_argument(
+        "--target-folder", type=str, default=None,
+        help=(
+            "DRIVE_INPUT_ROOT 配下のサブフォルダ名（フォルダ自動検出モード）。"
+            "'__list__' で候補を列挙して即終了"
         ),
     )
     args = parser.parse_args()
@@ -348,6 +374,7 @@ def main() -> None:
         batch_id=args.batch_id,
         step=args.step,
         profile_name=args.profile,
+        target_folder=args.target_folder,
     )
 
 

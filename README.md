@@ -25,7 +25,9 @@ pip install -r requirements.txt
 | `DRIVE_OUTPUT_FOLDER_ID` | 出力PDFを保存するGoogle DriveフォルダID（`jissen_default` プロファイル用） | ✅（既定プロファイル使用時） |
 | `DRIVE_FOLDER_JISSEN_2024_Q1`〜`Q4` | 2024 年度 Q1〜Q4 プロファイル用の入力フォルダ ID | プロファイル使用時 |
 | `DRIVE_OUTPUT_JISSEN_2024_Q1`〜`Q4` | 2024 年度 Q1〜Q4 プロファイル用の出力フォルダ ID | プロファイル使用時 |
-| `SPREADSHEET_ID` | 出力一覧を書き込むスプレッドシートID（全プロファイル共通） | ✅ |
+| `DRIVE_INPUT_ROOT` | 入力サブフォルダの親フォルダ ID（フォルダ自動検出モード用） | 自動検出モード時 |
+| `DRIVE_OUTPUT_ROOT` | 出力サブフォルダの親フォルダ ID（フォルダ自動検出モード用、配下に同名フォルダを自動作成） | 自動検出モード時 |
+| `SPREADSHEET_ID` | 出力一覧を書き込むスプレッドシートID（全モード共通、タブも自動作成） | ✅ |
 | `GMAIL_TOKEN_JSON` | （旧称）`GOOGLE_OAUTH_TOKEN_JSON` の後方互換エイリアス | 旧Secret再利用可 |
 
 #### `GOOGLE_OAUTH_TOKEN_JSON` がなぜ必要か
@@ -132,6 +134,85 @@ https://www.googleapis.com/auth/gmail.compose
 2. GitHub Secrets に `input_folder_id_secret` / `output_folder_id_secret` で指定したキー名で Drive フォルダ ID を登録
 3. `.github/workflows/generate_comments.yml` の `env:` セクションに `<KEY>: ${{ secrets.<KEY> }}` を追記
 4. （オプション）Google フォームのプルダウン選択肢と Apps Script の `ALLOWED_PROFILES` 配列に新プロファイル名を追加
+
+> **新セミナーを 1 つ追加するたびに上記 4 ステップが必要になる** ため、増える数が読めない用途では下記「フォルダ自動検出モード」のほうが運用負荷が低い。
+
+## フォルダ自動検出モード
+
+### なぜ便利か
+
+セミナー種類 × 回数 × 提出物種類が今後増える用途に向けた **Convention over Configuration** 設計。**Drive にフォルダを作るだけで全自動で処理対象になる** ため、新しい種別を追加するたびに Secret / YAML / Apps Script を編集する必要がない。
+
+```
+[従来] 新セミナー → profiles/*.yaml + GitHub Secret × 2 + workflow YAML 編集 + Apps Script 編集
+[新規] 新セミナー → Drive にサブフォルダ作成 + PDF アップロードのみ
+```
+
+| 観点 | プロファイルモード | フォルダ自動検出モード |
+|------|------------------|-------------------|
+| 新セミナー追加時のコード変更 | あり（YAML + workflow YAML） | **なし** |
+| 新セミナー追加時の Secret 追加 | あり（入力 ID + 出力 ID の 2 つ） | **なし** |
+| 命名規約の自由度 | YAML で固定 | Drive フォルダ名に従う |
+| 既存挙動との関係 | 完全維持（後方互換） | 追加機能（profile と排他で選択） |
+
+### セットアップ手順（一度だけ）
+
+1. Drive で「入力サブフォルダの親フォルダ」を 1 つ作成（例: `アプコメ入力ROOT`）→ フォルダ ID を控える
+2. Drive で「出力サブフォルダの親フォルダ」を 1 つ作成（例: `アプコメ出力ROOT`）→ フォルダ ID を控える
+3. GitHub Secrets に下記 2 つを追加（既存 Secret は触らない）:
+   | Secret 名 | 値 |
+   |-----------|-----|
+   | `DRIVE_INPUT_ROOT` | 手順 1 のフォルダ ID |
+   | `DRIVE_OUTPUT_ROOT` | 手順 2 のフォルダ ID |
+4. `SPREADSHEET_ID` は既存と同じものを引き続き使う（タブが自動で作成される）
+
+### 使い方（毎回）
+
+1. Drive で `DRIVE_INPUT_ROOT` 配下にサブフォルダを作成（命名自由、例: `2024_Q1_実践事例` / `2025_新人研修_中間レポート`）
+2. そのフォルダに対象 PDF をアップロード
+3. GitHub Actions ワークフローを起動し、`target_folder` 入力欄にフォルダ名を入れる（例: `target_folder: 2024_Q1_実践事例`）
+4. `profile` 入力欄は無視される（target_folder が優先）
+
+### システムが自動でやること
+
+1. `DRIVE_INPUT_ROOT` 配下から `target_folder` 名のフォルダを検索（半角/全角・空白の有無の表記揺れは自動吸収）
+2. `DRIVE_OUTPUT_ROOT` 配下に同名フォルダを作成（既存ならスキップ）
+3. `SPREADSHEET_ID` に同名タブを作成（既存ならスキップ）
+4. 管理番号 prefix を `<target_folder>-` で派生（例: `2024_Q1_実践事例-000001`）
+5. 既存処理パイプライン（PDF 取得 → Claude API → コメント PDF 生成 → 結合 → Drive 保存 → Sheets 追記）を実行
+
+### 命名規約と派生ルール
+
+- **フォルダ名 = タブ名 = 管理番号 prefix の中身**（例: `2024_Q1_実践事例` → タブ `2024_Q1_実践事例` / 管理番号 `2024_Q1_実践事例-000001`）
+- フォルダ名の sanitize は最小限。Drive で許される文字（半角/全角の日本語、英数字、`_` `-` 等）は基本そのまま使われる
+- 表記揺れマッチング: 「`医療法人 かがやき`」と「`医療法人かがやき`」のような半角/全角空白の有無や全角/半角英数字の差異は **同一フォルダ** と見なし、重複作成を防ぐ（lessons.md P-009 と同じ方針）
+- 管理番号は **同一プレフィックス内で連番継続**（既存シートの最大値 +1 から）。再実行しても連番が乱れない
+
+### 候補名を確認する
+
+「いま `DRIVE_INPUT_ROOT` 配下に何のサブフォルダがあるか」を確認したい場合は `target_folder` に `__list__` を入力してワークフローを実行する。Actions のログに候補一覧が表示される（PDF 処理はスキップ）。
+
+### コマンドライン
+
+```bash
+# フォルダ自動検出モード（profile より優先）
+python -m src.batch_main --target-folder "2024_Q1_実践事例" --test-count 5
+python -m src.main --target-folder "2024_Q1_実践事例"
+
+# 候補列挙のみ（処理しない）
+python -m src.main --target-folder "__list__"
+```
+
+### profile モードとの選び方
+
+| こんなときは | 選ぶモード |
+|------------|----------|
+| 既存の `jissen_default` / `jissen_2024_q1` 等で動いていて、変える必要がない | プロファイルモード（後方互換） |
+| プロンプトテンプレートやドキュメント種別を切り替えたい | プロファイルモード（YAML で `prompt_template` 等を切り替え可能） |
+| セミナー × 回数 × 提出物種類を頻繁に追加する | **フォルダ自動検出モード** |
+| Secret/YAML を増やしたくない | **フォルダ自動検出モード** |
+
+両モードは同時に存在でき、相互に干渉しない。同じワークフロー実行で `target_folder` が空なら profile が使われる。
 
 YAML スキーマ（必須フィールド）：
 

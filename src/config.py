@@ -36,6 +36,13 @@ SPREADSHEET_ID = _get_secret("SPREADSHEET_ID")
 GMAIL_TOKEN_JSON = _get_secret("GMAIL_TOKEN_JSON")
 GOOGLE_CREDENTIALS_JSON = _get_secret("GOOGLE_CREDENTIALS_JSON")
 
+# ── フォルダ自動検出モード用設定 ──
+# Convention over Configuration の方針で、Secret/YAML 追加なしで新セミナーに
+# 対応するための入出力 ROOT フォルダ ID。``--target-folder`` 指定時のみ参照する。
+# 既存の ``--profile`` モードでは未使用（後方互換）。
+DRIVE_INPUT_ROOT = _get_secret("DRIVE_INPUT_ROOT")
+DRIVE_OUTPUT_ROOT = _get_secret("DRIVE_OUTPUT_ROOT")
+
 # OAuthユーザートークン（Drive/Sheets/Gmail共通）。
 # サービスアカウントは My Drive 配下にファイルをアップロードできない（storageQuotaExceeded）
 # ため、Drive書き込み時はユーザー認可トークンを優先する。
