@@ -68,6 +68,15 @@ passthrough 対象も「処理した」記録は残す（出力一覧シート�
 リトライ対象は一過性エラーのみ（401/403/404 のような恒久エラーは即座に
 失敗させ、無駄な再試行をしない）。
 
+### P-018: 表示用フォルダ名に識別子を前置するときは「比較は正規化形・保存は元表記」を貫く
+医院フォルダ名の先頭に医院番号（管理番号の先頭セグメント）を付与した
+（`001_三浦歯科医院`）。識別子（医院番号）は管理番号から機械抽出した
+安定値、医院名は AI 抽出値。両者を結合したフォルダ名をキーにすると、AI 抽出
+側の表記揺れ（P-009）がそのまま重複フォルダを生む。**Rule**: 表示用の複合
+フォルダ名（識別子 + 名前）を作るときも、フォルダの検索・再利用は
+`find_or_create_folder` の正規化マッチング（P-009）に委ねる。識別子部分は
+機械抽出で安定しているが、名前部分は揺れる前提で設計する。
+
 ## Session Log
 - **2026-03-16**: Project initialized with workflow orchestration architecture.
 - **2026-05-01**: Added 5-agent team and 3 deterministic check scripts to handle 1000+ PDF scale. Each agent owns one of the failure modes in P-001 through P-005. See `tasks/todo.md` Phase 6 for the standard operating sequence.
@@ -78,3 +87,4 @@ passthrough 対象も「処理した」記録は残す（出力一覧シート�
 - **2026-05-21**: 増分処理（管理番号での重複検知）を追加。出力一覧シートに既存の管理番号を持つ PDF は download / Claude API 呼び出しの前にスキップし、新規 PDF のみ処理する。仕様確定の際に「強制再実行（`force_reprocess` / `--force-reprocess`）」オプションは不要と判断し、一度実装しかけた `force_reprocess` 経路（`main.py` / `batch_main.py` の引数・argparse フラグ・分岐）を完全撤去。重複検知は無条件で有効とし、再処理は出力シートの該当行を手動削除して行う運用に統一。管理番号なし PDF は重複検知不可のためスキップ（fail-loud）。P-015 を追加。
 - **2026-05-21**: 添付資料ファイルのパススルー処理を追加。ファイル名に「【添付資料】」を含む PDF は実践事例の補足資料であり、AI 処理（テキスト抽出 / Claude API / コメントページ生成 / PDF 結合）を一切せず、同じ管理番号（`NNN-NN-N`）のメイン実践事例 PDF と同じ `<医院名>/<個人名>/` フォルダへ元ファイル名のままコピーする。入力をファイル名で「メイン」「添付資料」に早期分類し（`utils.is_attachment_filename`）、メイン処理ループで管理番号 → `(医院名, 個人名)` の対応表を構築、添付資料はその表を引いてコピー + 出力一覧シートに「【添付資料】<元名>」で記録。Batch モードでは添付資料を Claude API に投げず、`batch_attachments.json`（`batch_prep.json` とは別ファイル）で Step1→Step4 に引き継ぎ、Step4 でメインと同じフォルダへコピー。重複判定セットは実行開始時の 1 スナップショットで、メイン処理が同一実行内の添付資料判定に影響しないようにした。メイン不在の添付資料は警告つきスキップ。P-016 を追加。テスト 319 → 342 件（`is_attachment_filename` 8 件、通常モード 7 件、Batch モード 6 件、integration smoke 2 件）。
 - **2026-05-21**: Google Sheets/Drive API に一過性エラーの自動リトライを追加。本番のフォルダ自動検出モード実行中、`sheets_client.get_processed_management_numbers` 内の `spreadsheets().get(...).execute()` が Sheets API の 503（The service is currently unavailable）でクラッシュした。RCA: Google API クライアント（`sheets_client.py` / `drive_client.py` / `discover.py`）はリトライ機構を持たず、5xx・429 が 1 回起きるとワークフロー全体が落ちる。修正: `config.py` に `GOOGLE_API_NUM_RETRIES = 5` を定義し、grep で洗い出した全 14 件の `.execute()`（sheets 9・drive 4・discover 1）と `download_pdf` の `next_chunk` 1 件に `num_retries` を付与。`googleapiclient` が 5xx/429 を指数バックオフ + ジッターで自動再試行する（4xx の恒久エラーはリトライしない正しい挙動）。P-017 を追加。テスト 342 → 350 件（リトライ引数検証 8 件追加）。
+- **2026-05-21**: 医院フォルダ名に医院番号を前置 + 医院フォルダURLシートを追加。(1) 医院フォルダ名を `<医院番号>_<医院名>`（例 `001_三浦歯科医院`）に変更。医院番号は管理番号 `NNN-NN-N` の先頭セグメント（`utils.extract_clinic_number`）。管理番号の先頭セグメントが 3〜5 桁可変になったため `extract_management_number` の正規表現を `^\d{3}-\d{2}-\d` → `^\d{3,5}-\d{2}-\d` に拡張（4〜5 桁医院番号の PDF がスキップされていた）。(2) 医院ごとに 1 行、医院フォルダ URL を `<出力シート名>_医院` シート（3 列: 医院番号 / 医院名 / 医院フォルダURL）へ記録。`sheets_client` に `get_recorded_clinic_numbers` / `append_clinic_folder_record` を追加し、`_ensure_output_sheet` をヘッダー長から列数を決める汎用ヘルパー `_ensure_sheet_with_header` に一般化。重複記録防止は実行開始時のスナップショット + in-memory set。`drive_client.upload_pdf_to_clinic_person` の戻り値に `clinic_folder_id` を追加。出力一覧シート（6 列）の医院名列は AI 抽出値そのまま（医院番号なし）を維持。添付資料もメインと同じ医院番号付きフォルダへコピー。P-018 を追加。テスト 350 → 390 件（`extract_clinic_number` 11 件、`extract_management_number` 桁数拡張 2 件、sheets 22 件、drive 1 件、main 5 件、batch_main 5 件、integration smoke 3 件 ほか）。既存の番号なしフォルダは孤立する（自動移行はしない）。

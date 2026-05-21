@@ -303,7 +303,9 @@ def upload_pdf_to_clinic_person(
         file_name: Drive上のファイル名（省略時はローカルファイル名を使用）
 
     Returns:
-        {"id": "<file_id>", "webViewLink": "<url>"}
+        ``{"id": "<file_id>", "webViewLink": "<url>", "clinic_folder_id": "<id>"}``。
+        ``clinic_folder_id`` は医院フォルダの Drive ID で、呼び出し側が
+        医院フォルダ URL を構築する（医院フォルダ URL シート記録に使う）。
     """
     service = get_drive_service()
     clinic_folder_id = find_or_create_folder(
@@ -312,9 +314,11 @@ def upload_pdf_to_clinic_person(
     person_folder_id = find_or_create_folder(
         person_name, clinic_folder_id, service=service
     )
-    return upload_pdf(
+    result = upload_pdf(
         file_path=file_path,
         folder_id=person_folder_id,
         file_name=file_name,
         service=service,
     )
+    result["clinic_folder_id"] = clinic_folder_id
+    return result

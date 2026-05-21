@@ -61,6 +61,7 @@ def _install_step4_mocks(mock_drive, mock_merger) -> None:
     mock_drive.download_pdf.return_value = b"%PDF-1.4 fake"
     mock_drive.upload_pdf_to_clinic_person.return_value = {
         "webViewLink": "https://drive.google.com/fake",
+        "clinic_folder_id": "clinic_folder_fake",
     }
     mock_merger.make_output_filename.return_value = "out.pdf"
 
@@ -327,6 +328,123 @@ class TestStep4UsesProfile(unittest.TestCase):
         kwargs = mock_sheets.append_output_record.call_args.kwargs
         self.assertEqual(kwargs["management_number"], "")
         self.assertIn("管理番号なし.pdf", "\n".join(log_ctx.output))
+
+
+class TestStep4ClinicNumberFolder(unittest.TestCase):
+    """``step4_generate_pdfs`` の医院番号付きフォルダ名 + 医院フォルダURLシート。
+
+    医院フォルダ名は ``<医院番号>_<医院名>``。医院フォルダURLシート
+    （``<出力シート名>_医院``）に医院を記録し、同一医院は 1 行のみ。
+    """
+
+    @patch("src.batch_main.pdf_merger")
+    @patch("src.batch_main.pdf_creator")
+    @patch("src.batch_main.drive_client")
+    @patch("src.batch_main.sheets_client")
+    @patch("src.batch_main.ensure_fonts")
+    def test_clinic_folder_name_has_clinic_number_prefix(
+        self, mock_fonts, mock_sheets, mock_drive, mock_creator, mock_merger,
+    ):
+        """医院フォルダ名が ``<医院番号>_<医院名>`` になる。"""
+        profile = _make_profile()
+        mock_sheets.get_recorded_clinic_numbers.return_value = set()
+        _install_step4_mocks(mock_drive, mock_merger)
+
+        batch_main.step4_generate_pdfs(
+            profile,
+            results=_make_batch_results(1),
+            items=_make_batch_items(["111-22-3実践事例.pdf"]),
+        )
+
+        upload_kwargs = mock_drive.upload_pdf_to_clinic_person.call_args.kwargs
+        self.assertEqual(upload_kwargs["clinic_name"], "111_山田歯科")
+
+    @patch("src.batch_main.pdf_merger")
+    @patch("src.batch_main.pdf_creator")
+    @patch("src.batch_main.drive_client")
+    @patch("src.batch_main.sheets_client")
+    @patch("src.batch_main.ensure_fonts")
+    def test_clinic_folder_url_recorded_in_clinic_sheet(
+        self, mock_fonts, mock_sheets, mock_drive, mock_creator, mock_merger,
+    ):
+        """医院フォルダURLシートに医院番号 / 医院名 / フォルダURL が記録される。"""
+        profile = _make_profile(output_sheet_name="出力一覧")
+        mock_sheets.get_recorded_clinic_numbers.return_value = set()
+        mock_drive.download_pdf.return_value = b"%PDF-1.4 fake"
+        mock_drive.upload_pdf_to_clinic_person.return_value = {
+            "webViewLink": "https://drive.google.com/fake",
+            "clinic_folder_id": "clinic_abc",
+        }
+        mock_merger.make_output_filename.return_value = "out.pdf"
+
+        batch_main.step4_generate_pdfs(
+            profile,
+            results=_make_batch_results(1),
+            items=_make_batch_items(["111-22-3実践事例.pdf"]),
+        )
+
+        # 医院シート名は <出力シート名>_医院
+        snapshot_call = mock_sheets.get_recorded_clinic_numbers.call_args.kwargs
+        self.assertEqual(snapshot_call["sheet_name"], "出力一覧_医院")
+        rec_call = mock_sheets.append_clinic_folder_record.call_args.kwargs
+        self.assertEqual(rec_call["clinic_number"], "111")
+        self.assertEqual(rec_call["clinic_name"], "山田歯科")
+        self.assertEqual(
+            rec_call["clinic_folder_url"],
+            "https://drive.google.com/drive/folders/clinic_abc",
+        )
+        self.assertEqual(rec_call["sheet_name"], "出力一覧_医院")
+
+    @patch("src.batch_main.pdf_merger")
+    @patch("src.batch_main.pdf_creator")
+    @patch("src.batch_main.drive_client")
+    @patch("src.batch_main.sheets_client")
+    @patch("src.batch_main.ensure_fonts")
+    def test_same_clinic_recorded_only_once(
+        self, mock_fonts, mock_sheets, mock_drive, mock_creator, mock_merger,
+    ):
+        """同一医院番号の PDF が複数あっても医院シートには 1 行のみ記録される。"""
+        profile = _make_profile()
+        mock_sheets.get_recorded_clinic_numbers.return_value = set()
+        _install_step4_mocks(mock_drive, mock_merger)
+
+        # 医院番号 200 が 2 件、300 が 1 件
+        batch_main.step4_generate_pdfs(
+            profile,
+            results=_make_batch_results(3),
+            items=_make_batch_items(
+                ["200-01-0事例A.pdf", "200-01-1事例B.pdf", "300-02-0事例C.pdf"]
+            ),
+        )
+
+        recorded = [
+            c.kwargs["clinic_number"]
+            for c in mock_sheets.append_clinic_folder_record.call_args_list
+        ]
+        self.assertEqual(sorted(recorded), ["200", "300"])
+
+    @patch("src.batch_main.pdf_merger")
+    @patch("src.batch_main.pdf_creator")
+    @patch("src.batch_main.drive_client")
+    @patch("src.batch_main.sheets_client")
+    @patch("src.batch_main.ensure_fonts")
+    def test_already_recorded_clinic_not_appended_again(
+        self, mock_fonts, mock_sheets, mock_drive, mock_creator, mock_merger,
+    ):
+        """医院シートに既に記録済みの医院番号は再追記されない。"""
+        profile = _make_profile()
+        # 医院番号 111 は前回実行で記録済み
+        mock_sheets.get_recorded_clinic_numbers.return_value = {"111"}
+        _install_step4_mocks(mock_drive, mock_merger)
+
+        batch_main.step4_generate_pdfs(
+            profile,
+            results=_make_batch_results(1),
+            items=_make_batch_items(["111-22-3実践事例.pdf"]),
+        )
+
+        mock_sheets.append_output_record.assert_called_once()
+        mock_sheets.append_clinic_folder_record.assert_not_called()
 
 
 class TestArgparseTargetFolder(unittest.TestCase):
@@ -636,11 +754,12 @@ class TestStep4AttachmentPassthrough(unittest.TestCase):
             items=_make_batch_items(["111-22-3実践事例.pdf"]),
         )
 
-        # upload は 2 回（メイン + 添付資料）。添付資料は同じ医院/個人フォルダへ、
-        # 元ファイル名のまま。
+        # upload は 2 回（メイン + 添付資料）。添付資料は同じ医院フォルダへ、
+        # 元ファイル名のまま。医院フォルダ名は <医院番号>_<医院名>
+        # （111-22-3 → 医院番号 111）。
         self.assertEqual(mock_drive.upload_pdf_to_clinic_person.call_count, 2)
         att_upload = mock_drive.upload_pdf_to_clinic_person.call_args_list[1]
-        self.assertEqual(att_upload.kwargs["clinic_name"], "山田歯科")
+        self.assertEqual(att_upload.kwargs["clinic_name"], "111_山田歯科")
         self.assertEqual(att_upload.kwargs["person_name"], "田中太郎")
         self.assertEqual(
             att_upload.kwargs["file_name"], "111-22-3【添付資料】補足.pdf"
@@ -685,6 +804,39 @@ class TestStep4AttachmentPassthrough(unittest.TestCase):
         # メイン 1 件のみ upload。孤児添付資料はコピーされない。
         self.assertEqual(mock_drive.upload_pdf_to_clinic_person.call_count, 1)
         self.assertIn("999-99-9【添付資料】孤児.pdf", "\n".join(log_ctx.output))
+
+    @patch("src.batch_main.pdf_merger")
+    @patch("src.batch_main.pdf_creator")
+    @patch("src.batch_main.drive_client")
+    @patch("src.batch_main.sheets_client")
+    @patch("src.batch_main.ensure_fonts")
+    def test_step4_attachment_uses_clinic_number_folder(
+        self, mock_fonts, mock_sheets, mock_drive, mock_creator, mock_merger,
+    ):
+        """添付資料も医院番号付きフォルダ ``<医院番号>_<医院名>`` へコピーされる。"""
+        _install_step4_mocks(mock_drive, mock_merger)
+        mock_sheets.get_recorded_clinic_numbers.return_value = set()
+        self._att_file.write_text(json.dumps([
+            {
+                "file_id": "id_att",
+                "file_name": "111-22-3【添付資料】補足.pdf",
+                "management_number": "111-22-3",
+            }
+        ]))
+        profile = _make_profile()
+
+        batch_main.step4_generate_pdfs(
+            profile,
+            results=_make_batch_results(1),
+            items=_make_batch_items(["111-22-3実践事例.pdf"]),
+        )
+
+        # メイン・添付資料ともに医院フォルダ名 111_山田歯科
+        for call in mock_drive.upload_pdf_to_clinic_person.call_args_list:
+            self.assertEqual(call.kwargs["clinic_name"], "111_山田歯科")
+        # 出力一覧シートの医院名列は AI 抽出値（医院番号なし）
+        for call in mock_sheets.append_output_record.call_args_list:
+            self.assertEqual(call.kwargs["clinic_name"], "山田歯科")
 
     @patch("src.batch_main.pdf_merger")
     @patch("src.batch_main.pdf_creator")

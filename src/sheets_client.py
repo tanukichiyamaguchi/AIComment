@@ -176,13 +176,28 @@ def _validate_email(email: str) -> bool:
 
 _OUTPUT_HEADER = ["管理番号", "医院名", "個人名", "実践事例名", "Drive URL", "処理日時"]
 
+# 医院フォルダURLシートのヘッダー（3列）。出力一覧シート（6列）とは別タブで、
+# 医院ごとに 1 行、医院フォルダの Drive URL を記録する。
+_CLINIC_SHEET_HEADER = ["医院番号", "医院名", "医院フォルダURL"]
 
-def _ensure_output_sheet(
+
+def _ensure_sheet_with_header(
     service: Any,
     spreadsheet_id: str,
     sheet_name: str,
+    header: list[str],
 ) -> None:
-    """出力一覧シートが無ければ作成し、ヘッダー行を書き込む。"""
+    """指定シートが無ければ作成し、ヘッダー行が空なら書き込む（汎用ヘルパー）。
+
+    出力一覧シート（6列）と医院フォルダURLシート（3列）の両方で使う。
+    ヘッダーの列数は ``header`` の長さから動的に決める（A1 から N 列ぶん）。
+
+    Args:
+        service: Sheets API サービス
+        spreadsheet_id: スプレッドシートID
+        sheet_name: シート名（タブ名）
+        header: ヘッダー行（列数はこのリスト長から決まる）
+    """
     meta = service.spreadsheets().get(
         spreadsheetId=spreadsheet_id
     ).execute(num_retries=GOOGLE_API_NUM_RETRIES)
@@ -197,9 +212,11 @@ def _ensure_output_sheet(
                 ]
             },
         ).execute(num_retries=GOOGLE_API_NUM_RETRIES)
-        logger.info(f"Sheets: 出力一覧シートを新規作成 ({sheet_name})")
+        logger.info(f"Sheets: シートを新規作成 ({sheet_name})")
 
-    header_range = f"{sheet_name}!A1:F1"
+    # ヘッダー range は列数に合わせて A1:<最終列>1 を組み立てる。
+    last_col = chr(ord("A") + len(header) - 1)
+    header_range = f"{sheet_name}!A1:{last_col}1"
     current = service.spreadsheets().values().get(
         spreadsheetId=spreadsheet_id,
         range=header_range,
@@ -209,9 +226,31 @@ def _ensure_output_sheet(
             spreadsheetId=spreadsheet_id,
             range=header_range,
             valueInputOption="RAW",
-            body={"values": [_OUTPUT_HEADER]},
+            body={"values": [header]},
         ).execute(num_retries=GOOGLE_API_NUM_RETRIES)
-        logger.info(f"Sheets: 出力一覧シートのヘッダーを書き込み ({sheet_name})")
+        logger.info(f"Sheets: シートのヘッダーを書き込み ({sheet_name})")
+
+
+def _ensure_output_sheet(
+    service: Any,
+    spreadsheet_id: str,
+    sheet_name: str,
+) -> None:
+    """出力一覧シート（6列）が無ければ作成し、ヘッダー行を書き込む。"""
+    _ensure_sheet_with_header(
+        service, spreadsheet_id, sheet_name, _OUTPUT_HEADER
+    )
+
+
+def _ensure_clinic_sheet(
+    service: Any,
+    spreadsheet_id: str,
+    sheet_name: str,
+) -> None:
+    """医院フォルダURLシート（3列）が無ければ作成し、ヘッダー行を書き込む。"""
+    _ensure_sheet_with_header(
+        service, spreadsheet_id, sheet_name, _CLINIC_SHEET_HEADER
+    )
 
 
 def get_processed_management_numbers(
@@ -325,4 +364,108 @@ def append_output_record(
 
     logger.info(
         f"Sheets: 出力一覧に追加 ({management_number} / {clinic_name} / {person_name} / {sample_name})"
+    )
+
+
+def get_recorded_clinic_numbers(
+    spreadsheet_id: str | None = None,
+    sheet_name: str | None = None,
+) -> set[str]:
+    """医院フォルダURLシートの A列（医院番号）から記録済み医院番号の集合を返す。
+
+    重複記録防止に使う。医院フォルダURLシートに既に行がある医院番号は、
+    同じ実行内・後続実行で再度追記しないための事前スナップショット。
+
+    Args:
+        spreadsheet_id: スプレッドシートID（省略時は設定値 ``SPREADSHEET_ID``）
+        sheet_name: 医院シート名（``<出力シート名>_医院``）。
+            省略時は設定値 ``OUTPUT_SHEET_NAME``。
+
+    Returns:
+        記録済み医院番号の集合。空セル・ヘッダー行は除外する。
+        シートが未作成（``_ensure_clinic_sheet`` 前）の場合や
+        ``values`` キーが無い場合は空集合を返す。
+    """
+    spreadsheet_id = spreadsheet_id or SPREADSHEET_ID
+    if not spreadsheet_id:
+        raise ValueError("SPREADSHEET_IDが設定されていません")
+    sheet_name = sheet_name or OUTPUT_SHEET_NAME
+
+    service = get_sheets_service()
+
+    # 医院シートがまだ作成されていない（初回実行）場合、A2:A の取得は
+    # 400 エラーになる。シート一覧を先に確認し、未作成なら空集合で返す。
+    meta = service.spreadsheets().get(
+        spreadsheetId=spreadsheet_id
+    ).execute(num_retries=GOOGLE_API_NUM_RETRIES)
+    existing_titles = [s["properties"]["title"] for s in meta.get("sheets", [])]
+    if sheet_name not in existing_titles:
+        logger.info(
+            f"Sheets: 医院フォルダURLシート未作成のため記録済み医院番号は0件 "
+            f"({sheet_name})"
+        )
+        return set()
+
+    result = service.spreadsheets().values().get(
+        spreadsheetId=spreadsheet_id,
+        range=f"{sheet_name}!A2:A",
+    ).execute(num_retries=GOOGLE_API_NUM_RETRIES)
+
+    rows = result.get("values", [])
+    recorded = {
+        row[0].strip()
+        for row in rows
+        if row and row[0] and row[0].strip()
+    }
+    logger.info(
+        f"Sheets: 記録済み医院番号 {len(recorded)}件を取得 ({sheet_name})"
+    )
+    return recorded
+
+
+def append_clinic_folder_record(
+    clinic_number: str,
+    clinic_name: str,
+    clinic_folder_url: str,
+    spreadsheet_id: str | None = None,
+    sheet_name: str | None = None,
+) -> None:
+    """医院フォルダURLシートに1行追加する（医院番号 / 医院名 / 医院フォルダURL）。
+
+    シートが無ければヘッダー付きで自動作成する。重複記録の防止は呼び出し側の
+    責務（``get_recorded_clinic_numbers`` で事前スナップショットを取る）。
+
+    Args:
+        clinic_number: 医院番号（管理番号の先頭セグメント、3〜5桁）
+        clinic_name: 医院名（AI 抽出値）
+        clinic_folder_url: 医院フォルダの Drive 閲覧 URL
+        spreadsheet_id: スプレッドシートID（省略時は設定値）
+        sheet_name: 医院シート名（``<出力シート名>_医院``）。
+            省略時は設定値 ``OUTPUT_SHEET_NAME``。
+    """
+    spreadsheet_id = spreadsheet_id or SPREADSHEET_ID
+    if not spreadsheet_id:
+        raise ValueError("SPREADSHEET_IDが設定されていません")
+    sheet_name = sheet_name or OUTPUT_SHEET_NAME
+
+    service = get_sheets_service()
+    _ensure_clinic_sheet(service, spreadsheet_id, sheet_name)
+
+    service.spreadsheets().values().append(
+        spreadsheetId=spreadsheet_id,
+        range=f"{sheet_name}!A:C",
+        # RAW: 各値を入力された文字列のまま格納する（医院番号の先頭ゼロや
+        # URL が数式・数値に解釈されないようにする）。
+        valueInputOption="RAW",
+        insertDataOption="INSERT_ROWS",
+        body={
+            "values": [
+                [clinic_number, clinic_name, clinic_folder_url]
+            ]
+        },
+    ).execute(num_retries=GOOGLE_API_NUM_RETRIES)
+
+    logger.info(
+        f"Sheets: 医院フォルダURLシートに追加 "
+        f"({clinic_number} / {clinic_name} / {clinic_folder_url})"
     )
