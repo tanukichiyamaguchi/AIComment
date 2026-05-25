@@ -298,8 +298,10 @@ def step4_generate_pdfs(
 
     # 添付資料パススルー用の対応表。メイン PDF の処理ループで構築し、
     # ループ後に添付資料をこの表で引いて同じ出力フォルダへコピーする。
-    # (医院フォルダ名, 医院名, 個人名) — 医院フォルダ名は ``<医院番号>_<医院名>``
-    # （Drive 階層用）、医院名は AI 抽出値そのまま（出力一覧シート用）。
+    # (医院番号, 医院名, 個人名) — 医院番号と医院名（AI 抽出の生の値）を別々
+    # に保持し、添付資料アップロード時にメインと同じ
+    # ``find_or_create_clinic_folder`` を通じて同じ医院フォルダ（医院番号で
+    # 識別）に合流させる（P-019）。
     case_map: dict[str, tuple[str, str, str]] = {}
 
     # 医院フォルダURLシート（``<出力シート名>_医院``）の記録済み医院番号を
@@ -350,12 +352,12 @@ def step4_generate_pdfs(
         sample_title = meta["sample_title"] or Path(pdf_file_name).stem or "untitled"
         comment = meta["comment"]
 
-        # 医院番号（管理番号の先頭セグメント）を抽出し、医院フォルダ名を
-        # ``<医院番号>_<医院名>`` で構築する。抽出できない場合は医院名のみ。
+        # 医院番号（管理番号の先頭セグメント）を抽出する。医院フォルダの識別
+        # は医院番号のみで行うため（P-019）、医院番号と医院名を別々に
+        # ``upload_pdf_to_clinic_person`` に渡す。医院番号が空の場合は
+        # ``find_or_create_clinic_folder`` 側で旧来の名前ベース照合に
+        # フォールバックする。
         clinic_number = extract_clinic_number(pdf_file_name)
-        clinic_folder_name = (
-            f"{clinic_number}_{clinic_name}" if clinic_number else clinic_name
-        )
 
         output_filename = pdf_merger.make_output_filename(
             clinic_name, person_name, sample_title
@@ -383,7 +385,8 @@ def step4_generate_pdfs(
                 upload_result = drive_client.upload_pdf_to_clinic_person(
                     file_path=output_path,
                     output_root_folder_id=profile.output_folder_id,
-                    clinic_name=clinic_folder_name,
+                    clinic_number=clinic_number,
+                    clinic_name=clinic_name,
                     person_name=person_name,
                     file_name=output_filename,
                 )
@@ -410,7 +413,7 @@ def step4_generate_pdfs(
             # このメインと同じ出力フォルダへコピーするために使う。
             if mgmt_num:
                 case_map[mgmt_num] = (
-                    clinic_folder_name, clinic_name, person_name
+                    clinic_number, clinic_name, person_name
                 )
             logger.info(
                 f"完了: {mgmt_num} / {clinic_name} / {person_name} / {sample_title}"
@@ -449,13 +452,14 @@ def _process_attachments(
     AI 処理（Claude API / コメントページ生成 / 結合）は一切しない。元 PDF の
     バイト列をそのまま再アップロードし、出力一覧シートに「【添付資料】<元名>」
     で記録する。``case_map`` に対応するメインが無い添付資料は警告スキップ。
-    添付資料はメインと同じ管理番号（= 同じ医院番号）なので、メインと同じ
-    医院番号付きフォルダ（``<医院番号>_<医院名>``）へコピーされる。
+    添付資料はメインと同じ管理番号（= 同じ医院番号）なので、
+    ``find_or_create_clinic_folder`` 経由でメインと同じ医院フォルダへ
+    コピーされる（P-019）。
 
     Args:
         profile: 実行時設定（出力フォルダ ID / シート名を参照）
         case_map: メイン処理で構築した管理番号 →
-            ``(医院フォルダ名, 医院名, 個人名)`` の対応表
+            ``(医院番号, 医院名, 個人名)`` の対応表
         stats: Step4 の統計 dict（``success`` / ``error`` をインプレース更新）
     """
     logger = setup_logging()
@@ -484,10 +488,11 @@ def _process_attachments(
             stats["error"] += 1
             continue
 
-        # case_map は (医院フォルダ名, 医院名, 個人名)。添付資料は医院番号付き
-        # フォルダ（メインと同じ）へコピーし、出力一覧シートには AI 抽出の
-        # 医院名（医院番号なし）を記録する。
-        clinic_folder_name, clinic_name, person_name = case
+        # case_map は (医院番号, 医院名, 個人名)。添付資料は
+        # ``find_or_create_clinic_folder`` 経由でメインと同じ医院フォルダへ
+        # コピーされ、出力一覧シートには AI 抽出の医院名（医院番号なし）を
+        # 記録する。
+        clinic_number, clinic_name, person_name = case
         try:
             # 元 PDF のバイト列をそのまま再アップロード（マージ・コメント
             # ページ生成はしない）。出力ファイル名は元のまま。
@@ -498,7 +503,8 @@ def _process_attachments(
                 upload_result = drive_client.upload_pdf_to_clinic_person(
                     file_path=attachment_path,
                     output_root_folder_id=profile.output_folder_id,
-                    clinic_name=clinic_folder_name,
+                    clinic_number=clinic_number,
+                    clinic_name=clinic_name,
                     person_name=person_name,
                     file_name=file_name,
                 )
