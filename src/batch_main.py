@@ -34,10 +34,11 @@ from src.utils import (
     is_attachment_filename,
 )
 from src.config import LOGS_DIR
-from src import discover, drive_client, sheets_client
+from src import discover, drive_client, gmail_client, sheets_client
 from src import pdf_reader, comment_generator, pdf_creator, pdf_merger
 from src.discover import RunConfig
 from src.profile import ProfileConfig
+from src.sheets_client import EmailRecord
 
 
 # 添付資料 PDF の情報（file id / file name / 管理番号）を Step1→Step4 で
@@ -313,6 +314,14 @@ def step4_generate_pdfs(
     )
     clinics_recorded_this_run: set[str] = set()
 
+    # メールアドレス一覧シートを Step4 開始時に 1 回だけ読み込む。Gmail 下書き
+    # 作成時の TO/CC を ``lookup_email`` で引くためのスナップショット。シート
+    # 未作成なら自動作成（ヘッダーのみ）+ 空リストを返す。メイン経路と添付資料
+    # 経路（``_process_attachments``）で共有する（毎回読まない）。
+    email_records: list[EmailRecord] = sheets_client.read_email_records(
+        sheet_name=profile.email_sheet_name,
+    )
+
     def _record_clinic_folder(
         clinic_number: str, clinic_name: str, clinic_folder_id: str
     ) -> None:
@@ -391,24 +400,34 @@ def step4_generate_pdfs(
                     file_name=output_filename,
                 )
 
-            mgmt_num = extract_management_number(pdf_file_name)
-            if not mgmt_num:
-                logger.warning(
-                    f"管理番号をファイル名から抽出できません"
-                    f"（先頭が NNN-NN-N 形式でない）: {pdf_file_name}"
+                mgmt_num = extract_management_number(pdf_file_name)
+                if not mgmt_num:
+                    logger.warning(
+                        f"管理番号をファイル名から抽出できません"
+                        f"（先頭が NNN-NN-N 形式でない）: {pdf_file_name}"
+                    )
+                sheets_client.append_output_record(
+                    management_number=mgmt_num,
+                    clinic_name=clinic_name,
+                    person_name=person_name,
+                    sample_name=sample_title,
+                    drive_url=upload_result["webViewLink"],
+                    sheet_name=profile.output_sheet_name,
                 )
-            sheets_client.append_output_record(
-                management_number=mgmt_num,
-                clinic_name=clinic_name,
-                person_name=person_name,
-                sample_name=sample_title,
-                drive_url=upload_result["webViewLink"],
-                sheet_name=profile.output_sheet_name,
-            )
-            # 医院フォルダURLシートに医院を記録（同一医院は 1 行のみ）。
-            _record_clinic_folder(
-                clinic_number, clinic_name, upload_result["clinic_folder_id"]
-            )
+                # 医院フォルダURLシートに医院を記録（同一医院は 1 行のみ）。
+                _record_clinic_folder(
+                    clinic_number, clinic_name,
+                    upload_result["clinic_folder_id"],
+                )
+                # Gmail 下書きを作成（メール未登録ならスキップ・例外時も続行）。
+                # tempdir スコープ内で実行することで PDF ファイルにアクセスできる。
+                _create_gmail_draft_safe(
+                    email_records=email_records,
+                    clinic_number=clinic_number,
+                    person_name=person_name,
+                    pdf_path=output_path,
+                )
+
             # 添付資料パススルー用の対応表を構築。同じ管理番号の添付資料を
             # このメインと同じ出力フォルダへコピーするために使う。
             if mgmt_num:
@@ -432,7 +451,7 @@ def step4_generate_pdfs(
     # 番号のメインと同じ出力フォルダへ元ファイル名のままコピーする。AI 処理
     # （Claude API / コメントページ生成 / 結合）は一切しない。ファイルが
     # 存在しない（添付資料ゼロ）場合は何もしない。
-    _process_attachments(profile, case_map, stats)
+    _process_attachments(profile, case_map, stats, email_records)
 
     total = stats["success"] + stats["error"] + stats["missing"]
     logger.info(
@@ -442,10 +461,48 @@ def step4_generate_pdfs(
     )
 
 
+def _create_gmail_draft_safe(
+    email_records: list[EmailRecord],
+    clinic_number: str,
+    person_name: str,
+    pdf_path: Path,
+) -> None:
+    """PDF アップロード成功後の副作用として Gmail 下書きを作成する。
+
+    メールアドレス一覧シートから ``(医院番号, 個人名)`` でルックアップし、
+    TO（個人メール優先、無ければ医院メール）と CC（個人メール宛のときだけ
+    医院メールを CC）を決める。メール未登録ならスキップ（警告）。例外が
+    発生しても PDF 処理は止めずに次へ進む（fail-soft）。
+
+    下書きの重複作成防止は管理番号デデュープ（P-015）に依存。本関数では
+    独自のリトライ・重複チェックは行わない。
+    """
+    logger = setup_logging()
+    try:
+        to_email, cc_email = sheets_client.lookup_email(
+            email_records, clinic_number, person_name,
+        )
+        if to_email:
+            gmail_client.create_draft(
+                to_email=to_email,
+                person_name=person_name,
+                pdf_path=pdf_path,
+                cc_email=cc_email or None,
+            )
+        else:
+            logger.warning(
+                f"Gmail下書きスキップ: メール未登録 "
+                f"(医院番号={clinic_number}, 個人名={person_name})"
+            )
+    except Exception as e:
+        logger.error(f"Gmail下書き作成失敗（処理は続行）: {e}", exc_info=True)
+
+
 def _process_attachments(
     profile: ProfileConfig | RunConfig,
     case_map: dict[str, tuple[str, str, str]],
     stats: dict[str, int],
+    email_records: list[EmailRecord],
 ) -> None:
     """``batch_attachments.json`` を読み、添付資料をメインと同じ出力先へコピーする。
 
@@ -461,6 +518,8 @@ def _process_attachments(
         case_map: メイン処理で構築した管理番号 →
             ``(医院番号, 医院名, 個人名)`` の対応表
         stats: Step4 の統計 dict（``success`` / ``error`` をインプレース更新）
+        email_records: Step4 開始時に読み込んだメールアドレス一覧スナップショット。
+            メイン経路と共有する（毎回読まない）。
     """
     logger = setup_logging()
     attachments_file = LOGS_DIR / _BATCH_ATTACHMENTS_FILE
@@ -509,14 +568,25 @@ def _process_attachments(
                     file_name=file_name,
                 )
 
-            sheets_client.append_output_record(
-                management_number=mgmt_num,
-                clinic_name=clinic_name,
-                person_name=person_name,
-                sample_name=f"【添付資料】{file_name}",
-                drive_url=upload_result["webViewLink"],
-                sheet_name=profile.output_sheet_name,
-            )
+                sheets_client.append_output_record(
+                    management_number=mgmt_num,
+                    clinic_name=clinic_name,
+                    person_name=person_name,
+                    sample_name=f"【添付資料】{file_name}",
+                    drive_url=upload_result["webViewLink"],
+                    sheet_name=profile.output_sheet_name,
+                )
+
+                # 添付資料経路も Gmail 下書きを作成する（同じ個人宛、件名は
+                # メインと同じテンプレート）。メイン経路と同じ ``email_records``
+                # を共有し、API 呼び出しを 1 回読みで済ます。
+                _create_gmail_draft_safe(
+                    email_records=email_records,
+                    clinic_number=clinic_number,
+                    person_name=person_name,
+                    pdf_path=attachment_path,
+                )
+
             logger.info(
                 f"添付資料コピー完了: {mgmt_num} / {clinic_name} / "
                 f"{person_name} / {file_name}"

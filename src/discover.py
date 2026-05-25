@@ -37,7 +37,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from src import drive_client
-from src.config import GOOGLE_API_NUM_RETRIES
+from src.config import EMAIL_SHEET_NAME, GOOGLE_API_NUM_RETRIES
 from src.profile import ProfileConfig, load_profile
 from src.utils import normalize_name_for_match
 
@@ -65,11 +65,15 @@ class RunConfig:
     """main / batch_main の実行時に使う、プロファイル / 自動検出のどちらでも
     統一的に扱える設定。``step1_prepare`` / ``step4_generate_pdfs`` がこの
     インターフェースだけに依存することで、分岐コードを最小化する。
+
+    ``email_sheet_name`` は Gmail 下書きルックアップ用シート名。自動検出
+    モードでは Profile 由来ではないため ``EMAIL_SHEET_NAME`` の既定値を使う。
     """
     display_name: str
     input_folder_id: str
     output_folder_id: str
     output_sheet_name: str
+    email_sheet_name: str = EMAIL_SHEET_NAME
 
     @classmethod
     def from_profile(cls, profile: ProfileConfig) -> "RunConfig":
@@ -81,6 +85,7 @@ class RunConfig:
             input_folder_id=profile.input_folder_id,
             output_folder_id=profile.output_folder_id,
             output_sheet_name=profile.output_sheet_name,
+            email_sheet_name=profile.email_sheet_name,
         )
 
     @classmethod
