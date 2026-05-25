@@ -1072,15 +1072,19 @@ class TestLegacyBehaviorRegression(unittest.TestCase):
 
         main.run(test_count=0, profile_name="jissen_default")
 
-        # upload 呼び出しで医院フォルダ名 <医院番号>_<医院名> が渡される。
-        # 医院名部分の表記揺れはそのまま保持され、正規化は
-        # find_or_create_folder 内部で行われる（責務分離 / P-018）。
+        # upload 呼び出しで医院番号と医院名が別引数で渡される。医院名部分の
+        # 表記揺れはそのまま保持され、識別は医院番号で行われる（P-019）。
         # PDF は 001-00-0... / 002-00-0... なので医院番号は 001 / 002。
         upload_calls = mock_drive.upload_pdf_to_clinic_person.call_args_list
         self.assertEqual(len(upload_calls), 2)
-        clinics = [c.kwargs["clinic_name"] for c in upload_calls]
-        self.assertEqual(clinics[0], "001_医療法人 かがやき")
-        self.assertEqual(clinics[1], "002_医療法人かがやき")
+        self.assertEqual(upload_calls[0].kwargs["clinic_number"], "001")
+        self.assertEqual(
+            upload_calls[0].kwargs["clinic_name"], "医療法人 かがやき"
+        )
+        self.assertEqual(upload_calls[1].kwargs["clinic_number"], "002")
+        self.assertEqual(
+            upload_calls[1].kwargs["clinic_name"], "医療法人かがやき"
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -1566,9 +1570,13 @@ class TestAttachmentPassthroughE2E(unittest.TestCase):
 
         # メイン 1 件は Claude API に投げる、添付資料は投げない
         self.assertEqual(mock_gen.generate_comment_with_metadata.call_count, 1)
-        # upload は 2 回、両方とも同じ医院フォルダへ。医院フォルダ名は
-        # <医院番号>_<医院名>（管理番号 001-01-0 → 医院番号 001）。
+        # upload は 2 回、両方とも同じ医院番号 + 医院名で呼ばれる
+        # （find_or_create_clinic_folder が同じ医院フォルダへ合流させる、P-019）。
         self.assertEqual(mock_drive.upload_pdf_to_clinic_person.call_count, 2)
+        clinic_numbers = {
+            c.kwargs["clinic_number"]
+            for c in mock_drive.upload_pdf_to_clinic_person.call_args_list
+        }
         clinics = {
             c.kwargs["clinic_name"]
             for c in mock_drive.upload_pdf_to_clinic_person.call_args_list
@@ -1577,7 +1585,8 @@ class TestAttachmentPassthroughE2E(unittest.TestCase):
             c.kwargs["person_name"]
             for c in mock_drive.upload_pdf_to_clinic_person.call_args_list
         }
-        self.assertEqual(clinics, {"001_山田歯科"})
+        self.assertEqual(clinic_numbers, {"001"})
+        self.assertEqual(clinics, {"山田歯科"})
         self.assertEqual(persons, {"田中太郎"})
         # シートは 2 行。両方とも管理番号 001-01-0。メイン処理が先、添付資料が後。
         self.assertEqual(mock_sheets.append_output_record.call_count, 2)
@@ -1641,11 +1650,12 @@ class TestAttachmentPassthroughE2E(unittest.TestCase):
         submit_arg = mock_gen.submit_batch.call_args.args[0]
         self.assertEqual(len(submit_arg), 1)
         self.assertEqual(submit_arg[0]["pdf_file_name"], "001-01-0実践事例.pdf")
-        # upload は 2 回（メイン + 添付資料）、両方同じ医院フォルダへ。
-        # 医院フォルダ名は <医院番号>_<医院名>（管理番号 001-01-0 → 001）。
+        # upload は 2 回（メイン + 添付資料）、両方とも医院番号 001 + 医院名
+        # 山田歯科で呼ばれる（同じ医院フォルダへ合流、P-019）。
         self.assertEqual(mock_drive.upload_pdf_to_clinic_person.call_count, 2)
         att_upload = mock_drive.upload_pdf_to_clinic_person.call_args_list[1]
-        self.assertEqual(att_upload.kwargs["clinic_name"], "001_山田歯科")
+        self.assertEqual(att_upload.kwargs["clinic_number"], "001")
+        self.assertEqual(att_upload.kwargs["clinic_name"], "山田歯科")
         self.assertEqual(att_upload.kwargs["person_name"], "田中太郎")
         self.assertEqual(
             att_upload.kwargs["file_name"], "001-01-0【添付資料】補足資料.pdf"
@@ -1713,13 +1723,18 @@ class TestClinicNumberFolderE2E(unittest.TestCase):
 
         main.run(test_count=0, profile_name="jissen_default")
 
-        # 全 3 件、医院フォルダ名は <医院番号>_<医院名>
-        clinic_folders = [
+        # 全 3 件、upload には医院番号 + 医院名が別引数で渡る
+        clinic_numbers = [
+            c.kwargs["clinic_number"]
+            for c in mock_drive.upload_pdf_to_clinic_person.call_args_list
+        ]
+        clinic_names_upload = [
             c.kwargs["clinic_name"]
             for c in mock_drive.upload_pdf_to_clinic_person.call_args_list
         ]
+        self.assertEqual(clinic_numbers, ["001", "001", "002"])
         self.assertEqual(
-            clinic_folders, ["001_山田歯科", "001_山田歯科", "002_山田歯科"]
+            clinic_names_upload, ["山田歯科", "山田歯科", "山田歯科"]
         )
         # 出力一覧シートの医院名列は AI 抽出値（医院番号なし）
         for c in mock_sheets.append_output_record.call_args_list:
@@ -1808,16 +1823,112 @@ class TestClinicNumberFolderE2E(unittest.TestCase):
                 profile_name="jissen_default",
             )
 
-        clinic_folders = {
-            c.kwargs["clinic_name"]
+        # 全 2 件、upload には医院番号 + 医院名が別引数で渡る
+        clinic_numbers_upload = sorted(
+            c.kwargs["clinic_number"]
             for c in mock_drive.upload_pdf_to_clinic_person.call_args_list
-        }
-        self.assertEqual(clinic_folders, {"001_山田歯科", "002_山田歯科"})
+        )
+        self.assertEqual(clinic_numbers_upload, ["001", "002"])
+        for c in mock_drive.upload_pdf_to_clinic_person.call_args_list:
+            self.assertEqual(c.kwargs["clinic_name"], "山田歯科")
         recorded = sorted(
             c.kwargs["clinic_number"]
             for c in mock_sheets.append_clinic_folder_record.call_args_list
         )
         self.assertEqual(recorded, ["001", "002"])
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 12. 医院フォルダ識別が医院番号ベースであることの E2E スモークテスト
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestClinicFolderByNumberE2E(unittest.TestCase):
+    """同じ医院の複数 PDF が、AI 抽出医院名の表記揺れに関わらず同じフォルダに
+    入る E2E（P-019: 医院フォルダの識別は医院番号のみ、医院名表記揺れは
+    無視）。"""
+
+    def setUp(self):
+        self._env_patcher = patch.dict(os.environ, _PROFILE_ENV, clear=False)
+        self._env_patcher.start()
+
+    def tearDown(self):
+        self._env_patcher.stop()
+
+    @patch("src.main.ensure_fonts")
+    @patch("src.main.pdf_merger")
+    @patch("src.main.pdf_creator")
+    @patch("src.main.pdf_reader")
+    @patch("src.main.comment_generator")
+    @patch("src.main.sheets_client")
+    @patch("src.main.drive_client")
+    def test_same_clinic_number_with_name_variations_uses_same_folder(
+        self, mock_drive, mock_sheets, mock_gen, mock_reader,
+        mock_creator, mock_merger, mock_fonts,
+    ):
+        """同じ医院番号 001 の 3 件の PDF で、AI が異なる医院名表記
+        （``三浦歯科医院`` / ``三浦歯科`` / ``医療法人三浦歯科``）を抽出しても、
+        ``upload_pdf_to_clinic_person`` は同じ医院番号で呼ばれ、
+        ``find_or_create_clinic_folder`` が同じ医院フォルダへ合流させる
+        前提を確認する（識別は医院番号のみ、P-019）。"""
+        mock_drive.list_pdfs.return_value = [
+            {"id": "id_1", "name": "001-01-0実践事例A.pdf"},
+            {"id": "id_2", "name": "001-01-1実践事例B.pdf"},
+            {"id": "id_3", "name": "001-01-2実践事例C.pdf"},
+        ]
+        mock_drive.download_pdf.return_value = b"%PDF-1.4 fake"
+        mock_drive.upload_pdf_to_clinic_person.return_value = {
+            "webViewLink": "https://drive.google.com/fake",
+            "clinic_folder_id": "clinic_folder_id_xyz",
+        }
+        mock_sheets.get_processed_management_numbers.return_value = set()
+        mock_sheets.get_recorded_clinic_numbers.return_value = set()
+        mock_reader.extract_text.return_value = "PDFテキスト"
+        # AI 抽出側の医院名表記揺れ — 同じ医院番号 001 でも語が違う
+        mock_gen.generate_comment_with_metadata.side_effect = [
+            {
+                "clinic_name": "三浦歯科医院",
+                "person_name": "白川 蓮",
+                "sample_title": "事例A",
+                "comment": "コメント1",
+            },
+            {
+                "clinic_name": "三浦歯科",  # 「医院」が抜けた揺れ（P-009 では吸収不可）
+                "person_name": "白川 蓮",
+                "sample_title": "事例B",
+                "comment": "コメント2",
+            },
+            {
+                "clinic_name": "医療法人三浦歯科",  # 法人名が前に付いた揺れ
+                "person_name": "白川 蓮",
+                "sample_title": "事例C",
+                "comment": "コメント3",
+            },
+        ]
+        mock_merger.make_output_filename.return_value = "out.pdf"
+
+        main.run(test_count=0, profile_name="jissen_default")
+
+        # 3 件全て upload され、全て医院番号 001 で呼ばれる
+        upload_calls = mock_drive.upload_pdf_to_clinic_person.call_args_list
+        self.assertEqual(len(upload_calls), 3)
+        for c in upload_calls:
+            self.assertEqual(c.kwargs["clinic_number"], "001")
+        # 医院名は表記が違ったまま、生の AI 抽出値が伝搬する
+        # （新規作成時のフォルダ名末尾用 / 出力一覧シート列用）
+        clinic_names_upload = [c.kwargs["clinic_name"] for c in upload_calls]
+        self.assertEqual(
+            clinic_names_upload,
+            ["三浦歯科医院", "三浦歯科", "医療法人三浦歯科"],
+        )
+        # 医院フォルダURLシートには医院番号 001 で 1 行のみ
+        # （find_or_create_clinic_folder が同じフォルダに合流させる前提なので、
+        # clinics_recorded_this_run のスナップショット重複防止が効く）
+        recorded = [
+            c.kwargs["clinic_number"]
+            for c in mock_sheets.append_clinic_folder_record.call_args_list
+        ]
+        self.assertEqual(recorded, ["001"])
 
 
 if __name__ == "__main__":
