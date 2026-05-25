@@ -11,6 +11,7 @@ from typing import Any
 from googleapiclient.discovery import build
 
 from src.config import (
+    EMAIL_SHEET_NAME,
     GOOGLE_API_NUM_RETRIES,
     GOOGLE_CREDENTIALS_JSON,
     GOOGLE_SCOPES,
@@ -469,3 +470,161 @@ def append_clinic_folder_record(
         f"Sheets: 医院フォルダURLシートに追加 "
         f"({clinic_number} / {clinic_name} / {clinic_folder_url})"
     )
+
+
+# ── メールアドレス一覧シート（Gmail 下書き作成用ルックアップ表） ──
+
+
+@dataclass
+class EmailRecord:
+    """メールアドレスシートの 1 行。
+
+    1 行 per (医院, 個人)。医院メール（E 列）は同一医院の複数行で重複記入可
+    （ユーザー側の利便性のため）。
+    """
+    clinic_number: str  # A 列: 医院番号
+    clinic_name: str    # B 列: 医院名（参照用）
+    person_name: str    # C 列: 個人名
+    person_email: str   # D 列: 個人メール
+    clinic_email: str   # E 列: 医院メール
+
+
+_EMAIL_SHEET_HEADER = [
+    "医院番号", "医院名", "個人名", "個人メール", "医院メール"
+]
+
+
+def _ensure_email_sheet(
+    service: Any,
+    spreadsheet_id: str,
+    sheet_name: str,
+) -> None:
+    """メールアドレス一覧シート（5列）が無ければ作成し、ヘッダー行を書き込む。"""
+    _ensure_sheet_with_header(
+        service, spreadsheet_id, sheet_name, _EMAIL_SHEET_HEADER
+    )
+
+
+def read_email_records(
+    spreadsheet_id: str | None = None,
+    sheet_name: str | None = None,
+) -> list[EmailRecord]:
+    """メールアドレス一覧シートから全行を読み取る。
+
+    シートが存在しなければ自動作成し（ヘッダーのみ書き込む）空リストを返す。
+    形式不正のメールはログ警告して空扱い（既存 ``_validate_email`` を使う）。
+    医院番号・個人名のどちらも空の行は読み飛ばす。
+
+    Args:
+        spreadsheet_id: スプレッドシートID（省略時は設定値 ``SPREADSHEET_ID``）
+        sheet_name: シート名（省略時は設定値 ``EMAIL_SHEET_NAME``）
+
+    Returns:
+        EmailRecord のリスト。シート新規作成直後（ヘッダーのみ）は空リスト。
+    """
+    spreadsheet_id = spreadsheet_id or SPREADSHEET_ID
+    if not spreadsheet_id:
+        raise ValueError("SPREADSHEET_IDが設定されていません")
+    sheet_name = sheet_name or EMAIL_SHEET_NAME
+
+    service = get_sheets_service()
+    _ensure_email_sheet(service, spreadsheet_id, sheet_name)
+
+    result = service.spreadsheets().values().get(
+        spreadsheetId=spreadsheet_id,
+        range=f"{sheet_name}!A:E",
+    ).execute(num_retries=GOOGLE_API_NUM_RETRIES)
+
+    rows = result.get("values", [])
+    if not rows:
+        logger.info(
+            f"Sheets: メールアドレスシートが空 (ヘッダーのみ): {sheet_name}"
+        )
+        return []
+
+    records: list[EmailRecord] = []
+    # ヘッダー行はスキップ（A1 はヘッダー）
+    for i, row in enumerate(rows[1:], start=2):
+        # 列が足りない場合は空文字で補完
+        while len(row) < 5:
+            row.append("")
+
+        clinic_number = (row[0] or "").strip()
+        clinic_name = (row[1] or "").strip()
+        person_name = (row[2] or "").strip()
+        person_email = (row[3] or "").strip()
+        clinic_email = (row[4] or "").strip()
+
+        # 医院番号も個人名も両方空の行は無視（空行 / コメント行扱い）
+        if not clinic_number and not person_name:
+            continue
+
+        if person_email and not _validate_email(person_email):
+            logger.warning(
+                f"Sheets: メールシート 行{i} 個人メールの形式が不正のため空扱い"
+            )
+            person_email = ""
+        if clinic_email and not _validate_email(clinic_email):
+            logger.warning(
+                f"Sheets: メールシート 行{i} 医院メールの形式が不正のため空扱い"
+            )
+            clinic_email = ""
+
+        records.append(EmailRecord(
+            clinic_number=clinic_number,
+            clinic_name=clinic_name,
+            person_name=person_name,
+            person_email=person_email,
+            clinic_email=clinic_email,
+        ))
+
+    logger.info(
+        f"Sheets: メールアドレスシート {len(records)}件を取得 ({sheet_name})"
+    )
+    return records
+
+
+def lookup_email(
+    records: list[EmailRecord],
+    clinic_number: str,
+    person_name: str,
+) -> tuple[str, str]:
+    """メールルックアップ。``(to_email, cc_email)`` を返す。
+
+    ルールの優先順位:
+        1. ``(clinic_number, person_name)`` 完全一致行があり、個人メール非空
+           → ``(個人メール, 医院メール)``  ※医院メール空なら ``(個人メール, "")``
+        2. 上記行で個人メール空、医院メール非空 → ``(医院メール, "")``
+        3. 完全一致行が無い → 同じ ``clinic_number`` の他の行を 1 つ拾い
+           その E 列を医院メールとして使う → ``(医院メール, "")``
+        4. すべて空 → ``("", "")``
+
+    呼び出し側は ``to_email`` が空でない場合のみ下書きを作る。
+
+    Args:
+        records: ``read_email_records`` の戻り値
+        clinic_number: 医院番号（管理番号の先頭セグメント）
+        person_name: 個人名（AI 抽出値）
+
+    Returns:
+        ``(to_email, cc_email)``。どちらも空文字列ならメール未登録扱い。
+    """
+    # 1. 完全一致を探す
+    for r in records:
+        if r.clinic_number == clinic_number and r.person_name == person_name:
+            if r.person_email:
+                # 個人メールあり → TO=個人, CC=医院（医院メールが空ならCCなし）
+                return (r.person_email, r.clinic_email)
+            if r.clinic_email:
+                # 個人メール空、医院メールあり → TO=医院
+                return (r.clinic_email, "")
+            # 両方空 → 同じ医院番号の他の行へフォールバックさせる
+            break
+
+    # 3. 同じ医院番号の他の行から医院メールを 1 つ拾う
+    for r in records:
+        if r.clinic_number == clinic_number and r.clinic_email:
+            return (r.clinic_email, "")
+
+    # 4. すべて空
+    return ("", "")
