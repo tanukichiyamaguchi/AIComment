@@ -77,6 +77,21 @@ passthrough 対象も「処理した」記録は残す（出力一覧シート�
 `find_or_create_folder` の正規化マッチング（P-009）に委ねる。識別子部分は
 機械抽出で安定しているが、名前部分は揺れる前提で設計する。
 
+### P-019: 識別子付き複合フォルダ名は識別子部分でのみマッチさせよ
+医院フォルダ名を `<医院番号>_<医院名>` 形式にしたとき、フォルダの照合に
+名前全体を使うと、AI 抽出側の医院名表記揺れ（`三浦歯科医院` vs `三浦歯科`
+vs `医療法人三浦歯科`）で「同じ医院番号の別フォルダ」が量産される。
+NFKC + 空白除去の正規化（P-009）は語そのものの違いを吸収できない。
+**Rule**: 識別子と表示名を結合したフォルダ名（例 `<ID>_<表示名>`）の
+存在チェックは、**識別子部分でのみ前方一致** で行う。表示名部分は重複
+作成の判定材料にしない。新規作成時のフォルダ名には表示名を含めて
+良いが、再利用判定では表示名を無視する。識別子が空の場合のみ、
+表示名ベースのマッチング（P-009）にフォールバックする。同じ識別子で
+複数のフォルダが既存する（このルール導入前にできた重複）場合は、
+ID 昇順で決定論的に 1 つ選ぶ + 警告ログに重複一覧を出して手動統合を促す
+（自動統合・自動リネームは破壊的変更となるため行わない）。実装例:
+`src/drive_client.find_or_create_clinic_folder`。
+
 ## Session Log
 - **2026-03-16**: Project initialized with workflow orchestration architecture.
 - **2026-05-01**: Added 5-agent team and 3 deterministic check scripts to handle 1000+ PDF scale. Each agent owns one of the failure modes in P-001 through P-005. See `tasks/todo.md` Phase 6 for the standard operating sequence.
@@ -88,3 +103,4 @@ passthrough 対象も「処理した」記録は残す（出力一覧シート�
 - **2026-05-21**: 添付資料ファイルのパススルー処理を追加。ファイル名に「【添付資料】」を含む PDF は実践事例の補足資料であり、AI 処理（テキスト抽出 / Claude API / コメントページ生成 / PDF 結合）を一切せず、同じ管理番号（`NNN-NN-N`）のメイン実践事例 PDF と同じ `<医院名>/<個人名>/` フォルダへ元ファイル名のままコピーする。入力をファイル名で「メイン」「添付資料」に早期分類し（`utils.is_attachment_filename`）、メイン処理ループで管理番号 → `(医院名, 個人名)` の対応表を構築、添付資料はその表を引いてコピー + 出力一覧シートに「【添付資料】<元名>」で記録。Batch モードでは添付資料を Claude API に投げず、`batch_attachments.json`（`batch_prep.json` とは別ファイル）で Step1→Step4 に引き継ぎ、Step4 でメインと同じフォルダへコピー。重複判定セットは実行開始時の 1 スナップショットで、メイン処理が同一実行内の添付資料判定に影響しないようにした。メイン不在の添付資料は警告つきスキップ。P-016 を追加。テスト 319 → 342 件（`is_attachment_filename` 8 件、通常モード 7 件、Batch モード 6 件、integration smoke 2 件）。
 - **2026-05-21**: Google Sheets/Drive API に一過性エラーの自動リトライを追加。本番のフォルダ自動検出モード実行中、`sheets_client.get_processed_management_numbers` 内の `spreadsheets().get(...).execute()` が Sheets API の 503（The service is currently unavailable）でクラッシュした。RCA: Google API クライアント（`sheets_client.py` / `drive_client.py` / `discover.py`）はリトライ機構を持たず、5xx・429 が 1 回起きるとワークフロー全体が落ちる。修正: `config.py` に `GOOGLE_API_NUM_RETRIES = 5` を定義し、grep で洗い出した全 14 件の `.execute()`（sheets 9・drive 4・discover 1）と `download_pdf` の `next_chunk` 1 件に `num_retries` を付与。`googleapiclient` が 5xx/429 を指数バックオフ + ジッターで自動再試行する（4xx の恒久エラーはリトライしない正しい挙動）。P-017 を追加。テスト 342 → 350 件（リトライ引数検証 8 件追加）。
 - **2026-05-21**: 医院フォルダ名に医院番号を前置 + 医院フォルダURLシートを追加。(1) 医院フォルダ名を `<医院番号>_<医院名>`（例 `001_三浦歯科医院`）に変更。医院番号は管理番号 `NNN-NN-N` の先頭セグメント（`utils.extract_clinic_number`）。管理番号の先頭セグメントが 3〜5 桁可変になったため `extract_management_number` の正規表現を `^\d{3}-\d{2}-\d` → `^\d{3,5}-\d{2}-\d` に拡張（4〜5 桁医院番号の PDF がスキップされていた）。(2) 医院ごとに 1 行、医院フォルダ URL を `<出力シート名>_医院` シート（3 列: 医院番号 / 医院名 / 医院フォルダURL）へ記録。`sheets_client` に `get_recorded_clinic_numbers` / `append_clinic_folder_record` を追加し、`_ensure_output_sheet` をヘッダー長から列数を決める汎用ヘルパー `_ensure_sheet_with_header` に一般化。重複記録防止は実行開始時のスナップショット + in-memory set。`drive_client.upload_pdf_to_clinic_person` の戻り値に `clinic_folder_id` を追加。出力一覧シート（6 列）の医院名列は AI 抽出値そのまま（医院番号なし）を維持。添付資料もメインと同じ医院番号付きフォルダへコピー。P-018 を追加。テスト 350 → 390 件（`extract_clinic_number` 11 件、`extract_management_number` 桁数拡張 2 件、sheets 22 件、drive 1 件、main 5 件、batch_main 5 件、integration smoke 3 件 ほか）。既存の番号なしフォルダは孤立する（自動移行はしない）。
+- **2026-05-25**: 医院フォルダの識別を医院番号ベースに変更（名前表記揺れで重複作成しない）。PR #33 で医院フォルダ名を `<医院番号>_<医院名>` 形式にしたが、フォルダの検索・再利用にフォルダ名全体を使っており、AI が同じ医院でも医院名を違う表記で抽出すると（`三浦歯科医院` vs `三浦歯科` vs `医療法人三浦歯科`）同じ医院番号で別フォルダが量産されていた。P-009 の正規化（NFKC＋空白除去）は語そのものの違い（接尾語の有無）を吸収できない。`drive_client.find_or_create_clinic_folder` を新規追加し、医院フォルダの **識別キーを医院番号のみ**（フォルダ名の `<医院番号>_` プレフィックス前方一致）に変更。既存フォルダ再利用時は医院名部分が違っても **リネームしない**。同じ医院番号で複数フォルダが既存する場合（本修正前にできた重複）→ フォルダID昇順で決定論的に1つ選ぶ + 警告ログに重複ID一覧を出し手動統合を促す。医院番号が空（管理番号なし）の PDF は元の名前ベース照合にフォールバック。`drive_client.upload_pdf_to_clinic_person` のシグネチャを `clinic_number` + `clinic_name` の別引数に変更。main / batch_main の呼び出し側を、医院フォルダ名 pre-build (`f"{n}_{name}"`) から `clinic_number` / `clinic_name` を分離して渡すように変更。case_map (添付資料パススルー対応表) も `(医院フォルダ名, 医院名, 個人名)` から `(医院番号, 医院名, 個人名)` に変更し、添付資料アップロード時に同じ `find_or_create_clinic_folder` 経由でメインと同じ医院フォルダへ合流させる。P-019 を追加。テスト 390 → 401 件。
