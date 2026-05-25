@@ -92,6 +92,26 @@ ID 昇順で決定論的に 1 つ選ぶ + 警告ログに重複一覧を出し�
 （自動統合・自動リネームは破壊的変更となるため行わない）。実装例:
 `src/drive_client.find_or_create_clinic_folder`。
 
+### P-020: 副作用は本処理の冪等キーに従わせる（独自の重複チェックを足さない）
+Gmail 下書き作成を本処理フロー（main / batch_main の Step4）に組み込む際、
+「下書きが既にあるか」を独自にチェックしてリトライ・スキップする機構を
+作るのは過剰設計になる。下書きは PDF 処理の **副作用** であり、PDF 処理
+自体が管理番号で冪等（P-015）になっている以上、副作用も自動的に冪等になる
+（PDF 処理がスキップされれば副作用もスキップされる）。逆に、副作用側で
+独自の重複検知（draft の subject 検索など）を入れると、(a) 管理番号デデュープ
+との二重防壁になりロジックが分散する、(b) 管理番号デデュープが効かない
+ケース（管理番号なし PDF）でも副作用だけ動いて整合性が崩れる、(c) ユーザー
+が再処理したいとき、出力シート行の削除に加えて draft の削除も必要になり
+運用が複雑化する。**Rule**: 副作用（メール下書き / Slack 通知 / Webhook
+コール等）は本処理の冪等キーに従わせる。本処理がスキップされたら副作用も
+動かない、本処理が再実行されたら副作用も再実行される、という関係を保つ。
+副作用側に独自のリトライ・重複チェックを足したくなったら、まず本処理の
+冪等キーで十分かを確認する。後からメールアドレスを記入しても、その管理
+番号が既に処理済みなら下書きは再作成されない（運用上は問題なし＝再処理
+が必要なら出力シートの該当行を手動削除する、と説明しておく）。副作用の
+失敗は警告ログだけ出して処理を続行する（fail-soft）。実装例:
+`src/main._create_gmail_draft` / `src/batch_main._create_gmail_draft_safe`。
+
 ## Session Log
 - **2026-03-16**: Project initialized with workflow orchestration architecture.
 - **2026-05-01**: Added 5-agent team and 3 deterministic check scripts to handle 1000+ PDF scale. Each agent owns one of the failure modes in P-001 through P-005. See `tasks/todo.md` Phase 6 for the standard operating sequence.
@@ -104,3 +124,4 @@ ID 昇順で決定論的に 1 つ選ぶ + 警告ログに重複一覧を出し�
 - **2026-05-21**: Google Sheets/Drive API に一過性エラーの自動リトライを追加。本番のフォルダ自動検出モード実行中、`sheets_client.get_processed_management_numbers` 内の `spreadsheets().get(...).execute()` が Sheets API の 503（The service is currently unavailable）でクラッシュした。RCA: Google API クライアント（`sheets_client.py` / `drive_client.py` / `discover.py`）はリトライ機構を持たず、5xx・429 が 1 回起きるとワークフロー全体が落ちる。修正: `config.py` に `GOOGLE_API_NUM_RETRIES = 5` を定義し、grep で洗い出した全 14 件の `.execute()`（sheets 9・drive 4・discover 1）と `download_pdf` の `next_chunk` 1 件に `num_retries` を付与。`googleapiclient` が 5xx/429 を指数バックオフ + ジッターで自動再試行する（4xx の恒久エラーはリトライしない正しい挙動）。P-017 を追加。テスト 342 → 350 件（リトライ引数検証 8 件追加）。
 - **2026-05-21**: 医院フォルダ名に医院番号を前置 + 医院フォルダURLシートを追加。(1) 医院フォルダ名を `<医院番号>_<医院名>`（例 `001_三浦歯科医院`）に変更。医院番号は管理番号 `NNN-NN-N` の先頭セグメント（`utils.extract_clinic_number`）。管理番号の先頭セグメントが 3〜5 桁可変になったため `extract_management_number` の正規表現を `^\d{3}-\d{2}-\d` → `^\d{3,5}-\d{2}-\d` に拡張（4〜5 桁医院番号の PDF がスキップされていた）。(2) 医院ごとに 1 行、医院フォルダ URL を `<出力シート名>_医院` シート（3 列: 医院番号 / 医院名 / 医院フォルダURL）へ記録。`sheets_client` に `get_recorded_clinic_numbers` / `append_clinic_folder_record` を追加し、`_ensure_output_sheet` をヘッダー長から列数を決める汎用ヘルパー `_ensure_sheet_with_header` に一般化。重複記録防止は実行開始時のスナップショット + in-memory set。`drive_client.upload_pdf_to_clinic_person` の戻り値に `clinic_folder_id` を追加。出力一覧シート（6 列）の医院名列は AI 抽出値そのまま（医院番号なし）を維持。添付資料もメインと同じ医院番号付きフォルダへコピー。P-018 を追加。テスト 350 → 390 件（`extract_clinic_number` 11 件、`extract_management_number` 桁数拡張 2 件、sheets 22 件、drive 1 件、main 5 件、batch_main 5 件、integration smoke 3 件 ほか）。既存の番号なしフォルダは孤立する（自動移行はしない）。
 - **2026-05-25**: 医院フォルダの識別を医院番号ベースに変更（名前表記揺れで重複作成しない）。PR #33 で医院フォルダ名を `<医院番号>_<医院名>` 形式にしたが、フォルダの検索・再利用にフォルダ名全体を使っており、AI が同じ医院でも医院名を違う表記で抽出すると（`三浦歯科医院` vs `三浦歯科` vs `医療法人三浦歯科`）同じ医院番号で別フォルダが量産されていた。P-009 の正規化（NFKC＋空白除去）は語そのものの違い（接尾語の有無）を吸収できない。`drive_client.find_or_create_clinic_folder` を新規追加し、医院フォルダの **識別キーを医院番号のみ**（フォルダ名の `<医院番号>_` プレフィックス前方一致）に変更。既存フォルダ再利用時は医院名部分が違っても **リネームしない**。同じ医院番号で複数フォルダが既存する場合（本修正前にできた重複）→ フォルダID昇順で決定論的に1つ選ぶ + 警告ログに重複ID一覧を出し手動統合を促す。医院番号が空（管理番号なし）の PDF は元の名前ベース照合にフォールバック。`drive_client.upload_pdf_to_clinic_person` のシグネチャを `clinic_number` + `clinic_name` の別引数に変更。main / batch_main の呼び出し側を、医院フォルダ名 pre-build (`f"{n}_{name}"`) から `clinic_number` / `clinic_name` を分離して渡すように変更。case_map (添付資料パススルー対応表) も `(医院フォルダ名, 医院名, 個人名)` から `(医院番号, 医院名, 個人名)` に変更し、添付資料アップロード時に同じ `find_or_create_clinic_folder` 経由でメインと同じ医院フォルダへ合流させる。P-019 を追加。テスト 390 → 401 件。
+- **2026-05-25**: Gmail 下書きの本処理フロー組み込み。`src/gmail_client.create_draft` は実装済みだったが main / batch_main から呼ばれていなかった（README §391 で「v2 では未使用」と明記済み）。設計: スプレッドシートに新規タブ `メールアドレス一覧`（5列: 医院番号 / 医院名 / 個人名 / 個人メール / 医院メール）を追加し、`sheets_client.read_email_records` で読み込み、`lookup_email` で `(医院番号, 個人名)` 完全一致 → 個人メール優先で TO 決定、医院メールは個人メールあり時のみ CC（無いとき TO に降格）、完全一致なしのとき同じ医院番号の他の行から医院メールを 1 つ拾うフォールバック、すべて空ならスキップ + 警告。`create_draft` に `cc_email` 引数を追加。`ProfileConfig` / `RunConfig` に `email_sheet_name` を追加（YAML 省略可、既定値は `EMAIL_SHEET_NAME` = `メールアドレス一覧`）。`email_records` はメインループ開始前に 1 回だけ読み込み、メイン経路 + 添付資料経路で共有（API 呼び出しを 1 回読みで済ます）。下書きは PDF アップロード成功後・シート追記後の位置に組み込み、例外は `logger.error` でログ出して処理続行（fail-soft）。下書き重複作成防止は管理番号デデュープ（P-015）に依存し、独自リトライ・重複チェックは入れない（P-020）。テスト 401 → 436 件（gmail_client 6 件 / sheets_client 16 件 / main 6 件 / batch_main 5 件 / integration smoke 2 件）。P-020 を追加。
