@@ -10,5 +10,10 @@ output_folder_id_secret: DRIVE_OUTPUT_FOLDER_ID
 # 既存の OUTPUT_SHEET_NAME と同一値（後方互換）
 output_sheet_name: "出力一覧"
 
+# 参加者マスターシート名（Gmail 下書きの TO ルックアップに使用）。
+# 省略するとデフォルト "参加者マスター" タブを自動作成→空のまま使用してしまい、
+# 全下書きの宛先が空になる事故が起きるため、運用中の実タブ名を明示する。
+master_sheet_name: "テスト5_参加者マスター"
+
 # プロンプトテンプレート識別子（既存挙動）
 prompt_template: jissen_practice_case
