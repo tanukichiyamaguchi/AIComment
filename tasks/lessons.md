@@ -112,6 +112,23 @@ Gmail 下書き作成を本処理フロー（main / batch_main の Step4）に�
 失敗は警告ログだけ出して処理を続行する（fail-soft）。実装例:
 `src/main._create_gmail_draft` / `src/batch_main._create_gmail_draft_safe`。
 
+### P-021: 副作用 (Gmail 下書き) と表示用標準化 (医院名) を同じマスターシートに統合する
+PR #35 で「メールアドレス一覧シート」（Gmail 下書きの TO/CC 用）を導入した直後、
+ユーザーから「既に運用している管理シート（管理番号 / 医院名 / 参加者名 / 会場 /
+メールアドレス）を 1 つ使い、医院フォルダの命名にも使いたい」という要望が来た。
+別々のシートで lookup する（複数シートを保守する）より、**ユーザーが既に運用
+している 1 シートを唯一の真実とする** ほうが運用が単純になる。
+**Rule**: 似た用途の lookup（表示用標準化 / 副作用の送信先 など）を別シートに
+分けたくなったら、まず「ユーザーが運用している 1 シート」に統合できないかを
+検討する。1 シート 2 用途は (a) ユーザーの保守負担が 1 か所に集約される、(b)
+データの整合性（同じ医院番号で別シートの医院名が違う等）の心配がない、(c)
+新セミナーごとの初期設定が「1 シート + 1 タブ名」だけになる、というメリットが
+ある。lookup ミス時の fallback は **用途別に振る舞いを分ける**:
+表示用（医院名）→ AI 抽出値で代用 + 警告ログ（処理は続ける）、
+副作用（メール送信）→ スキップ + 警告ログ（fail-soft、PDF 処理は続ける）。
+代用時は必ずログを出す（サイレント代用は事故の元）。実装例: `src/sheets_client.MasterRecord` /
+`lookup_clinic_name` / `lookup_email_by_management_number`。
+
 ## Session Log
 - **2026-03-16**: Project initialized with workflow orchestration architecture.
 - **2026-05-01**: Added 5-agent team and 3 deterministic check scripts to handle 1000+ PDF scale. Each agent owns one of the failure modes in P-001 through P-005. See `tasks/todo.md` Phase 6 for the standard operating sequence.
@@ -125,3 +142,4 @@ Gmail 下書き作成を本処理フロー（main / batch_main の Step4）に�
 - **2026-05-21**: 医院フォルダ名に医院番号を前置 + 医院フォルダURLシートを追加。(1) 医院フォルダ名を `<医院番号>_<医院名>`（例 `001_三浦歯科医院`）に変更。医院番号は管理番号 `NNN-NN-N` の先頭セグメント（`utils.extract_clinic_number`）。管理番号の先頭セグメントが 3〜5 桁可変になったため `extract_management_number` の正規表現を `^\d{3}-\d{2}-\d` → `^\d{3,5}-\d{2}-\d` に拡張（4〜5 桁医院番号の PDF がスキップされていた）。(2) 医院ごとに 1 行、医院フォルダ URL を `<出力シート名>_医院` シート（3 列: 医院番号 / 医院名 / 医院フォルダURL）へ記録。`sheets_client` に `get_recorded_clinic_numbers` / `append_clinic_folder_record` を追加し、`_ensure_output_sheet` をヘッダー長から列数を決める汎用ヘルパー `_ensure_sheet_with_header` に一般化。重複記録防止は実行開始時のスナップショット + in-memory set。`drive_client.upload_pdf_to_clinic_person` の戻り値に `clinic_folder_id` を追加。出力一覧シート（6 列）の医院名列は AI 抽出値そのまま（医院番号なし）を維持。添付資料もメインと同じ医院番号付きフォルダへコピー。P-018 を追加。テスト 350 → 390 件（`extract_clinic_number` 11 件、`extract_management_number` 桁数拡張 2 件、sheets 22 件、drive 1 件、main 5 件、batch_main 5 件、integration smoke 3 件 ほか）。既存の番号なしフォルダは孤立する（自動移行はしない）。
 - **2026-05-25**: 医院フォルダの識別を医院番号ベースに変更（名前表記揺れで重複作成しない）。PR #33 で医院フォルダ名を `<医院番号>_<医院名>` 形式にしたが、フォルダの検索・再利用にフォルダ名全体を使っており、AI が同じ医院でも医院名を違う表記で抽出すると（`三浦歯科医院` vs `三浦歯科` vs `医療法人三浦歯科`）同じ医院番号で別フォルダが量産されていた。P-009 の正規化（NFKC＋空白除去）は語そのものの違い（接尾語の有無）を吸収できない。`drive_client.find_or_create_clinic_folder` を新規追加し、医院フォルダの **識別キーを医院番号のみ**（フォルダ名の `<医院番号>_` プレフィックス前方一致）に変更。既存フォルダ再利用時は医院名部分が違っても **リネームしない**。同じ医院番号で複数フォルダが既存する場合（本修正前にできた重複）→ フォルダID昇順で決定論的に1つ選ぶ + 警告ログに重複ID一覧を出し手動統合を促す。医院番号が空（管理番号なし）の PDF は元の名前ベース照合にフォールバック。`drive_client.upload_pdf_to_clinic_person` のシグネチャを `clinic_number` + `clinic_name` の別引数に変更。main / batch_main の呼び出し側を、医院フォルダ名 pre-build (`f"{n}_{name}"`) から `clinic_number` / `clinic_name` を分離して渡すように変更。case_map (添付資料パススルー対応表) も `(医院フォルダ名, 医院名, 個人名)` から `(医院番号, 医院名, 個人名)` に変更し、添付資料アップロード時に同じ `find_or_create_clinic_folder` 経由でメインと同じ医院フォルダへ合流させる。P-019 を追加。テスト 390 → 401 件。
 - **2026-05-25**: Gmail 下書きの本処理フロー組み込み。`src/gmail_client.create_draft` は実装済みだったが main / batch_main から呼ばれていなかった（README §391 で「v2 では未使用」と明記済み）。設計: スプレッドシートに新規タブ `メールアドレス一覧`（5列: 医院番号 / 医院名 / 個人名 / 個人メール / 医院メール）を追加し、`sheets_client.read_email_records` で読み込み、`lookup_email` で `(医院番号, 個人名)` 完全一致 → 個人メール優先で TO 決定、医院メールは個人メールあり時のみ CC（無いとき TO に降格）、完全一致なしのとき同じ医院番号の他の行から医院メールを 1 つ拾うフォールバック、すべて空ならスキップ + 警告。`create_draft` に `cc_email` 引数を追加。`ProfileConfig` / `RunConfig` に `email_sheet_name` を追加（YAML 省略可、既定値は `EMAIL_SHEET_NAME` = `メールアドレス一覧`）。`email_records` はメインループ開始前に 1 回だけ読み込み、メイン経路 + 添付資料経路で共有（API 呼び出しを 1 回読みで済ます）。下書きは PDF アップロード成功後・シート追記後の位置に組み込み、例外は `logger.error` でログ出して処理続行（fail-soft）。下書き重複作成防止は管理番号デデュープ（P-015）に依存し、独自リトライ・重複チェックは入れない（P-020）。テスト 401 → 436 件（gmail_client 6 件 / sheets_client 16 件 / main 6 件 / batch_main 5 件 / integration smoke 2 件）。P-020 を追加。
+- **2026-05-26**: 参加者マスターシートに統合（医院名標準化 + Gmail 下書きの TO）。PR #35 で追加した「メールアドレス一覧」シート方式（5 列: 医院番号 / 医院名 / 個人名 / 個人メール / 医院メール）を廃止し、ユーザーが既に運用している「参加者マスター」シート（5 列: 管理番号 / 医院名 / 参加者名 / 申し込み会場 / メールアドレス）を **唯一の lookup ソース** に統合。理由: ユーザーが新セミナーごとに 1 シートを準備する運用に合わせて、(a) 医院名の表記統一（フォルダ名・出力シート列・PDF ヘッダーすべて同じ標準名）、(b) Gmail 下書きの TO ルックアップ、を同じシートで賄えるようにした。`sheets_client` の旧 `EmailRecord` / `read_email_records` / `lookup_email` を削除し、新 `MasterRecord` / `read_master_records` / `lookup_clinic_name` / `lookup_email_by_management_number` を追加。医院名 lookup は管理番号 prefix（`101-`）の **前方一致**、メール lookup は管理番号 **完全一致**。`gmail_client.create_draft` の `cc_email` 引数は将来再利用のため残すが、main / batch_main からは常に `None` を渡す（現運用では CC を使わない）。`ProfileConfig` / `RunConfig` の `email_sheet_name` を `master_sheet_name` に rename、`config.EMAIL_SHEET_NAME` を `MASTER_SHEET_NAME` に rename。lookup ミス時の fallback: 医院名は AI 抽出値で代用 + 警告ログ、メールは下書きスキップ + 警告ログ（fail-soft、PDF 処理は続行）。`master_records` はメイン経路 + 添付資料経路で共有（1 回読み）。`case_map` の医院名はマスター標準化済みの値を保持し、添付資料経路で再 lookup しない。テスト 436 → 440 件（sheets_client 16 件入替: EmailRecord 系 16 件削除 → MasterRecord 系 16 件追加 / main 8 件入替 / batch_main 7 件入替 / integration smoke 2 件入替）。`profiles/jissen_2024_q1.yaml` に `master_sheet_name` 指定例を追記、`README.md` §4-4 を全面書き換え。P-021 を追加。

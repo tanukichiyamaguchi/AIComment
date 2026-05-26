@@ -67,8 +67,13 @@ class TestArgparseProfile(unittest.TestCase):
 def _install_run_mocks(
     mock_drive, mock_gen, mock_reader, mock_creator, mock_merger,
     *, pdf_files: list[dict],
+    mock_sheets_client=None,
 ) -> None:
-    """``main.run()`` の処理ループを 1 周以上回すための標準モック。"""
+    """``main.run()`` の処理ループを 1 周以上回すための標準モック。
+
+    ``mock_sheets_client`` が渡された場合、参加者マスター系のデフォルト戻り値
+    （未登録扱いで AI 抽出値にフォールバック / メール未登録）も同時設定する。
+    """
     mock_drive.list_pdfs.return_value = pdf_files
     mock_drive.download_pdf.return_value = b"%PDF-1.4 fake"
     mock_drive.upload_pdf_to_clinic_person.return_value = {
@@ -83,6 +88,11 @@ def _install_run_mocks(
         "comment": "コメント本文",
     }
     mock_merger.make_output_filename.return_value = "out.pdf"
+    if mock_sheets_client is not None:
+        # 既定: マスター未登録 → AI 抽出値で代用 / メール未登録 → 下書きスキップ
+        mock_sheets_client.read_master_records.return_value = []
+        mock_sheets_client.lookup_clinic_name.return_value = ""
+        mock_sheets_client.lookup_email_by_management_number.return_value = ""
 
 
 
@@ -138,6 +148,7 @@ class TestRunUsesProfile(unittest.TestCase):
         )
         _install_run_mocks(
             mock_drive_client, mock_gen, mock_reader, mock_creator, mock_merger,
+            mock_sheets_client=mock_sheets_client,
             pdf_files=[{"id": "id_1", "name": "001-01-0実践事例.pdf"}],
         )
 
@@ -169,6 +180,7 @@ class TestRunUsesProfile(unittest.TestCase):
         mock_load_profile.return_value = _make_profile()
         _install_run_mocks(
             mock_drive_client, mock_gen, mock_reader, mock_creator, mock_merger,
+            mock_sheets_client=mock_sheets_client,
             pdf_files=[
                 {"id": "id_1", "name": "012-03-4実践事例タイトル.pdf"},
                 {"id": "id_2", "name": "012-03-5_別の事例.pdf"},
@@ -211,6 +223,7 @@ class TestRunUsesProfile(unittest.TestCase):
         mock_sheets_client.get_processed_management_numbers.return_value = set()
         _install_run_mocks(
             mock_drive_client, mock_gen, mock_reader, mock_creator, mock_merger,
+            mock_sheets_client=mock_sheets_client,
             pdf_files=[{"id": "id_1", "name": "管理番号なし.pdf"}],
         )
 
@@ -262,6 +275,7 @@ class TestRunIncrementalDedup(unittest.TestCase):
         }
         _install_run_mocks(
             mock_drive_client, mock_gen, mock_reader, mock_creator, mock_merger,
+            mock_sheets_client=mock_sheets_client,
             pdf_files=[
                 {"id": "id_1", "name": "001-01-0既存.pdf"},
                 {"id": "id_2", "name": "001-01-1新規.pdf"},
@@ -312,6 +326,7 @@ class TestRunIncrementalDedup(unittest.TestCase):
         }
         _install_run_mocks(
             mock_drive_client, mock_gen, mock_reader, mock_creator, mock_merger,
+            mock_sheets_client=mock_sheets_client,
             pdf_files=[
                 {"id": "id_1", "name": "001-01-0既存.pdf"},
                 {"id": "id_2", "name": "001-01-1既存.pdf"},
@@ -352,6 +367,7 @@ class TestRunIncrementalDedup(unittest.TestCase):
         }
         _install_run_mocks(
             mock_drive_client, mock_gen, mock_reader, mock_creator, mock_merger,
+            mock_sheets_client=mock_sheets_client,
             pdf_files=[
                 {"id": "id_0", "name": "001-01-0既存.pdf"},
                 {"id": "id_x", "name": "管理番号なし.pdf"},
@@ -406,6 +422,7 @@ class TestRunAttachmentPassthrough(unittest.TestCase):
         mock_sheets_client.get_processed_management_numbers.return_value = set()
         _install_run_mocks(
             mock_drive_client, mock_gen, mock_reader, mock_creator, mock_merger,
+            mock_sheets_client=mock_sheets_client,
             pdf_files=[
                 {"id": "id_main", "name": "001-01-0実践事例.pdf"},
                 {"id": "id_att", "name": "001-01-0【添付資料】補足データ.pdf"},
@@ -453,6 +470,7 @@ class TestRunAttachmentPassthrough(unittest.TestCase):
         mock_sheets_client.get_processed_management_numbers.return_value = set()
         _install_run_mocks(
             mock_drive_client, mock_gen, mock_reader, mock_creator, mock_merger,
+            mock_sheets_client=mock_sheets_client,
             pdf_files=[
                 {"id": "id_main", "name": "001-01-0実践事例.pdf"},
                 {"id": "id_att", "name": "001-01-0【添付資料】補足データ.pdf"},
@@ -498,6 +516,7 @@ class TestRunAttachmentPassthrough(unittest.TestCase):
         mock_sheets_client.get_processed_management_numbers.return_value = set()
         _install_run_mocks(
             mock_drive_client, mock_gen, mock_reader, mock_creator, mock_merger,
+            mock_sheets_client=mock_sheets_client,
             pdf_files=[
                 {"id": "id_main", "name": "001-01-0実践事例.pdf"},
                 {"id": "id_att", "name": "001-01-0【添付資料】補足データ.pdf"},
@@ -542,6 +561,7 @@ class TestRunAttachmentPassthrough(unittest.TestCase):
         mock_sheets_client.get_processed_management_numbers.return_value = set()
         _install_run_mocks(
             mock_drive_client, mock_gen, mock_reader, mock_creator, mock_merger,
+            mock_sheets_client=mock_sheets_client,
             pdf_files=[
                 {"id": "id_main", "name": "001-01-0実践事例.pdf"},
                 {"id": "id_att", "name": "001-01-0【添付資料】補足データ.pdf"},
@@ -584,6 +604,7 @@ class TestRunAttachmentPassthrough(unittest.TestCase):
         # 添付資料の管理番号 002-02-0 に対応するメインは入力に無い
         _install_run_mocks(
             mock_drive_client, mock_gen, mock_reader, mock_creator, mock_merger,
+            mock_sheets_client=mock_sheets_client,
             pdf_files=[
                 {"id": "id_main", "name": "001-01-0実践事例.pdf"},
                 {"id": "id_att", "name": "002-02-0【添付資料】孤児.pdf"},
@@ -634,6 +655,7 @@ class TestRunAttachmentPassthrough(unittest.TestCase):
         }
         _install_run_mocks(
             mock_drive_client, mock_gen, mock_reader, mock_creator, mock_merger,
+            mock_sheets_client=mock_sheets_client,
             pdf_files=[
                 {"id": "id_main", "name": "001-01-0実践事例.pdf"},
                 {"id": "id_att", "name": "001-01-0【添付資料】補足.pdf"},
@@ -671,6 +693,7 @@ class TestRunAttachmentPassthrough(unittest.TestCase):
         mock_sheets_client.get_processed_management_numbers.return_value = set()
         _install_run_mocks(
             mock_drive_client, mock_gen, mock_reader, mock_creator, mock_merger,
+            mock_sheets_client=mock_sheets_client,
             pdf_files=[
                 {"id": "id_m1", "name": "001-01-1実践事例.pdf"},
                 {"id": "id_m2", "name": "001-01-2実践事例.pdf"},
@@ -718,6 +741,7 @@ class TestRunClinicNumberFolder(unittest.TestCase):
         mock_sheets_client.get_recorded_clinic_numbers.return_value = set()
         _install_run_mocks(
             mock_drive_client, mock_gen, mock_reader, mock_creator, mock_merger,
+            mock_sheets_client=mock_sheets_client,
             pdf_files=[{"id": "id_1", "name": "012-03-4実践事例.pdf"}],
         )
 
@@ -752,6 +776,7 @@ class TestRunClinicNumberFolder(unittest.TestCase):
         }
         _install_run_mocks(
             mock_drive_client, mock_gen, mock_reader, mock_creator, mock_merger,
+            mock_sheets_client=mock_sheets_client,
             pdf_files=[{"id": "id_1", "name": "012-03-4実践事例.pdf"}],
         )
         mock_drive_client.upload_pdf_to_clinic_person.return_value = {
@@ -795,6 +820,7 @@ class TestRunClinicNumberFolder(unittest.TestCase):
         # 医院番号 005 が 2 件、007 が 1 件
         _install_run_mocks(
             mock_drive_client, mock_gen, mock_reader, mock_creator, mock_merger,
+            mock_sheets_client=mock_sheets_client,
             pdf_files=[
                 {"id": "id_1", "name": "005-01-0実践事例A.pdf"},
                 {"id": "id_2", "name": "005-01-1実践事例B.pdf"},
@@ -830,6 +856,7 @@ class TestRunClinicNumberFolder(unittest.TestCase):
         mock_sheets_client.get_recorded_clinic_numbers.return_value = {"012"}
         _install_run_mocks(
             mock_drive_client, mock_gen, mock_reader, mock_creator, mock_merger,
+            mock_sheets_client=mock_sheets_client,
             pdf_files=[{"id": "id_1", "name": "012-03-4実践事例.pdf"}],
         )
 
@@ -858,6 +885,7 @@ class TestRunClinicNumberFolder(unittest.TestCase):
         mock_sheets_client.get_recorded_clinic_numbers.return_value = set()
         _install_run_mocks(
             mock_drive_client, mock_gen, mock_reader, mock_creator, mock_merger,
+            mock_sheets_client=mock_sheets_client,
             pdf_files=[
                 {"id": "id_main", "name": "088-01-0実践事例.pdf"},
                 {"id": "id_att", "name": "088-01-0【添付資料】補足.pdf"},
@@ -875,25 +903,27 @@ class TestRunClinicNumberFolder(unittest.TestCase):
             self.assertEqual(call.kwargs["clinic_name"], "山田歯科")
 
 
-class TestRunGmailDraftIntegration(unittest.TestCase):
-    """``run()`` の Gmail 下書き作成統合。
+class TestRunMasterSheetIntegration(unittest.TestCase):
+    """``run()`` の参加者マスター統合（医院名標準化 + Gmail 下書き作成）。
 
-    PDF アップロード成功後 + シート追記後、メールアドレス一覧シートを引いて
-    Gmail 下書きを作成する。メール未登録時はスキップ + 警告ログ。例外時は
-    処理を止めず次の PDF へ進む（fail-soft）。
+    PDF アップロード成功後 + シート追記後、参加者マスターシートから
+    管理番号でメールアドレスを引き Gmail 下書きを作成する。CC は使わない。
+    医院名は管理番号 prefix（医院番号）で標準表記を引き、未登録なら AI
+    抽出値で代用 + 警告ログ。メール未登録時は下書きスキップ + 警告ログ。
+    例外時は処理を止めず次の PDF へ進む（fail-soft）。
     """
 
-    def _email_record(
-        self, clinic_number, person_name, person_email, clinic_email,
-        clinic_name="X",
+    def _master_record(
+        self, management_number, clinic_name, email,
+        participant_name="X", venue="",
     ):
-        from src.sheets_client import EmailRecord
-        return EmailRecord(
-            clinic_number=clinic_number,
+        from src.sheets_client import MasterRecord
+        return MasterRecord(
+            management_number=management_number,
             clinic_name=clinic_name,
-            person_name=person_name,
-            person_email=person_email,
-            clinic_email=clinic_email,
+            participant_name=participant_name,
+            venue=venue,
+            email=email,
         )
 
     @patch("src.main.ensure_fonts")
@@ -905,24 +935,27 @@ class TestRunGmailDraftIntegration(unittest.TestCase):
     @patch("src.main.sheets_client")
     @patch("src.main.drive_client")
     @patch("src.discover.load_profile")
-    def test_gmail_draft_created_with_person_email_and_clinic_cc(
+    def test_gmail_draft_created_with_master_email_no_cc(
         self, mock_load_profile, mock_drive_client, mock_sheets_client,
         mock_gmail_client, mock_gen, mock_reader, mock_creator, mock_merger,
         mock_ensure_fonts,
     ):
-        """個人メールあり・医院メールあり → TO=個人, CC=医院 で create_draft。"""
+        """管理番号 hit → TO=マスターのメール、CC=None で create_draft。"""
         from src import sheets_client as real_sheets_client
 
         mock_load_profile.return_value = _make_profile()
         mock_sheets_client.get_processed_management_numbers.return_value = set()
         mock_sheets_client.get_recorded_clinic_numbers.return_value = set()
-        mock_sheets_client.read_email_records.return_value = [
-            self._email_record(
-                "012", "田中太郎", "tanaka@example.com", "clinic@example.com"
+        mock_sheets_client.read_master_records.return_value = [
+            self._master_record(
+                "012-03-4", "標準医院名", "tanaka@example.com",
             ),
         ]
-        mock_sheets_client.lookup_email.side_effect = (
-            lambda recs, cn, pn: real_sheets_client.lookup_email(recs, cn, pn)
+        mock_sheets_client.lookup_clinic_name.side_effect = (
+            lambda recs, cn: real_sheets_client.lookup_clinic_name(recs, cn)
+        )
+        mock_sheets_client.lookup_email_by_management_number.side_effect = (
+            lambda recs, mn: real_sheets_client.lookup_email_by_management_number(recs, mn)
         )
         _install_run_mocks(
             mock_drive_client, mock_gen, mock_reader, mock_creator, mock_merger,
@@ -931,11 +964,10 @@ class TestRunGmailDraftIntegration(unittest.TestCase):
 
         main_module.run(test_count=0, profile_name="jissen_default")
 
-        # create_draft が呼ばれる
         mock_gmail_client.create_draft.assert_called_once()
         kwargs = mock_gmail_client.create_draft.call_args.kwargs
         self.assertEqual(kwargs["to_email"], "tanaka@example.com")
-        self.assertEqual(kwargs["cc_email"], "clinic@example.com")
+        self.assertIsNone(kwargs["cc_email"])  # CC は使わない
         self.assertEqual(kwargs["person_name"], "田中太郎")
 
     @patch("src.main.ensure_fonts")
@@ -947,24 +979,25 @@ class TestRunGmailDraftIntegration(unittest.TestCase):
     @patch("src.main.sheets_client")
     @patch("src.main.drive_client")
     @patch("src.discover.load_profile")
-    def test_gmail_draft_uses_clinic_email_when_person_empty(
+    def test_clinic_name_from_master_replaces_ai_value(
         self, mock_load_profile, mock_drive_client, mock_sheets_client,
         mock_gmail_client, mock_gen, mock_reader, mock_creator, mock_merger,
         mock_ensure_fonts,
     ):
-        """個人メール空・医院メールあり → TO=医院メール, CC なしで create_draft。"""
+        """医院名 lookup hit → マスター標準名でフォルダ作成・シート記録。"""
         from src import sheets_client as real_sheets_client
 
         mock_load_profile.return_value = _make_profile()
         mock_sheets_client.get_processed_management_numbers.return_value = set()
         mock_sheets_client.get_recorded_clinic_numbers.return_value = set()
-        mock_sheets_client.read_email_records.return_value = [
-            self._email_record(
-                "012", "田中太郎", "", "clinic@example.com"
-            ),
+        mock_sheets_client.read_master_records.return_value = [
+            self._master_record("012-03-4", "標準医院名", "t@example.com"),
         ]
-        mock_sheets_client.lookup_email.side_effect = (
-            lambda recs, cn, pn: real_sheets_client.lookup_email(recs, cn, pn)
+        mock_sheets_client.lookup_clinic_name.side_effect = (
+            lambda recs, cn: real_sheets_client.lookup_clinic_name(recs, cn)
+        )
+        mock_sheets_client.lookup_email_by_management_number.side_effect = (
+            lambda recs, mn: real_sheets_client.lookup_email_by_management_number(recs, mn)
         )
         _install_run_mocks(
             mock_drive_client, mock_gen, mock_reader, mock_creator, mock_merger,
@@ -973,11 +1006,60 @@ class TestRunGmailDraftIntegration(unittest.TestCase):
 
         main_module.run(test_count=0, profile_name="jissen_default")
 
-        mock_gmail_client.create_draft.assert_called_once()
-        kwargs = mock_gmail_client.create_draft.call_args.kwargs
-        self.assertEqual(kwargs["to_email"], "clinic@example.com")
-        # cc_email は None で渡される（空文字列は or None で None に変換）
-        self.assertIsNone(kwargs["cc_email"])
+        # AI 抽出値は「山田歯科」だが、フォルダ作成・出力シート行・医院シート行
+        # すべて「標準医院名」（マスターの値）に統一される
+        upload_kwargs = mock_drive_client.upload_pdf_to_clinic_person.call_args.kwargs
+        self.assertEqual(upload_kwargs["clinic_name"], "標準医院名")
+        append_kwargs = mock_sheets_client.append_output_record.call_args.kwargs
+        self.assertEqual(append_kwargs["clinic_name"], "標準医院名")
+        rec_kwargs = mock_sheets_client.append_clinic_folder_record.call_args.kwargs
+        self.assertEqual(rec_kwargs["clinic_name"], "標準医院名")
+
+    @patch("src.main.ensure_fonts")
+    @patch("src.main.pdf_merger")
+    @patch("src.main.pdf_creator")
+    @patch("src.main.pdf_reader")
+    @patch("src.main.comment_generator")
+    @patch("src.main.gmail_client")
+    @patch("src.main.sheets_client")
+    @patch("src.main.drive_client")
+    @patch("src.discover.load_profile")
+    def test_clinic_name_falls_back_to_ai_with_warning(
+        self, mock_load_profile, mock_drive_client, mock_sheets_client,
+        mock_gmail_client, mock_gen, mock_reader, mock_creator, mock_merger,
+        mock_ensure_fonts,
+    ):
+        """医院名 lookup ミス → AI 抽出値で代用 + 警告ログ（PDF 処理は続行）。"""
+        from src import sheets_client as real_sheets_client
+
+        mock_load_profile.return_value = _make_profile()
+        mock_sheets_client.get_processed_management_numbers.return_value = set()
+        mock_sheets_client.get_recorded_clinic_numbers.return_value = set()
+        mock_sheets_client.read_master_records.return_value = []  # マスター空
+        mock_sheets_client.lookup_clinic_name.side_effect = (
+            lambda recs, cn: real_sheets_client.lookup_clinic_name(recs, cn)
+        )
+        mock_sheets_client.lookup_email_by_management_number.side_effect = (
+            lambda recs, mn: real_sheets_client.lookup_email_by_management_number(recs, mn)
+        )
+        _install_run_mocks(
+            mock_drive_client, mock_gen, mock_reader, mock_creator, mock_merger,
+            pdf_files=[{"id": "id_1", "name": "012-03-4実践事例.pdf"}],
+        )
+
+        with self.assertLogs("jissen_comment", level="WARNING") as log_ctx:
+            main_module.run(test_count=0, profile_name="jissen_default")
+
+        # AI 抽出値「山田歯科」がフォルダ命名・シート列に伝搬する
+        upload_kwargs = mock_drive_client.upload_pdf_to_clinic_person.call_args.kwargs
+        self.assertEqual(upload_kwargs["clinic_name"], "山田歯科")
+        append_kwargs = mock_sheets_client.append_output_record.call_args.kwargs
+        self.assertEqual(append_kwargs["clinic_name"], "山田歯科")
+        # 警告ログには医院番号と AI 抽出値が含まれる
+        joined = "\n".join(log_ctx.output)
+        self.assertIn("参加者マスター未登録", joined)
+        self.assertIn("012", joined)
+        self.assertIn("山田歯科", joined)
 
     @patch("src.main.ensure_fonts")
     @patch("src.main.pdf_merger")
@@ -993,15 +1075,18 @@ class TestRunGmailDraftIntegration(unittest.TestCase):
         mock_gmail_client, mock_gen, mock_reader, mock_creator, mock_merger,
         mock_ensure_fonts,
     ):
-        """メール未登録 → create_draft 呼ばれず warning ログ + PDF 処理は完了する。"""
+        """メール lookup ミス → create_draft 呼ばれず警告 + PDF 処理は完了する。"""
         from src import sheets_client as real_sheets_client
 
         mock_load_profile.return_value = _make_profile()
         mock_sheets_client.get_processed_management_numbers.return_value = set()
         mock_sheets_client.get_recorded_clinic_numbers.return_value = set()
-        mock_sheets_client.read_email_records.return_value = []  # 未登録
-        mock_sheets_client.lookup_email.side_effect = (
-            lambda recs, cn, pn: real_sheets_client.lookup_email(recs, cn, pn)
+        mock_sheets_client.read_master_records.return_value = []  # 未登録
+        mock_sheets_client.lookup_clinic_name.side_effect = (
+            lambda recs, cn: real_sheets_client.lookup_clinic_name(recs, cn)
+        )
+        mock_sheets_client.lookup_email_by_management_number.side_effect = (
+            lambda recs, mn: real_sheets_client.lookup_email_by_management_number(recs, mn)
         )
         _install_run_mocks(
             mock_drive_client, mock_gen, mock_reader, mock_creator, mock_merger,
@@ -1013,10 +1098,10 @@ class TestRunGmailDraftIntegration(unittest.TestCase):
 
         # create_draft は呼ばれない
         mock_gmail_client.create_draft.assert_not_called()
-        # warning ログにメール未登録が含まれる
+        # 警告ログにメール未登録 + 管理番号が含まれる
         joined = "\n".join(log_ctx.output)
         self.assertIn("メール未登録", joined)
-        self.assertIn("012", joined)
+        self.assertIn("012-03-4", joined)
         # PDF アップロード・シート追記は通常通り完了する（fail-soft）
         mock_drive_client.upload_pdf_to_clinic_person.assert_called_once()
         mock_sheets_client.append_output_record.assert_called_once()
@@ -1041,16 +1126,15 @@ class TestRunGmailDraftIntegration(unittest.TestCase):
         mock_load_profile.return_value = _make_profile()
         mock_sheets_client.get_processed_management_numbers.return_value = set()
         mock_sheets_client.get_recorded_clinic_numbers.return_value = set()
-        mock_sheets_client.read_email_records.return_value = [
-            self._email_record(
-                "001", "田中太郎", "tanaka@example.com", "",
-            ),
-            self._email_record(
-                "002", "田中太郎", "next@example.com", "",
-            ),
+        mock_sheets_client.read_master_records.return_value = [
+            self._master_record("001-01-0", "三浦歯科医院", "p1@example.com"),
+            self._master_record("002-01-0", "山本歯科", "p2@example.com"),
         ]
-        mock_sheets_client.lookup_email.side_effect = (
-            lambda recs, cn, pn: real_sheets_client.lookup_email(recs, cn, pn)
+        mock_sheets_client.lookup_clinic_name.side_effect = (
+            lambda recs, cn: real_sheets_client.lookup_clinic_name(recs, cn)
+        )
+        mock_sheets_client.lookup_email_by_management_number.side_effect = (
+            lambda recs, mn: real_sheets_client.lookup_email_by_management_number(recs, mn)
         )
         # create_draft は最初の呼び出しで例外
         mock_gmail_client.create_draft.side_effect = [
@@ -1082,20 +1166,23 @@ class TestRunGmailDraftIntegration(unittest.TestCase):
     @patch("src.main.sheets_client")
     @patch("src.main.drive_client")
     @patch("src.discover.load_profile")
-    def test_email_records_read_once_for_whole_run(
+    def test_master_records_read_once_for_whole_run(
         self, mock_load_profile, mock_drive_client, mock_sheets_client,
         mock_gmail_client, mock_gen, mock_reader, mock_creator, mock_merger,
         mock_ensure_fonts,
     ):
-        """read_email_records はループ前に 1 回だけ呼ばれる（ループ内で再読しない）。"""
+        """read_master_records はループ前に 1 回だけ呼ばれる（ループ内で再読しない）。"""
         from src import sheets_client as real_sheets_client
 
         mock_load_profile.return_value = _make_profile()
         mock_sheets_client.get_processed_management_numbers.return_value = set()
         mock_sheets_client.get_recorded_clinic_numbers.return_value = set()
-        mock_sheets_client.read_email_records.return_value = []
-        mock_sheets_client.lookup_email.side_effect = (
-            lambda recs, cn, pn: real_sheets_client.lookup_email(recs, cn, pn)
+        mock_sheets_client.read_master_records.return_value = []
+        mock_sheets_client.lookup_clinic_name.side_effect = (
+            lambda recs, cn: real_sheets_client.lookup_clinic_name(recs, cn)
+        )
+        mock_sheets_client.lookup_email_by_management_number.side_effect = (
+            lambda recs, mn: real_sheets_client.lookup_email_by_management_number(recs, mn)
         )
         _install_run_mocks(
             mock_drive_client, mock_gen, mock_reader, mock_creator, mock_merger,
@@ -1108,8 +1195,8 @@ class TestRunGmailDraftIntegration(unittest.TestCase):
 
         main_module.run(test_count=0, profile_name="jissen_default")
 
-        # 3 件処理しても read_email_records は 1 回だけ
-        self.assertEqual(mock_sheets_client.read_email_records.call_count, 1)
+        # 3 件処理しても read_master_records は 1 回だけ
+        self.assertEqual(mock_sheets_client.read_master_records.call_count, 1)
 
     @patch("src.main.ensure_fonts")
     @patch("src.main.pdf_merger")
@@ -1125,19 +1212,20 @@ class TestRunGmailDraftIntegration(unittest.TestCase):
         mock_gmail_client, mock_gen, mock_reader, mock_creator, mock_merger,
         mock_ensure_fonts,
     ):
-        """添付資料経路でも create_draft が呼ばれる（同じ個人宛、件名はメインと同じ）。"""
+        """添付資料経路でも create_draft が呼ばれる（同じ管理番号、件名はメインと同じ）。"""
         from src import sheets_client as real_sheets_client
 
         mock_load_profile.return_value = _make_profile()
         mock_sheets_client.get_processed_management_numbers.return_value = set()
         mock_sheets_client.get_recorded_clinic_numbers.return_value = set()
-        mock_sheets_client.read_email_records.return_value = [
-            self._email_record(
-                "001", "田中太郎", "tanaka@example.com", "clinic@example.com"
-            ),
+        mock_sheets_client.read_master_records.return_value = [
+            self._master_record("001-01-0", "三浦歯科医院", "tanaka@example.com"),
         ]
-        mock_sheets_client.lookup_email.side_effect = (
-            lambda recs, cn, pn: real_sheets_client.lookup_email(recs, cn, pn)
+        mock_sheets_client.lookup_clinic_name.side_effect = (
+            lambda recs, cn: real_sheets_client.lookup_clinic_name(recs, cn)
+        )
+        mock_sheets_client.lookup_email_by_management_number.side_effect = (
+            lambda recs, mn: real_sheets_client.lookup_email_by_management_number(recs, mn)
         )
         _install_run_mocks(
             mock_drive_client, mock_gen, mock_reader, mock_creator, mock_merger,
@@ -1151,11 +1239,53 @@ class TestRunGmailDraftIntegration(unittest.TestCase):
 
         # メイン + 添付資料 で create_draft が 2 回呼ばれる
         self.assertEqual(mock_gmail_client.create_draft.call_count, 2)
-        # 両方とも同じ to/person_name
+        # 両方とも同じ to/person_name、CC なし
         for call in mock_gmail_client.create_draft.call_args_list:
             self.assertEqual(call.kwargs["to_email"], "tanaka@example.com")
             self.assertEqual(call.kwargs["person_name"], "田中太郎")
-            self.assertEqual(call.kwargs["cc_email"], "clinic@example.com")
+            self.assertIsNone(call.kwargs["cc_email"])
+
+    @patch("src.main.ensure_fonts")
+    @patch("src.main.pdf_merger")
+    @patch("src.main.pdf_creator")
+    @patch("src.main.pdf_reader")
+    @patch("src.main.comment_generator")
+    @patch("src.main.gmail_client")
+    @patch("src.main.sheets_client")
+    @patch("src.main.drive_client")
+    @patch("src.discover.load_profile")
+    def test_master_records_shared_with_attachment_path(
+        self, mock_load_profile, mock_drive_client, mock_sheets_client,
+        mock_gmail_client, mock_gen, mock_reader, mock_creator, mock_merger,
+        mock_ensure_fonts,
+    ):
+        """master_records は 1 回読み込みでメイン + 添付資料経路で共有される。"""
+        from src import sheets_client as real_sheets_client
+
+        mock_load_profile.return_value = _make_profile()
+        mock_sheets_client.get_processed_management_numbers.return_value = set()
+        mock_sheets_client.get_recorded_clinic_numbers.return_value = set()
+        mock_sheets_client.read_master_records.return_value = [
+            self._master_record("001-01-0", "三浦歯科医院", "tanaka@example.com"),
+        ]
+        mock_sheets_client.lookup_clinic_name.side_effect = (
+            lambda recs, cn: real_sheets_client.lookup_clinic_name(recs, cn)
+        )
+        mock_sheets_client.lookup_email_by_management_number.side_effect = (
+            lambda recs, mn: real_sheets_client.lookup_email_by_management_number(recs, mn)
+        )
+        _install_run_mocks(
+            mock_drive_client, mock_gen, mock_reader, mock_creator, mock_merger,
+            pdf_files=[
+                {"id": "id_m", "name": "001-01-0実践事例.pdf"},
+                {"id": "id_a", "name": "001-01-0【添付資料】補足.pdf"},
+            ],
+        )
+
+        main_module.run(test_count=0, profile_name="jissen_default")
+
+        # メイン + 添付資料 = 2 件処理しても read_master_records は 1 回のみ
+        self.assertEqual(mock_sheets_client.read_master_records.call_count, 1)
 
 
 class TestArgparseTargetFolder(unittest.TestCase):
@@ -1284,6 +1414,7 @@ class TestRunUsesTargetFolder(unittest.TestCase):
         )
         _install_run_mocks(
             mock_drive_client, mock_gen, mock_reader, mock_creator, mock_merger,
+            mock_sheets_client=mock_sheets_client,
             pdf_files=[{"id": "id_1", "name": "007-08-9実践事例.pdf"}],
         )
 
