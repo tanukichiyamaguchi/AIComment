@@ -22,9 +22,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import tempfile
 import time
 from pathlib import Path
+from typing import Any
 
 from src.utils import (
     setup_logging,
@@ -323,6 +325,12 @@ def step4_generate_pdfs(
         sheet_name=profile.master_sheet_name,
     )
 
+    # Gmail 下書きは Step4 末尾でまとめて作成する（同じメールアドレスを持つ
+    # 複数 PDF を 1 通に集約するため）。ループ中は draft_items に蓄積するだけ。
+    # PDF ファイルは集約まで生存させる必要があるので session_outputs_dir に書く。
+    session_outputs_dir = Path(tempfile.mkdtemp(prefix="aicomment_batch_outputs_"))
+    draft_items: list[dict[str, Any]] = []
+
     def _record_clinic_folder(
         clinic_number: str, clinic_name: str, clinic_folder_id: str
     ) -> None:
@@ -402,6 +410,12 @@ def step4_generate_pdfs(
         try:
             pdf_data = drive_client.download_pdf(item["pdf_data_id"])
 
+            # 中間ファイルは iteration スコープ、最終出力は session_outputs_dir
+            # に書いてループ終了後の集約下書き作成まで生存させる。
+            pdf_subdir = session_outputs_dir / f"main_{custom_id}"
+            pdf_subdir.mkdir(parents=True, exist_ok=True)
+            output_path = pdf_subdir / output_filename
+
             with tempfile.TemporaryDirectory() as tmpdir:
                 comment_page_path = Path(tmpdir) / "comment_page.pdf"
                 pdf_creator.create_comment_page(
@@ -411,7 +425,6 @@ def step4_generate_pdfs(
                     output_path=comment_page_path,
                 )
 
-                output_path = Path(tmpdir) / output_filename
                 pdf_merger.merge_pdfs(
                     original_pdf_data=pdf_data,
                     comment_page_path=comment_page_path,
@@ -440,14 +453,16 @@ def step4_generate_pdfs(
                     clinic_number, clinic_name,
                     upload_result["clinic_folder_id"],
                 )
-                # Gmail 下書きを作成（マスター未ヒットでも宛先空で作成）。
-                # tempdir スコープ内で実行することで PDF ファイルにアクセスできる。
-                _create_gmail_draft_safe(
-                    master_records=master_records,
-                    clinic_number=clinic_number,
-                    person_name=person_name,
-                    pdf_path=output_path,
-                )
+
+            # Gmail 下書きはここで作らず draft_items に蓄積する。ループ終了後
+            # にメールアドレスでグルーピングして 1 通にまとめる。
+            _collect_draft_item_batch(
+                draft_items=draft_items,
+                master_records=master_records,
+                clinic_number=clinic_number,
+                person_name=person_name,
+                pdf_path=output_path,
+            )
 
             # 添付資料パススルー用の対応表を構築。医院名は既にマスター標準化
             # 済みの値が入っているため、添付資料経路はこの表をそのまま再利用
@@ -472,8 +487,20 @@ def step4_generate_pdfs(
     # batch_attachments.json を読み、各添付資料を case_map で引いて、同じ管理
     # 番号のメインと同じ出力フォルダへ元ファイル名のままコピーする。AI 処理
     # （Claude API / コメントページ生成 / 結合）は一切しない。ファイルが
-    # 存在しない（添付資料ゼロ）場合は何もしない。
-    _process_attachments(profile, case_map, stats, master_records)
+    # 存在しない（添付資料ゼロ）場合は何もしない。添付資料 PDF も同じ
+    # session_outputs_dir / draft_items に蓄積される（同じ個人宛グループに合流）。
+    _process_attachments(
+        profile, case_map, stats, master_records,
+        session_outputs_dir, draft_items,
+    )
+
+    # ── 集約下書き作成 ──
+    # メイン + 添付資料経路で蓄積した draft_items をメールアドレスでグルーピング
+    # し、グループごとに 1 通の Gmail 下書きを作成する。
+    try:
+        _create_grouped_drafts_for_batch(draft_items)
+    finally:
+        shutil.rmtree(session_outputs_dir, ignore_errors=True)
 
     total = stats["success"] + stats["error"] + stats["missing"]
     logger.info(
@@ -483,21 +510,16 @@ def step4_generate_pdfs(
     )
 
 
-def _create_gmail_draft_safe(
+def _collect_draft_item_batch(
+    draft_items: list[dict[str, Any]],
     master_records: list[MasterRecord],
     clinic_number: str,
     person_name: str,
     pdf_path: Path,
 ) -> None:
-    """PDF アップロード成功後の副作用として Gmail 下書きを作成する。
-
-    参加者マスターシートから医院管理番号 + 個人名でメールアドレスを引き、
-    TO に設定する（CC は現運用では使わない）。マスター未ヒットでも下書き
-    自体は作成し、TO を空にして手動補完できるようにする。例外が発生しても
-    PDF 処理は止めずに次へ進む（fail-soft）。
-
-    下書きの重複作成防止は管理番号デデュープ（P-015）に依存。本関数では
-    独自のリトライ・重複チェックは行わない。
+    """PDF アップロード成功後、Gmail 下書き用の (メール, 個人名, PDF) を
+    ``draft_items`` に追加する。マスター lookup の例外は警告ログを出して
+    握りつぶす（fail-soft、PDF 処理は止めない）。
     """
     logger = setup_logging()
     try:
@@ -506,17 +528,83 @@ def _create_gmail_draft_safe(
         )
         if not email:
             logger.warning(
-                f"Gmail下書き: 宛先空で作成 (マスター未ヒット, "
-                f"医院管理番号={clinic_number}, 個人名={person_name!r})"
+                f"メール未ヒット → 宛先空で下書き予定 "
+                f"(医院管理番号={clinic_number}, 個人名={person_name!r})"
             )
-        gmail_client.create_draft(
-            to_email=email,
-            person_name=person_name,
-            pdf_path=pdf_path,
-            cc_email=None,  # CC は現運用では使わない
-        )
+        draft_items.append({
+            "email": email,
+            "person_name": person_name,
+            "pdf_path": pdf_path,
+            "clinic_number": clinic_number,
+        })
     except Exception as e:
-        logger.error(f"Gmail下書き作成失敗（処理は続行）: {e}", exc_info=True)
+        logger.error(
+            f"メール lookup 失敗（PDF 処理は続行、下書きは作らない）: {e}",
+            exc_info=True,
+        )
+
+
+def _create_grouped_drafts_for_batch(
+    draft_items: list[dict[str, Any]],
+) -> None:
+    """``draft_items`` をメールアドレスでグループ化して下書きを作成する。
+
+    通常モード (``main._create_grouped_drafts_for_run``) と同じロジック:
+    メールアドレスごとに 1 通の下書きにまとめ、空メールは PDF ごとに個別の
+    宛先空下書きを作る。例外は警告ログを出して握りつぶす（fail-soft）。
+    """
+    logger = setup_logging()
+    if not draft_items:
+        return
+
+    groups: dict[str, list[dict[str, Any]]] = {}
+    empty_email_items: list[dict[str, Any]] = []
+    for item in draft_items:
+        email = item["email"]
+        if email:
+            groups.setdefault(email, []).append(item)
+        else:
+            empty_email_items.append(item)
+
+    logger.info(
+        f"Gmail下書き集約: メールあり{len(groups)}グループ "
+        f"({sum(len(v) for v in groups.values())}件分), "
+        f"メール空{len(empty_email_items)}件 → 計{len(groups) + len(empty_email_items)}通の下書きを作成"
+    )
+
+    for email, items in groups.items():
+        pdf_paths = [item["pdf_path"] for item in items]
+        person_name = items[0]["person_name"]
+        unique_names = {item["person_name"] for item in items}
+        if len(unique_names) > 1:
+            logger.warning(
+                f"同一メール {email!r} に異なる個人名が紐づいています: "
+                f"{sorted(unique_names)} → 先頭の {person_name!r} を採用"
+            )
+        try:
+            gmail_client.create_draft(
+                to_email=email,
+                person_name=person_name,
+                pdf_paths=pdf_paths,
+                cc_email=None,
+            )
+        except Exception as e:
+            logger.error(
+                f"Gmail下書き作成失敗（処理は続行）: {e}", exc_info=True
+            )
+
+    for item in empty_email_items:
+        try:
+            gmail_client.create_draft(
+                to_email="",
+                person_name=item["person_name"],
+                pdf_paths=item["pdf_path"],
+                cc_email=None,
+            )
+        except Exception as e:
+            logger.error(
+                f"Gmail下書き作成失敗（処理は続行）: {e}", exc_info=True
+            )
 
 
 def _process_attachments(
@@ -524,6 +612,8 @@ def _process_attachments(
     case_map: dict[str, tuple[str, str, str]],
     stats: dict[str, int],
     master_records: list[MasterRecord],
+    session_outputs_dir: Path,
+    draft_items: list[dict[str, Any]],
 ) -> None:
     """``batch_attachments.json`` を読み、添付資料をメインと同じ出力先へコピーする。
 
@@ -575,38 +665,40 @@ def _process_attachments(
         clinic_number, clinic_name, person_name = case
         try:
             # 元 PDF のバイト列をそのまま再アップロード（マージ・コメント
-            # ページ生成はしない）。出力ファイル名は元のまま。
+            # ページ生成はしない）。出力ファイル名は元のまま。session_outputs_dir
+            # に書いてループ終了後の集約下書き作成まで生存させる。
             pdf_data = drive_client.download_pdf(file_id)
-            with tempfile.TemporaryDirectory() as tmpdir:
-                attachment_path = Path(tmpdir) / file_name
-                attachment_path.write_bytes(pdf_data)
-                upload_result = drive_client.upload_pdf_to_clinic_person(
-                    file_path=attachment_path,
-                    output_root_folder_id=profile.output_folder_id,
-                    clinic_number=clinic_number,
-                    clinic_name=clinic_name,
-                    person_name=person_name,
-                    file_name=file_name,
-                )
+            att_subdir = session_outputs_dir / f"attach_{file_id}"
+            att_subdir.mkdir(parents=True, exist_ok=True)
+            attachment_path = att_subdir / file_name
+            attachment_path.write_bytes(pdf_data)
+            upload_result = drive_client.upload_pdf_to_clinic_person(
+                file_path=attachment_path,
+                output_root_folder_id=profile.output_folder_id,
+                clinic_number=clinic_number,
+                clinic_name=clinic_name,
+                person_name=person_name,
+                file_name=file_name,
+            )
 
-                sheets_client.append_output_record(
-                    management_number=mgmt_num,
-                    clinic_name=clinic_name,
-                    person_name=person_name,
-                    sample_name=f"【添付資料】{file_name}",
-                    drive_url=upload_result["webViewLink"],
-                    sheet_name=profile.output_sheet_name,
-                )
+            sheets_client.append_output_record(
+                management_number=mgmt_num,
+                clinic_name=clinic_name,
+                person_name=person_name,
+                sample_name=f"【添付資料】{file_name}",
+                drive_url=upload_result["webViewLink"],
+                sheet_name=profile.output_sheet_name,
+            )
 
-                # 添付資料経路も Gmail 下書きを作成する（同じ個人宛、件名は
-                # メインと同じテンプレート）。メイン経路と同じ ``master_records``
-                # を共有し、API 呼び出しを 1 回読みで済ます。
-                _create_gmail_draft_safe(
-                    master_records=master_records,
-                    clinic_number=clinic_number,
-                    person_name=person_name,
-                    pdf_path=attachment_path,
-                )
+            # 添付資料経路も Gmail 下書き用に蓄積する。同じ個人宛のメイン PDF
+            # と同じグループに集約され、1 通の下書きに複数添付される。
+            _collect_draft_item_batch(
+                draft_items=draft_items,
+                master_records=master_records,
+                clinic_number=clinic_number,
+                person_name=person_name,
+                pdf_path=attachment_path,
+            )
 
             logger.info(
                 f"添付資料コピー完了: {mgmt_num} / {clinic_name} / "

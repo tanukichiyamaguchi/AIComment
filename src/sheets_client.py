@@ -481,27 +481,38 @@ def append_clinic_folder_record(
 class MasterRecord:
     """参加者マスターシートの 1 行。
 
-    1 行 per 個人。同じ医院（例 医院管理番号 ``101``）に複数参加者が
-    いる場合は同じ医院管理番号で複数行が並ぶ（B 列の医院名も重複記入）。
+    1 行 per 個人。同じ医院（例 ``101``）には複数参加者がいる場合
+    ``101-01``、``101-02`` … と並ぶ。医院名は重複記入されている前提。
 
     Attributes:
-        clinic_number: A 列、医院管理番号（``101`` のような医院単位の番号）。
-            PDF ファイル名先頭の医院コード（``001-01-0`` の ``001``）と
-            直接突合する。
+        management_number: A 列、管理番号（``101-01`` のような ``xxx-yy`` 形式）。
+            先頭セグメント（``-`` の前）が医院コードで、PDF ファイル名から
+            抽出した医院コードと突合する。
         clinic_name: B 列、医院名（標準表記。「開業準備中」等の固定文字列も入る）
         participant_name: C 列、参加者名（個人特定の突合キー）
         venue: D 列、申し込み会場（参照用）
         email: E 列、メールアドレス
     """
-    clinic_number: str
+    management_number: str
     clinic_name: str
     participant_name: str
     venue: str
     email: str
 
+    @property
+    def clinic_number(self) -> str:
+        """管理番号 ``101-01`` から医院コード ``101`` を派生させる。
+
+        ``-`` を含まない管理番号は、そのまま医院コードとみなす（``101`` のみ
+        が入っているケースをサポート）。空文字なら空文字を返す。
+        """
+        if not self.management_number:
+            return ""
+        return self.management_number.split("-", 1)[0]
+
 
 _MASTER_SHEET_HEADER = [
-    "医院管理番号", "医院名", "参加者名", "申し込み会場", "メールアドレス"
+    "管理番号", "医院名", "参加者名", "申し込み会場", "メールアドレス"
 ]
 
 
@@ -640,14 +651,14 @@ def read_master_records(
         while len(row) < 5:
             row.append("")
 
-        clinic_number = (row[0] or "").strip()
+        management_number = (row[0] or "").strip()
         clinic_name = (row[1] or "").strip()
         participant_name = (row[2] or "").strip()
         venue = (row[3] or "").strip()
         email = (row[4] or "").strip()
 
-        # 医院管理番号も医院名も両方空の行は無視（空行 / コメント行扱い）
-        if not clinic_number and not clinic_name:
+        # 管理番号も医院名も両方空の行は無視（空行 / コメント行扱い）
+        if not management_number and not clinic_name:
             continue
 
         if email and not _validate_email(email):
@@ -657,7 +668,7 @@ def read_master_records(
             email = ""
 
         records.append(MasterRecord(
-            clinic_number=clinic_number,
+            management_number=management_number,
             clinic_name=clinic_name,
             participant_name=participant_name,
             venue=venue,
@@ -674,16 +685,16 @@ def lookup_clinic_name(
     records: list[MasterRecord],
     clinic_number: str,
 ) -> str:
-    """医院管理番号から標準医院名を引く。
+    """医院コードから標準医院名を引く。
 
-    A 列（医院管理番号）が ``clinic_number`` と完全一致する最初の行の
-    ``clinic_name`` を返す。複数行ある場合は最初に見つかった値を使う
-    （同一医院は同じ医院名で登録されている前提）。一致行がない、または
-    医院名が空文字なら空文字を返す。
+    A 列の管理番号 (``101-01`` 等) の先頭セグメント (``101``) が
+    ``clinic_number`` と一致する最初の行の ``clinic_name`` を返す。複数行
+    ある場合は最初に見つかった値を使う（同一医院は同じ医院名で登録されて
+    いる前提）。一致行がない、または医院名が空文字なら空文字を返す。
 
     Args:
         records: ``read_master_records`` の戻り値
-        clinic_number: 医院管理番号（``101`` のような数字部分）
+        clinic_number: 医院コード（``101`` のような数字部分）
 
     Returns:
         標準医院名。未登録なら空文字。呼び出し側は空文字なら AI 抽出値で代用。
@@ -702,10 +713,11 @@ def lookup_email_by_clinic_and_person(
     clinic_number: str,
     person_name: str,
 ) -> str:
-    """医院管理番号 + 個人名から参加者のメールアドレスを引く。
+    """医院コード + 個人名から参加者のメールアドレスを引く。
 
     突合手順:
-        1. 医院管理番号 (A 列) が ``clinic_number`` に完全一致する行に絞り込む
+        1. 管理番号 (A 列) の先頭セグメントが ``clinic_number`` と一致する
+           行に絞り込む（``101-01`` の管理番号は医院コード ``101`` として扱う）
         2. 個人名 (C 列) を ``_normalize_person_name`` で正規化して
            比較（NFKC + 全空白除去 + ひらがな統一 + 小文字化）
         3. 完全一致行が 1 件 → そのメールを返す
@@ -717,7 +729,7 @@ def lookup_email_by_clinic_and_person(
 
     Args:
         records: ``read_master_records`` の戻り値
-        clinic_number: 医院管理番号（``001`` のような数字部分）
+        clinic_number: 医院コード（``001`` のような数字部分）
         person_name: PDF 本文から AI 抽出した個人名
 
     Returns:

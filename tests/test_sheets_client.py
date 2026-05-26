@@ -687,8 +687,9 @@ def _build_master_sheet_service(
 class TestReadMasterRecords(unittest.TestCase):
     """``read_master_records``（参加者マスターシート読み取り）。
 
-    A 列は「医院管理番号」（医院単位の番号 ``001``）であり、PDF ファイル名
-    先頭の医院コードと直接突合する。
+    A 列は「管理番号」（``101-01`` のような ``xxx-yy`` 形式）であり、
+    先頭セグメント（``-`` の前）が医院コードで、PDF ファイル名先頭の
+    医院コードと突合する。
     """
 
     @patch("src.sheets_client.get_sheets_service")
@@ -697,10 +698,10 @@ class TestReadMasterRecords(unittest.TestCase):
         service = _build_master_sheet_service(
             ["参加者マスター"],
             [
-                ["医院管理番号", "医院名", "参加者名", "申し込み会場", "メールアドレス"],
-                ["101", "三浦歯科医院", "白川 蓮", "東京会場", "ren@example.com"],
-                ["101", "三浦歯科医院", "鈴木 一郎", "東京会場", "ichiro@example.com"],
-                ["102", "山本歯科", "田中 太郎", "大阪会場", "tanaka@example.com"],
+                ["管理番号", "医院名", "参加者名", "申し込み会場", "メールアドレス"],
+                ["101-01", "三浦歯科医院", "白川 蓮", "東京会場", "ren@example.com"],
+                ["101-02", "三浦歯科医院", "鈴木 一郎", "東京会場", "ichiro@example.com"],
+                ["102-01", "山本歯科", "田中 太郎", "大阪会場", "tanaka@example.com"],
             ],
         )
         mock_get_service.return_value = service
@@ -710,11 +711,13 @@ class TestReadMasterRecords(unittest.TestCase):
         )
 
         self.assertEqual(len(records), 3)
-        self.assertEqual(records[0].clinic_number, "101")
+        self.assertEqual(records[0].management_number, "101-01")
+        self.assertEqual(records[0].clinic_number, "101")  # 派生プロパティ
         self.assertEqual(records[0].clinic_name, "三浦歯科医院")
         self.assertEqual(records[0].participant_name, "白川 蓮")
         self.assertEqual(records[0].venue, "東京会場")
         self.assertEqual(records[0].email, "ren@example.com")
+        self.assertEqual(records[2].management_number, "102-01")
         self.assertEqual(records[2].clinic_number, "102")
         self.assertEqual(records[2].email, "tanaka@example.com")
 
@@ -739,20 +742,20 @@ class TestReadMasterRecords(unittest.TestCase):
         self.assertIn("参加者マスター!A1:E1", update_call.kwargs["range"])
         self.assertEqual(
             update_call.kwargs["body"]["values"][0],
-            ["医院管理番号", "医院名", "参加者名", "申し込み会場", "メールアドレス"],
+            ["管理番号", "医院名", "参加者名", "申し込み会場", "メールアドレス"],
         )
         self.assertEqual(records, [])
 
     @patch("src.sheets_client.get_sheets_service")
     def test_empty_rows_are_skipped(self, mock_get_service):
-        """医院管理番号も医院名も空の行は読み飛ばす。"""
+        """管理番号も医院名も空の行は読み飛ばす。"""
         service = _build_master_sheet_service(
             ["参加者マスター"],
             [
-                ["医院管理番号", "医院名", "参加者名", "申し込み会場", "メールアドレス"],
-                ["101", "三浦歯科医院", "白川 蓮", "東京会場", "ren@example.com"],
+                ["管理番号", "医院名", "参加者名", "申し込み会場", "メールアドレス"],
+                ["101-01", "三浦歯科医院", "白川 蓮", "東京会場", "ren@example.com"],
                 ["", "", "", "", ""],  # 空行
-                ["102", "山本歯科", "田中 太郎", "大阪会場", "tanaka@example.com"],
+                ["102-01", "山本歯科", "田中 太郎", "大阪会場", "tanaka@example.com"],
             ],
         )
         mock_get_service.return_value = service
@@ -762,8 +765,8 @@ class TestReadMasterRecords(unittest.TestCase):
         )
 
         self.assertEqual(len(records), 2)
-        self.assertEqual(records[0].clinic_number, "101")
-        self.assertEqual(records[1].clinic_number, "102")
+        self.assertEqual(records[0].management_number, "101-01")
+        self.assertEqual(records[1].management_number, "102-01")
 
     @patch("src.sheets_client.get_sheets_service")
     def test_invalid_email_warns_but_row_remains(self, mock_get_service):
@@ -771,8 +774,8 @@ class TestReadMasterRecords(unittest.TestCase):
         service = _build_master_sheet_service(
             ["参加者マスター"],
             [
-                ["医院管理番号", "医院名", "参加者名", "申し込み会場", "メールアドレス"],
-                ["101", "三浦歯科", "白川 蓮", "東京会場", "not-an-email"],
+                ["管理番号", "医院名", "参加者名", "申し込み会場", "メールアドレス"],
+                ["101-01", "三浦歯科", "白川 蓮", "東京会場", "not-an-email"],
             ],
         )
         mock_get_service.return_value = service
@@ -783,7 +786,7 @@ class TestReadMasterRecords(unittest.TestCase):
             )
 
         self.assertEqual(len(records), 1)
-        self.assertEqual(records[0].clinic_number, "101")
+        self.assertEqual(records[0].management_number, "101-01")
         self.assertEqual(records[0].clinic_name, "三浦歯科")
         self.assertEqual(records[0].email, "")
         joined = "\n".join(log_ctx.output)
@@ -796,8 +799,8 @@ class TestReadMasterRecords(unittest.TestCase):
         service = _build_master_sheet_service(
             ["参加者マスター"],
             [
-                ["医院管理番号", "医院名", "参加者名", "申し込み会場", "メールアドレス"],
-                ["101", "三浦歯科", "白川 蓮", "東京会場", "ren@example.com"],
+                ["管理番号", "医院名", "参加者名", "申し込み会場", "メールアドレス"],
+                ["101-01", "三浦歯科", "白川 蓮", "東京会場", "ren@example.com"],
             ],
         )
         mock_get_service.return_value = service
@@ -826,8 +829,8 @@ class TestReadMasterRecords(unittest.TestCase):
         service = _build_master_sheet_service(
             [sheets_client.MASTER_SHEET_NAME],
             [
-                ["医院管理番号", "医院名", "参加者名", "申し込み会場", "メールアドレス"],
-                ["101", "A", "B", "東京", "b@example.com"],
+                ["管理番号", "医院名", "参加者名", "申し込み会場", "メールアドレス"],
+                ["101-01", "A", "B", "東京", "b@example.com"],
             ],
         )
         mock_get_service.return_value = service
@@ -843,7 +846,7 @@ class TestReadMasterRecords(unittest.TestCase):
         service = _build_master_sheet_service(
             ["参加者マスター"],
             [
-                ["医院管理番号", "医院名", "参加者名", "申し込み会場", "メールアドレス"],
+                ["管理番号", "医院名", "参加者名", "申し込み会場", "メールアドレス"],
             ],
         )
         mock_get_service.return_value = service
@@ -862,26 +865,29 @@ class TestReadMasterRecords(unittest.TestCase):
 
 
 class TestLookupClinicName(unittest.TestCase):
-    """``lookup_clinic_name`` の医院管理番号完全一致挙動。"""
+    """``lookup_clinic_name`` の医院コード前方一致挙動。
+
+    A 列の管理番号 ``101-01`` から派生する ``clinic_number == "101"`` を使う。
+    """
 
     def _records(self) -> list[sheets_client.MasterRecord]:
         return [
             sheets_client.MasterRecord(
-                clinic_number="101",
+                management_number="101-01",
                 clinic_name="三浦歯科医院",
                 participant_name="白川 蓮",
                 venue="東京",
                 email="ren@example.com",
             ),
             sheets_client.MasterRecord(
-                clinic_number="101",
+                management_number="101-02",
                 clinic_name="三浦歯科医院",
                 participant_name="鈴木 一郎",
                 venue="東京",
                 email="ichiro@example.com",
             ),
             sheets_client.MasterRecord(
-                clinic_number="102",
+                management_number="102-01",
                 clinic_name="山本歯科",
                 participant_name="田中 太郎",
                 venue="大阪",
@@ -890,7 +896,7 @@ class TestLookupClinicName(unittest.TestCase):
         ]
 
     def test_exact_match_returns_clinic_name(self):
-        """医院管理番号の完全一致で医院名を返す。"""
+        """医院コードに一致する最初の行の医院名を返す。"""
         records = self._records()
         self.assertEqual(
             sheets_client.lookup_clinic_name(records, "101"), "三浦歯科医院"
@@ -900,17 +906,17 @@ class TestLookupClinicName(unittest.TestCase):
         )
 
     def test_multiple_rows_returns_first_clinic_name(self):
-        """同じ医院管理番号の複数行がある場合、最初に見つかった値を返す。"""
+        """同じ医院コードの複数行がある場合、最初に見つかった値を返す。"""
         records = [
             sheets_client.MasterRecord(
-                clinic_number="101",
+                management_number="101-01",
                 clinic_name="三浦歯科医院",
                 participant_name="A",
                 venue="",
                 email="",
             ),
             sheets_client.MasterRecord(
-                clinic_number="101",
+                management_number="101-02",
                 clinic_name="三浦歯科",  # 表記揺れ。順序的に拾われない
                 participant_name="B",
                 venue="",
@@ -922,7 +928,7 @@ class TestLookupClinicName(unittest.TestCase):
         )
 
     def test_no_match_returns_empty_string(self):
-        """一致行がない（医院管理番号が未登録）→ 空文字。"""
+        """一致行がない（医院コードが未登録）→ 空文字。"""
         records = self._records()
         self.assertEqual(sheets_client.lookup_clinic_name(records, "999"), "")
 
@@ -930,7 +936,7 @@ class TestLookupClinicName(unittest.TestCase):
         """一致行はあるが医院名が空 → 空文字。"""
         records = [
             sheets_client.MasterRecord(
-                clinic_number="103",
+                management_number="103-01",
                 clinic_name="",
                 participant_name="X",
                 venue="",
@@ -938,6 +944,19 @@ class TestLookupClinicName(unittest.TestCase):
             ),
         ]
         self.assertEqual(sheets_client.lookup_clinic_name(records, "103"), "")
+
+    def test_management_number_without_hyphen_treated_as_clinic_code(self):
+        """ハイフンなしの管理番号は医院コードとして直接扱われる。"""
+        records = [
+            sheets_client.MasterRecord(
+                management_number="103",  # ハイフンなし
+                clinic_name="あいうえ歯科",
+                participant_name="X",
+                venue="",
+                email="x@example.com",
+            ),
+        ]
+        self.assertEqual(sheets_client.lookup_clinic_name(records, "103"), "あいうえ歯科")
 
 
 class TestNormalizePersonName(unittest.TestCase):
@@ -1029,21 +1048,21 @@ class TestLookupEmailByClinicAndPerson(unittest.TestCase):
     def _records(self) -> list[sheets_client.MasterRecord]:
         return [
             sheets_client.MasterRecord(
-                clinic_number="101",
+                management_number="101-01",
                 clinic_name="三浦歯科医院",
                 participant_name="白川 蓮",
                 venue="東京",
                 email="ren@example.com",
             ),
             sheets_client.MasterRecord(
-                clinic_number="101",
+                management_number="101-02",
                 clinic_name="三浦歯科医院",
                 participant_name="鈴木 一郎",
                 venue="東京",
                 email="ichiro@example.com",
             ),
             sheets_client.MasterRecord(
-                clinic_number="102",
+                management_number="102-01",
                 clinic_name="山本歯科",
                 participant_name="田中 太郎",
                 venue="大阪",
@@ -1052,7 +1071,7 @@ class TestLookupEmailByClinicAndPerson(unittest.TestCase):
         ]
 
     def test_exact_match_returns_email(self):
-        """医院管理番号と個人名（正規化後完全一致）でメールを返す。"""
+        """医院コードと個人名（正規化後完全一致）でメールを返す。"""
         records = self._records()
         self.assertEqual(
             sheets_client.lookup_email_by_clinic_and_person(
@@ -1089,7 +1108,7 @@ class TestLookupEmailByClinicAndPerson(unittest.TestCase):
         """カタカナとひらがな差は同一視される。"""
         records = [
             sheets_client.MasterRecord(
-                clinic_number="101",
+                management_number="101-01",
                 clinic_name="クリニック",
                 participant_name="ヤマダタロウ",  # マスターはカタカナ
                 venue="",
@@ -1129,14 +1148,14 @@ class TestLookupEmailByClinicAndPerson(unittest.TestCase):
         """同じ医院に同姓同名複数 → 警告 + 先頭採用。"""
         records = [
             sheets_client.MasterRecord(
-                clinic_number="101",
+                management_number="101-01",
                 clinic_name="三浦歯科",
                 participant_name="山田 太郎",
                 venue="",
                 email="first@example.com",
             ),
             sheets_client.MasterRecord(
-                clinic_number="101",
+                management_number="101-02",
                 clinic_name="三浦歯科",
                 participant_name="山田 太郎",  # 同姓同名
                 venue="",
@@ -1152,7 +1171,7 @@ class TestLookupEmailByClinicAndPerson(unittest.TestCase):
         self.assertIn("同姓同名", joined)
 
     def test_clinic_number_match_required(self):
-        """医院管理番号が一致しない行のメールは引かない。"""
+        """医院コードが一致しない行のメールは引かない。"""
         records = self._records()
         # 個人名は 102 の田中太郎、医院は 101 を指定 → ヒットしない
         with self.assertLogs("jissen_comment", level="WARNING"):
@@ -1162,7 +1181,7 @@ class TestLookupEmailByClinicAndPerson(unittest.TestCase):
         self.assertEqual(email, "")
 
     def test_no_match_returns_empty(self):
-        """医院管理番号が未登録 → 空文字 + 警告。"""
+        """医院コードが未登録 → 空文字 + 警告。"""
         records = self._records()
         with self.assertLogs("jissen_comment", level="WARNING"):
             email = sheets_client.lookup_email_by_clinic_and_person(

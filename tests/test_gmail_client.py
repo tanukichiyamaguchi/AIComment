@@ -54,7 +54,7 @@ class TestCreateDraftWithCC(unittest.TestCase):
             draft_id = gmail_client.create_draft(
                 to_email="person@example.com",
                 person_name="白川 蓮",
-                pdf_path=pdf_path,
+                pdf_paths=pdf_path,
                 cc_email="clinic@example.com",
             )
 
@@ -89,7 +89,7 @@ class TestCreateDraftWithCC(unittest.TestCase):
             gmail_client.create_draft(
                 to_email="person@example.com",
                 person_name="田中 太郎",
-                pdf_path=pdf_path,
+                pdf_paths=pdf_path,
                 cc_email=None,
             )
 
@@ -118,7 +118,7 @@ class TestCreateDraftWithCC(unittest.TestCase):
             gmail_client.create_draft(
                 to_email="person@example.com",
                 person_name="山田 花子",
-                pdf_path=pdf_path,
+                pdf_paths=pdf_path,
                 cc_email="",
             )
 
@@ -145,7 +145,7 @@ class TestCreateDraftWithCC(unittest.TestCase):
             gmail_client.create_draft(
                 to_email="person@example.com",
                 person_name="個人 太郎",
-                pdf_path=pdf_path,
+                pdf_paths=pdf_path,
             )
 
         create_call = service.users.return_value.drafts.return_value.create.call_args
@@ -177,7 +177,7 @@ class TestCreateDraftLogging(unittest.TestCase):
                 gmail_client.create_draft(
                     to_email="abcdef@example.com",
                     person_name="白川 蓮",
-                    pdf_path=pdf_path,
+                    pdf_paths=pdf_path,
                     cc_email="ghijkl@example.com",
                 )
 
@@ -208,7 +208,7 @@ class TestCreateDraftLogging(unittest.TestCase):
                 gmail_client.create_draft(
                     to_email="abcdef@example.com",
                     person_name="白川 蓮",
-                    pdf_path=pdf_path,
+                    pdf_paths=pdf_path,
                 )
 
         joined = "\n".join(log_ctx.output)
