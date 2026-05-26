@@ -69,10 +69,10 @@ def _install_step4_mocks(mock_drive, mock_merger, mock_sheets=None) -> None:
     }
     mock_merger.make_output_filename.return_value = "out.pdf"
     if mock_sheets is not None:
-        # 既定: マスター未登録 → AI 抽出値で代用 / メール未登録 → 下書きスキップ
+        # 既定: マスター未登録 → AI 抽出値で代用 / メール未登録 → 宛先空で下書き
         mock_sheets.read_master_records.return_value = []
         mock_sheets.lookup_clinic_name.return_value = ""
-        mock_sheets.lookup_email_by_management_number.return_value = ""
+        mock_sheets.lookup_email_by_clinic_and_person.return_value = ""
 
 
 class TestArgparseProfile(unittest.TestCase):
@@ -383,7 +383,7 @@ class TestStep4ClinicNumberFolder(unittest.TestCase):
         mock_sheets.get_recorded_clinic_numbers.return_value = set()
         mock_sheets.read_master_records.return_value = []
         mock_sheets.lookup_clinic_name.return_value = ""
-        mock_sheets.lookup_email_by_management_number.return_value = ""
+        mock_sheets.lookup_email_by_clinic_and_person.return_value = ""
         mock_drive.download_pdf.return_value = b"%PDF-1.4 fake"
         mock_drive.upload_pdf_to_clinic_person.return_value = {
             "webViewLink": "https://drive.google.com/fake",
@@ -908,12 +908,16 @@ class TestStep4MasterSheetIntegration(unittest.TestCase):
             self._att_file.write_text(self._att_backup)
 
     def _master_record(
-        self, management_number, clinic_name, email,
-        participant_name="X", venue="",
+        self, clinic_number, clinic_name, email,
+        participant_name="田中太郎", venue="",
     ):
+        """テスト用 MasterRecord。``participant_name`` のデフォルトは
+        ``_make_batch_results`` の AI 抽出名と一致させ、突合がヒットするように
+        してある。
+        """
         from src.sheets_client import MasterRecord
         return MasterRecord(
-            management_number=management_number,
+            clinic_number=clinic_number,
             clinic_name=clinic_name,
             participant_name=participant_name,
             venue=venue,
@@ -936,14 +940,14 @@ class TestStep4MasterSheetIntegration(unittest.TestCase):
         mock_sheets.get_recorded_clinic_numbers.return_value = set()
         mock_sheets.read_master_records.return_value = [
             self._master_record(
-                "111-22-3", "標準医院名", "tanaka@example.com"
+                "111", "標準医院名", "tanaka@example.com"
             ),
         ]
         mock_sheets.lookup_clinic_name.side_effect = (
             lambda recs, cn: real_sheets_client.lookup_clinic_name(recs, cn)
         )
-        mock_sheets.lookup_email_by_management_number.side_effect = (
-            lambda recs, mn: real_sheets_client.lookup_email_by_management_number(recs, mn)
+        mock_sheets.lookup_email_by_clinic_and_person.side_effect = (
+            lambda recs, cn, pn: real_sheets_client.lookup_email_by_clinic_and_person(recs, cn, pn)
         )
         _install_step4_mocks(mock_drive, mock_merger)
         profile = _make_profile()
@@ -975,13 +979,13 @@ class TestStep4MasterSheetIntegration(unittest.TestCase):
 
         mock_sheets.get_recorded_clinic_numbers.return_value = set()
         mock_sheets.read_master_records.return_value = [
-            self._master_record("111-22-3", "標準医院名", "t@example.com"),
+            self._master_record("111", "標準医院名", "t@example.com"),
         ]
         mock_sheets.lookup_clinic_name.side_effect = (
             lambda recs, cn: real_sheets_client.lookup_clinic_name(recs, cn)
         )
-        mock_sheets.lookup_email_by_management_number.side_effect = (
-            lambda recs, mn: real_sheets_client.lookup_email_by_management_number(recs, mn)
+        mock_sheets.lookup_email_by_clinic_and_person.side_effect = (
+            lambda recs, cn, pn: real_sheets_client.lookup_email_by_clinic_and_person(recs, cn, pn)
         )
         _install_step4_mocks(mock_drive, mock_merger)
         profile = _make_profile()
@@ -1017,8 +1021,8 @@ class TestStep4MasterSheetIntegration(unittest.TestCase):
         mock_sheets.lookup_clinic_name.side_effect = (
             lambda recs, cn: real_sheets_client.lookup_clinic_name(recs, cn)
         )
-        mock_sheets.lookup_email_by_management_number.side_effect = (
-            lambda recs, mn: real_sheets_client.lookup_email_by_management_number(recs, mn)
+        mock_sheets.lookup_email_by_clinic_and_person.side_effect = (
+            lambda recs, cn, pn: real_sheets_client.lookup_email_by_clinic_and_person(recs, cn, pn)
         )
         _install_step4_mocks(mock_drive, mock_merger)
         profile = _make_profile()
@@ -1043,11 +1047,11 @@ class TestStep4MasterSheetIntegration(unittest.TestCase):
     @patch("src.batch_main.drive_client")
     @patch("src.batch_main.sheets_client")
     @patch("src.batch_main.ensure_fonts")
-    def test_unregistered_email_skips_draft_with_warning(
+    def test_unregistered_email_creates_draft_with_empty_to(
         self, mock_fonts, mock_sheets, mock_drive, mock_gmail,
         mock_creator, mock_merger,
     ):
-        """メール lookup ミス → create_draft 呼ばれず警告。PDF 処理は完了。"""
+        """メール lookup ミス → 宛先空で create_draft + 警告。PDF 処理は完了。"""
         from src import sheets_client as real_sheets_client
 
         mock_sheets.get_recorded_clinic_numbers.return_value = set()
@@ -1055,8 +1059,8 @@ class TestStep4MasterSheetIntegration(unittest.TestCase):
         mock_sheets.lookup_clinic_name.side_effect = (
             lambda recs, cn: real_sheets_client.lookup_clinic_name(recs, cn)
         )
-        mock_sheets.lookup_email_by_management_number.side_effect = (
-            lambda recs, mn: real_sheets_client.lookup_email_by_management_number(recs, mn)
+        mock_sheets.lookup_email_by_clinic_and_person.side_effect = (
+            lambda recs, cn, pn: real_sheets_client.lookup_email_by_clinic_and_person(recs, cn, pn)
         )
         _install_step4_mocks(mock_drive, mock_merger)
         profile = _make_profile()
@@ -1068,10 +1072,13 @@ class TestStep4MasterSheetIntegration(unittest.TestCase):
                 items=_make_batch_items(["111-22-3実践事例.pdf"]),
             )
 
-        mock_gmail.create_draft.assert_not_called()
+        # 下書きは宛先空で 1 回作成される
+        mock_gmail.create_draft.assert_called_once()
+        kwargs = mock_gmail.create_draft.call_args.kwargs
+        self.assertEqual(kwargs["to_email"], "")
         joined = "\n".join(log_ctx.output)
-        self.assertIn("メール未登録", joined)
-        self.assertIn("111-22-3", joined)
+        self.assertIn("マスター未ヒット", joined)
+        self.assertIn("111", joined)
         # PDF 処理は通常通り完了
         mock_drive.upload_pdf_to_clinic_person.assert_called_once()
         mock_sheets.append_output_record.assert_called_once()
@@ -1091,14 +1098,14 @@ class TestStep4MasterSheetIntegration(unittest.TestCase):
 
         mock_sheets.get_recorded_clinic_numbers.return_value = set()
         mock_sheets.read_master_records.return_value = [
-            self._master_record("111-22-3", "三浦歯科医院", "t@example.com"),
-            self._master_record("222-22-3", "山本歯科", "next@example.com"),
+            self._master_record("111", "三浦歯科医院", "t@example.com"),
+            self._master_record("222", "山本歯科", "next@example.com"),
         ]
         mock_sheets.lookup_clinic_name.side_effect = (
             lambda recs, cn: real_sheets_client.lookup_clinic_name(recs, cn)
         )
-        mock_sheets.lookup_email_by_management_number.side_effect = (
-            lambda recs, mn: real_sheets_client.lookup_email_by_management_number(recs, mn)
+        mock_sheets.lookup_email_by_clinic_and_person.side_effect = (
+            lambda recs, cn, pn: real_sheets_client.lookup_email_by_clinic_and_person(recs, cn, pn)
         )
         mock_gmail.create_draft.side_effect = [
             RuntimeError("Gmail API down"),
@@ -1139,8 +1146,8 @@ class TestStep4MasterSheetIntegration(unittest.TestCase):
         mock_sheets.lookup_clinic_name.side_effect = (
             lambda recs, cn: real_sheets_client.lookup_clinic_name(recs, cn)
         )
-        mock_sheets.lookup_email_by_management_number.side_effect = (
-            lambda recs, mn: real_sheets_client.lookup_email_by_management_number(recs, mn)
+        mock_sheets.lookup_email_by_clinic_and_person.side_effect = (
+            lambda recs, cn, pn: real_sheets_client.lookup_email_by_clinic_and_person(recs, cn, pn)
         )
         _install_step4_mocks(mock_drive, mock_merger)
         profile = _make_profile()
@@ -1172,14 +1179,14 @@ class TestStep4MasterSheetIntegration(unittest.TestCase):
         mock_sheets.get_recorded_clinic_numbers.return_value = set()
         mock_sheets.read_master_records.return_value = [
             self._master_record(
-                "111-22-3", "三浦歯科医院", "tanaka@example.com"
+                "111", "三浦歯科医院", "tanaka@example.com"
             ),
         ]
         mock_sheets.lookup_clinic_name.side_effect = (
             lambda recs, cn: real_sheets_client.lookup_clinic_name(recs, cn)
         )
-        mock_sheets.lookup_email_by_management_number.side_effect = (
-            lambda recs, mn: real_sheets_client.lookup_email_by_management_number(recs, mn)
+        mock_sheets.lookup_email_by_clinic_and_person.side_effect = (
+            lambda recs, cn, pn: real_sheets_client.lookup_email_by_clinic_and_person(recs, cn, pn)
         )
         _install_step4_mocks(mock_drive, mock_merger)
         # 添付資料 1 件を batch_attachments.json に入れる
