@@ -23,7 +23,7 @@ from typing import Any
 
 import yaml
 
-from src.config import EMAIL_SHEET_NAME
+from src.config import MASTER_SHEET_NAME
 
 PROFILES_DIR = Path(__file__).resolve().parent.parent / "profiles"
 
@@ -45,9 +45,10 @@ class ProfileConfig:
     シークレット参照（``*_secret`` フィールド）は ``load_profile`` 内で
     環境変数を参照して解決済みの値（folder ID 等）に置き換わる。
 
-    ``email_sheet_name`` は Gmail 下書き作成用のメールアドレス一覧シートの
-    タブ名。YAML で省略可能で、省略時は ``EMAIL_SHEET_NAME`` グローバル値
-    （``メールアドレス一覧``）にフォールバックする。
+    ``master_sheet_name`` は参加者マスターシートのタブ名（医院名標準化 +
+    Gmail 下書き作成用ルックアップ表）。YAML で省略可能で、省略時は
+    ``MASTER_SHEET_NAME`` グローバル値（``参加者マスター``）にフォールバック
+    する。
     """
 
     name: str
@@ -58,7 +59,7 @@ class ProfileConfig:
     output_folder_id: str
     output_sheet_name: str
     prompt_template: str
-    email_sheet_name: str = EMAIL_SHEET_NAME
+    master_sheet_name: str = MASTER_SHEET_NAME
 
 
 def load_profile(profile_name: str) -> ProfileConfig:
@@ -110,12 +111,12 @@ def load_profile(profile_name: str) -> ProfileConfig:
             f"'{output_secret_name}' が未設定"
         )
 
-    # メールアドレスシート名は YAML で省略可能（必須フィールド外）。
-    # 省略時はグローバル既定値 ``EMAIL_SHEET_NAME`` を使う。
-    email_sheet_name = (
-        str(data["email_sheet_name"])
-        if "email_sheet_name" in data
-        else EMAIL_SHEET_NAME
+    # 参加者マスターシート名は YAML で省略可能（必須フィールド外）。
+    # 省略時はグローバル既定値 ``MASTER_SHEET_NAME`` を使う。
+    master_sheet_name = (
+        str(data["master_sheet_name"])
+        if "master_sheet_name" in data
+        else MASTER_SHEET_NAME
     )
 
     return ProfileConfig(
@@ -127,7 +128,7 @@ def load_profile(profile_name: str) -> ProfileConfig:
         output_folder_id=output_id,
         output_sheet_name=str(data["output_sheet_name"]),
         prompt_template=str(data["prompt_template"]),
-        email_sheet_name=email_sheet_name,
+        master_sheet_name=master_sheet_name,
     )
 
 
