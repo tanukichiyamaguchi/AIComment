@@ -1517,5 +1517,72 @@ class TestRunUsesTargetFolder(unittest.TestCase):
         mock_resolve_context.assert_not_called()
 
 
+class TestCreateGroupedDraftsForRun(unittest.TestCase):
+    """F-06 / pdf_paths 型 回帰防止: グループ化 + 下書き作成の挙動。"""
+
+    def _items(self, *triples):
+        """``[(email, person_name, pdf_path), ...]`` を draft_items に変換。"""
+        return [
+            {
+                "email": email,
+                "person_name": person,
+                "pdf_path": path,
+                "clinic_number": "101",
+            }
+            for email, person, path in triples
+        ]
+
+    def test_single_person_single_email_uses_name_as_is(self):
+        gmail = MagicMock()
+        items = self._items(("a@example.com", "山田太郎", "/tmp/a.pdf"))
+        main_module._create_grouped_drafts_for_run(items, gmail)
+        gmail.create_draft.assert_called_once()
+        call = gmail.create_draft.call_args
+        self.assertEqual(call.kwargs["person_name"], "山田太郎")
+        self.assertEqual(call.kwargs["pdf_paths"], ["/tmp/a.pdf"])
+
+    def test_multiple_persons_same_email_uses_combined_name(self):
+        """同一メール × 別人 → 'X ほかN名' 形式 + WARNING。"""
+        gmail = MagicMock()
+        items = self._items(
+            ("shared@example.com", "山田太郎", "/tmp/a.pdf"),
+            ("shared@example.com", "鈴木花子", "/tmp/b.pdf"),
+        )
+        with self.assertLogs("jissen_comment", level="WARNING") as cm:
+            main_module._create_grouped_drafts_for_run(items, gmail)
+        gmail.create_draft.assert_called_once()
+        call = gmail.create_draft.call_args
+        # sorted set なので 鈴木花子 < 山田太郎 の順だが、安定して "ほか1名" を含む
+        self.assertIn("ほか1名", call.kwargs["person_name"])
+        self.assertEqual(
+            sorted(call.kwargs["pdf_paths"]), ["/tmp/a.pdf", "/tmp/b.pdf"]
+        )
+        self.assertTrue(any("異なる個人名" in m for m in cm.output))
+
+    def test_empty_email_creates_separate_draft_with_list_pdf_paths(self):
+        """メール空 → 項目ごとに 1 通、pdf_paths は list でラップされる。"""
+        gmail = MagicMock()
+        items = self._items(("", "山田太郎", "/tmp/a.pdf"))
+        main_module._create_grouped_drafts_for_run(items, gmail)
+        gmail.create_draft.assert_called_once()
+        call = gmail.create_draft.call_args
+        self.assertEqual(call.kwargs["to_email"], "")
+        # F: pdf_paths は list[Path] 型一貫性のためリストで渡す
+        self.assertIsInstance(call.kwargs["pdf_paths"], list)
+        self.assertEqual(call.kwargs["pdf_paths"], ["/tmp/a.pdf"])
+
+    def test_three_persons_same_email_says_hoka_2_mei(self):
+        gmail = MagicMock()
+        items = self._items(
+            ("g@example.com", "山田太郎", "/tmp/a.pdf"),
+            ("g@example.com", "鈴木花子", "/tmp/b.pdf"),
+            ("g@example.com", "佐藤次郎", "/tmp/c.pdf"),
+        )
+        with self.assertLogs("jissen_comment", level="WARNING"):
+            main_module._create_grouped_drafts_for_run(items, gmail)
+        call = gmail.create_draft.call_args
+        self.assertIn("ほか2名", call.kwargs["person_name"])
+
+
 if __name__ == "__main__":
     unittest.main()

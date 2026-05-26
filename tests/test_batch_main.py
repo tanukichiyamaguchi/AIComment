@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 import sys
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from src import batch_main
 from src.config import LOGS_DIR
@@ -1219,6 +1219,48 @@ class TestStep4MasterSheetIntegration(unittest.TestCase):
         self.assertIsNone(kwargs["cc_email"])
         # 添付ファイルは 2 件（メイン PDF + 添付資料 PDF）
         self.assertEqual(len(kwargs["pdf_paths"]), 2)
+
+
+class TestCreateGroupedDraftsForBatch(unittest.TestCase):
+    """F-06 / pdf_paths 型 回帰防止（Batch モード版）。"""
+
+    def _items(self, *triples):
+        return [
+            {
+                "email": email,
+                "person_name": person,
+                "pdf_path": path,
+                "clinic_number": "101",
+            }
+            for email, person, path in triples
+        ]
+
+    @patch("src.batch_main.gmail_client")
+    def test_single_person_passes_through(self, mock_gmail):
+        items = self._items(("a@example.com", "山田太郎", "/tmp/a.pdf"))
+        batch_main._create_grouped_drafts_for_batch(items)
+        call = mock_gmail.create_draft.call_args
+        self.assertEqual(call.kwargs["person_name"], "山田太郎")
+        self.assertEqual(call.kwargs["pdf_paths"], ["/tmp/a.pdf"])
+
+    @patch("src.batch_main.gmail_client")
+    def test_multiple_persons_use_hoka_format(self, mock_gmail):
+        items = self._items(
+            ("g@example.com", "山田太郎", "/tmp/a.pdf"),
+            ("g@example.com", "鈴木花子", "/tmp/b.pdf"),
+        )
+        with self.assertLogs("jissen_comment", level="WARNING"):
+            batch_main._create_grouped_drafts_for_batch(items)
+        call = mock_gmail.create_draft.call_args
+        self.assertIn("ほか1名", call.kwargs["person_name"])
+
+    @patch("src.batch_main.gmail_client")
+    def test_empty_email_wraps_pdf_path_in_list(self, mock_gmail):
+        items = self._items(("", "山田太郎", "/tmp/a.pdf"))
+        batch_main._create_grouped_drafts_for_batch(items)
+        call = mock_gmail.create_draft.call_args
+        self.assertIsInstance(call.kwargs["pdf_paths"], list)
+        self.assertEqual(call.kwargs["pdf_paths"], ["/tmp/a.pdf"])
 
 
 if __name__ == "__main__":

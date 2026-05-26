@@ -188,7 +188,7 @@ def _ensure_sheet_with_header(
     spreadsheet_id: str,
     sheet_name: str,
     header: list[str],
-) -> None:
+) -> bool:
     """指定シートが無ければ作成し、ヘッダー行が空なら書き込む（汎用ヘルパー）。
 
     出力一覧シート（6列）と医院フォルダURLシート（3列）と参加者マスター
@@ -200,13 +200,19 @@ def _ensure_sheet_with_header(
         spreadsheet_id: スプレッドシートID
         sheet_name: シート名（タブ名）
         header: ヘッダー行（列数はこのリスト長から決まる）
+
+    Returns:
+        本呼び出しでタブを **新規作成** したなら True、既存タブを再利用したなら
+        False。呼び出し側が「初回作成かどうか」で警告レベルを切り替えるために使う
+        （参加者マスターのサイレント空読み事故対策、P-022）。
     """
     meta = service.spreadsheets().get(
         spreadsheetId=spreadsheet_id
     ).execute(num_retries=GOOGLE_API_NUM_RETRIES)
     existing_titles = [s["properties"]["title"] for s in meta.get("sheets", [])]
 
-    if sheet_name not in existing_titles:
+    was_created = sheet_name not in existing_titles
+    if was_created:
         service.spreadsheets().batchUpdate(
             spreadsheetId=spreadsheet_id,
             body={
@@ -232,6 +238,8 @@ def _ensure_sheet_with_header(
             body={"values": [header]},
         ).execute(num_retries=GOOGLE_API_NUM_RETRIES)
         logger.info(f"Sheets: シートのヘッダーを書き込み ({sheet_name})")
+
+    return was_created
 
 
 def _ensure_output_sheet(
@@ -599,11 +607,28 @@ def _ensure_master_sheet(
     service: Any,
     spreadsheet_id: str,
     sheet_name: str,
-) -> None:
-    """参加者マスターシート（5列）が無ければ作成し、ヘッダー行を書き込む。"""
-    _ensure_sheet_with_header(
+) -> bool:
+    """参加者マスターシート（5列）が無ければ作成し、ヘッダー行を書き込む。
+
+    本タブを「**今回の呼び出しで**」新規作成した場合は、運用者が見落とさない
+    よう WARNING を出す。マスタータブが空のまま実行されると Gmail 下書きの TO が
+    全件空になる事故（過去発生）の再発防止（P-022）。
+
+    Returns:
+        本呼び出しで新規作成したなら True。既存タブを再利用したなら False。
+    """
+    was_created = _ensure_sheet_with_header(
         service, spreadsheet_id, sheet_name, _MASTER_SHEET_HEADER
     )
+    if was_created:
+        logger.warning(
+            f"参加者マスタータブ '{sheet_name}' をスプレッドシート "
+            f"{spreadsheet_id} に新規作成しました（ヘッダーのみの空タブ）。"
+            f"このまま PDF 処理を実行すると、参加者の lookup が全件失敗し、"
+            f"Gmail 下書きの TO が全件空になります。"
+            f"スプレッドシートのタブにデータを投入してから再実行してください。"
+        )
+    return was_created
 
 
 def read_master_records(
@@ -630,7 +655,7 @@ def read_master_records(
     sheet_name = sheet_name or MASTER_SHEET_NAME
 
     service = get_sheets_service()
-    _ensure_master_sheet(service, spreadsheet_id, sheet_name)
+    was_created = _ensure_master_sheet(service, spreadsheet_id, sheet_name)
 
     result = service.spreadsheets().values().get(
         spreadsheetId=spreadsheet_id,
@@ -639,6 +664,8 @@ def read_master_records(
 
     rows = result.get("values", [])
     if not rows:
+        # ヘッダーすら無い状態（API は完全空のシートでは values キーを返さない）。
+        # 直前に作成したなら _ensure_master_sheet が WARNING 済みなので INFO で OK。
         logger.info(
             f"Sheets: 参加者マスターシートが空 (ヘッダーのみ): {sheet_name}"
         )
@@ -675,10 +702,39 @@ def read_master_records(
             email=email,
         ))
 
-    logger.info(
-        f"Sheets: 参加者マスター {len(records)}件を取得 ({sheet_name})"
-    )
+    if not records:
+        # ヘッダーは存在するが行が無いケース。Gmail 下書きの TO が全件空に
+        # なるため、サイレントに INFO で流すのではなく WARNING を出す（P-022）。
+        logger.warning(
+            f"Sheets: 参加者マスター '{sheet_name}' は 0 件です（ヘッダーのみ）。"
+            f"このまま PDF 処理を実行すると Gmail 下書きの TO が全件空になります。"
+        )
+    else:
+        logger.info(
+            f"Sheets: 参加者マスター {len(records)}件を取得 ({sheet_name})"
+        )
     return records
+
+
+def _normalize_clinic_number(clinic_number: str) -> str:
+    """医院番号を比較用に正規化（先頭ゼロ除去）。
+
+    PDF ファイル名と参加者マスターで医院番号のゼロパディング桁数が異なる
+    ケース（``"001"`` と ``"00001"`` を同一医院として扱う）を吸収するため、
+    先頭ゼロを除去してから比較する。空文字は空文字を返す。``"000"`` のような
+    全部ゼロのケースは ``"0"`` を返す（lstrip 後が空になるのを避ける）。
+    """
+    if not clinic_number:
+        return ""
+    stripped = clinic_number.lstrip("0")
+    return stripped or "0"
+
+
+# ファジー一致を許可する個人名の最小文字数（正規化後）。1-2 文字の CJK 名は
+# Levenshtein 距離 1 で他人を誤って巻き込むリスクが高い（例: ``木`` ↔ ``林``
+# は距離 1 で同一クリニックの別人を誤マッチする）ため、短すぎる名前では
+# ファジー一致を無効化し、完全一致のみ採用する（P-022）。
+_FUZZY_MIN_LENGTH = 3
 
 
 def lookup_clinic_name(
@@ -702,8 +758,12 @@ def lookup_clinic_name(
     if not clinic_number:
         return ""
 
+    norm_target = _normalize_clinic_number(clinic_number)
     for r in records:
-        if r.clinic_number == clinic_number and r.clinic_name:
+        if (
+            _normalize_clinic_number(r.clinic_number) == norm_target
+            and r.clinic_name
+        ):
             return r.clinic_name
     return ""
 
@@ -738,7 +798,11 @@ def lookup_email_by_clinic_and_person(
     if not clinic_number or not person_name:
         return ""
 
-    candidates = [r for r in records if r.clinic_number == clinic_number]
+    norm_clinic_target = _normalize_clinic_number(clinic_number)
+    candidates = [
+        r for r in records
+        if _normalize_clinic_number(r.clinic_number) == norm_clinic_target
+    ]
     if not candidates:
         logger.warning(
             f"参加者マスター: 医院管理番号 {clinic_number} に該当行なし "
@@ -761,6 +825,17 @@ def lookup_email_by_clinic_and_person(
             f"({person_name!r} で {len(exact)}件) → 先頭採用"
         )
         return exact[0].email
+
+    # ファジー一致を試す前に、個人名が短すぎる（1-2 文字 CJK 等）場合は
+    # 距離 1 で他人を誤マッチするリスクが高いため、ファジー一致をスキップ
+    # して完全一致のみ採用する（P-022）。
+    if len(normalized_target) < _FUZZY_MIN_LENGTH:
+        logger.warning(
+            f"参加者マスター: 個人名 {person_name!r} が短すぎてファジー一致を"
+            f"スキップ (医院 {clinic_number} 内に完全一致なし、誤マッチ防止のため"
+            f"距離 1 候補は採用しない)"
+        )
+        return ""
 
     # ファジー一致（Levenshtein 距離 ≤ 1）
     fuzzy = [

@@ -67,8 +67,9 @@ class RunConfig:
     インターフェースだけに依存することで、分岐コードを最小化する。
 
     ``master_sheet_name`` は参加者マスターシート名（医院名標準化 + Gmail
-    下書きの TO ルックアップ用）。自動検出モードでは Profile 由来ではないため
-    ``MASTER_SHEET_NAME`` の既定値を使う。
+    下書きの TO ルックアップ用）。自動検出モードでは Profile 由来ではないため、
+    ``target_folder_name`` から「``<フォルダ名>_参加者マスター``」を派生させる
+    （セミナーごとに別タブを使う運用、F-09 修正）。
     """
     display_name: str
     input_folder_id: str
@@ -91,11 +92,16 @@ class RunConfig:
 
     @classmethod
     def from_discovered(cls, ctx: DiscoveredContext) -> "RunConfig":
+        # セミナー（target_folder）ごとに専用の参加者マスタータブを使う。
+        # 全セミナーで同じ既定タブ ``参加者マスター`` を共有すると、
+        # 別セミナーの参加者へ誤送信するリスクがあるため
+        # ``<フォルダ名>_参加者マスター`` を採用する（F-09 修正）。
         return cls(
             display_name=f"自動検出: {ctx.target_folder_name}",
             input_folder_id=ctx.input_folder_id,
             output_folder_id=ctx.output_folder_id,
             output_sheet_name=ctx.output_sheet_name,
+            master_sheet_name=f"{ctx.target_folder_name}_参加者マスター",
         )
 
 

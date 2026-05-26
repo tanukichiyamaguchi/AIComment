@@ -574,12 +574,17 @@ def _create_grouped_drafts_for_batch(
 
     for email, items in groups.items():
         pdf_paths = [item["pdf_path"] for item in items]
-        person_name = items[0]["person_name"]
-        unique_names = {item["person_name"] for item in items}
-        if len(unique_names) > 1:
+        unique_names = sorted({item["person_name"] for item in items})
+        if len(unique_names) == 1:
+            person_name = unique_names[0]
+        else:
+            # 同一メールに別人が紐づく場合（家族メール、医院共有メール等）、
+            # 件名・本文に複数名が含まれていることを示す形式に切り替える
+            # （F-06: 先頭1名だけ書くと受信者が混乱するため）
+            person_name = f"{unique_names[0]} ほか{len(unique_names) - 1}名"
             logger.warning(
                 f"同一メール {email!r} に異なる個人名が紐づいています: "
-                f"{sorted(unique_names)} → 先頭の {person_name!r} を採用"
+                f"{unique_names} → '{person_name}' で下書き作成"
             )
         try:
             gmail_client.create_draft(
@@ -598,7 +603,7 @@ def _create_grouped_drafts_for_batch(
             gmail_client.create_draft(
                 to_email="",
                 person_name=item["person_name"],
-                pdf_paths=item["pdf_path"],
+                pdf_paths=[item["pdf_path"]],
                 cc_email=None,
             )
         except Exception as e:
