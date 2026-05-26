@@ -33,7 +33,7 @@ from src.utils import (
 )
 from src import discover, drive_client, gmail_client, sheets_client
 from src import pdf_reader, comment_generator, pdf_creator, pdf_merger
-from src.sheets_client import EmailRecord
+from src.sheets_client import MasterRecord
 
 
 def run(
@@ -125,12 +125,12 @@ def run(
     )
     clinics_recorded_this_run: set[str] = set()
 
-    # メールアドレス一覧シートをループ開始前に 1 回だけ読み込む。Gmail 下書き
-    # 作成時の TO/CC を ``lookup_email`` で引くためのスナップショット。シート
-    # 未作成なら自動作成（ヘッダーのみ）+ 空リストを返す。メイン経路と添付資料
-    # 経路で共有する（毎回読まない）。
-    email_records: list[EmailRecord] = sheets_client.read_email_records(
-        sheet_name=cfg.email_sheet_name,
+    # 参加者マスターシートをループ開始前に 1 回だけ読み込む。医院名の標準化
+    # （フォルダ命名・各種シート列）と Gmail 下書きの TO ルックアップを兼ねる
+    # スナップショット。シート未作成なら自動作成（ヘッダーのみ）+ 空リストを
+    # 返す。メイン経路と添付資料経路で共有する（毎回読まない）。
+    master_records: list[MasterRecord] = sheets_client.read_master_records(
+        sheet_name=cfg.master_sheet_name,
     )
 
     targets: list[dict] = []
@@ -190,35 +190,34 @@ def run(
         clinics_recorded_this_run.add(clinic_number)
 
     def _create_gmail_draft(
-        clinic_number: str,
+        management_number: str,
         person_name: str,
         pdf_path: Path,
     ) -> None:
         """PDF アップロード成功後の副作用として Gmail 下書きを作成する。
 
-        メールアドレス一覧シートから ``(医院番号, 個人名)`` でルックアップし、
-        TO（個人メール優先、無ければ医院メール）と CC（個人メール宛のとき
-        だけ医院メールを CC）を決める。メール未登録ならスキップ（警告）。
-        例外が発生しても PDF 処理は止めずに次へ進む（fail-soft）。
+        参加者マスターシートから管理番号でメールアドレスを引き、TO に設定する
+        （CC は現運用では使わない）。メール未登録ならスキップ（警告）。例外が
+        発生しても PDF 処理は止めずに次へ進む（fail-soft）。
 
         下書きの重複作成防止は管理番号デデュープ（P-015）に依存。本関数では
         独自のリトライ・重複チェックは行わない。
         """
         try:
-            to_email, cc_email = sheets_client.lookup_email(
-                email_records, clinic_number, person_name,
+            email = sheets_client.lookup_email_by_management_number(
+                master_records, management_number,
             )
-            if to_email:
+            if email:
                 gmail_client.create_draft(
-                    to_email=to_email,
+                    to_email=email,
                     person_name=person_name,
                     pdf_path=pdf_path,
-                    cc_email=cc_email or None,
+                    cc_email=None,  # CC は現運用では使わない
                 )
             else:
                 logger.warning(
                     f"Gmail下書きスキップ: メール未登録 "
-                    f"(医院番号={clinic_number}, 個人名={person_name})"
+                    f"(管理番号={management_number})"
                 )
         except Exception as e:
             logger.error(f"Gmail下書き作成失敗（処理は続行）: {e}", exc_info=True)
@@ -240,7 +239,7 @@ def run(
                 pdf_text=pdf_text,
                 pdf_filename=file_name,
             )
-            clinic_name = metadata["clinic_name"] or "unknown_clinic"
+            clinic_name_from_ai = metadata["clinic_name"] or "unknown_clinic"
             person_name = metadata["person_name"] or "unknown_person"
             sample_title = metadata["sample_title"] or Path(file_name).stem
             comment = metadata["comment"]
@@ -251,6 +250,27 @@ def run(
             # なし）の場合は ``find_or_create_clinic_folder`` 側で旧来の名前
             # ベース照合にフォールバックする。
             clinic_number = extract_clinic_number(file_name)
+            mgmt_num = extract_management_number(file_name)
+
+            # 医院名は参加者マスターから引いた標準表記を最優先（表記統一 +
+            # 「開業準備中」等の固定文字列対応）。未登録なら AI 抽出値で代用
+            # （現状維持の挙動）。代用時は必ず警告ログを出す。以後すべての
+            # 医院名用途で ``clinic_name`` 変数を使う。
+            clinic_name_from_master = sheets_client.lookup_clinic_name(
+                master_records, clinic_number,
+            )
+            if clinic_name_from_master:
+                clinic_name = clinic_name_from_master
+                logger.info(
+                    f"医院名をマスターシートから取得: "
+                    f"{clinic_number} → {clinic_name}"
+                )
+            else:
+                clinic_name = clinic_name_from_ai
+                logger.warning(
+                    f"参加者マスター未登録、AI 抽出値で代用: "
+                    f"医院番号={clinic_number}, AI 抽出={clinic_name_from_ai}"
+                )
 
             output_filename = pdf_merger.make_output_filename(
                 clinic_name, person_name, sample_title
@@ -282,7 +302,6 @@ def run(
                 )
 
                 # 管理番号は処理対象選定時に抽出・検証済み（空でないことが保証される）。
-                mgmt_num = extract_management_number(file_name)
                 sheets_client.append_output_record(
                     management_number=mgmt_num,
                     clinic_name=clinic_name,
@@ -301,15 +320,15 @@ def run(
                 # Gmail 下書きを作成（メール未登録ならスキップ・例外時も続行）。
                 # tempdir スコープ内で実行することで PDF ファイルにアクセスできる。
                 _create_gmail_draft(
-                    clinic_number=clinic_number,
+                    management_number=mgmt_num,
                     person_name=person_name,
                     pdf_path=output_path,
                 )
 
             # 添付資料パススルー用の対応表を構築。同じ管理番号の添付資料を
-            # このメインと同じ出力フォルダへコピーするために使う。医院番号と
-            # 医院名（AI 抽出の生の値）を別々に持ち、添付資料アップロード時に
-            # 同じ ``find_or_create_clinic_folder`` で同じフォルダへ合流させる。
+            # このメインと同じ出力フォルダへコピーするために使う。医院名は
+            # 既にマスター標準化済みの値が入っているため、添付資料経路は
+            # この表をそのまま再利用すれば同じフォルダ・同じ列値になる。
             case_map[mgmt_num] = (clinic_number, clinic_name, person_name)
 
             logger.info(
@@ -355,10 +374,10 @@ def run(
             stats["skip_attachment_orphan"] += 1
             continue
 
-        # case_map は (医院番号, 医院名, 個人名)。添付資料はメインと同じ管理
-        # 番号 = 同じ医院番号なので、``find_or_create_clinic_folder`` 経由で
-        # メインと同じ医院フォルダへコピーされる。出力一覧シートの医院名列は
-        # AI 抽出値（医院番号なし）。
+        # case_map は (医院番号, 医院名, 個人名)。医院名はメイン処理ループで
+        # 既に参加者マスター標準化済み（未登録時は AI 抽出値）。添付資料は
+        # メインと同じ管理番号 = 同じ医院番号なので、``find_or_create_clinic_folder``
+        # 経由でメインと同じ医院フォルダへコピーされる。
         clinic_number, clinic_name, person_name = case
         try:
             # 元 PDF のバイト列をそのまま再アップロード（マージ・コメント
@@ -387,10 +406,10 @@ def run(
                 )
 
                 # 添付資料経路も Gmail 下書きを作成する（同じ個人宛で、件名は
-                # メインと同じテンプレート）。メイン経路と同じ ``email_records``
+                # メインと同じテンプレート）。メイン経路と同じ ``master_records``
                 # を共有し、API 呼び出しを 1 回読みで済ます。
                 _create_gmail_draft(
-                    clinic_number=clinic_number,
+                    management_number=mgmt_num,
                     person_name=person_name,
                     pdf_path=attachment_path,
                 )
