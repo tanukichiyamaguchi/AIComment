@@ -81,7 +81,7 @@ def _install_main_mocks(
     参加者マスター系のデフォルト戻り値（未登録扱い）も同時設定する:
         - read_master_records → []
         - lookup_clinic_name → "" (AI 抽出値にフォールバック)
-        - lookup_email_by_management_number → "" (下書きスキップ)
+        - lookup_email_by_clinic_and_person → "" (宛先空で下書き作成)
     """
     mock_drive.list_pdfs.return_value = _make_pdf_files(pdf_count)
     mock_drive.download_pdf.return_value = b"%PDF-1.4 fake"
@@ -99,7 +99,7 @@ def _install_main_mocks(
     # 参加者マスター系の既定: マスター未登録 → AI 抽出値で代用 / メール未登録
     mock_sheets.read_master_records.return_value = []
     mock_sheets.lookup_clinic_name.return_value = ""
-    mock_sheets.lookup_email_by_management_number.return_value = ""
+    mock_sheets.lookup_email_by_clinic_and_person.return_value = ""
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -1035,7 +1035,7 @@ class TestLegacyBehaviorRegression(unittest.TestCase):
         # マスター未登録 → AI 抽出値で代用
         mock_sheets.read_master_records.return_value = []
         mock_sheets.lookup_clinic_name.return_value = ""
-        mock_sheets.lookup_email_by_management_number.return_value = ""
+        mock_sheets.lookup_email_by_clinic_and_person.return_value = ""
 
         # pdf_merger は merge_pdfs だけモックし、make_output_filename は本物を使う
         with patch("src.main.pdf_merger.merge_pdfs"):
@@ -1582,7 +1582,7 @@ class TestAttachmentPassthroughE2E(unittest.TestCase):
         # マスター未登録 → AI 抽出値で代用 / メール未登録 → 下書きスキップ
         mock_sheets.read_master_records.return_value = []
         mock_sheets.lookup_clinic_name.return_value = ""
-        mock_sheets.lookup_email_by_management_number.return_value = ""
+        mock_sheets.lookup_email_by_clinic_and_person.return_value = ""
 
         main.run(test_count=0, profile_name="jissen_default")
 
@@ -1660,7 +1660,7 @@ class TestAttachmentPassthroughE2E(unittest.TestCase):
         # マスター未登録 → AI 抽出値で代用 / メール未登録 → 下書きスキップ
         mock_sheets.read_master_records.return_value = []
         mock_sheets.lookup_clinic_name.return_value = ""
-        mock_sheets.lookup_email_by_management_number.return_value = ""
+        mock_sheets.lookup_email_by_clinic_and_person.return_value = ""
 
         with patch("src.batch_main.time.sleep"):
             batch_main.run(
@@ -1742,7 +1742,7 @@ class TestClinicNumberFolderE2E(unittest.TestCase):
         # マスター未登録 → AI 抽出値で代用 / メール未登録 → 下書きスキップ
         mock_sheets.read_master_records.return_value = []
         mock_sheets.lookup_clinic_name.return_value = ""
-        mock_sheets.lookup_email_by_management_number.return_value = ""
+        mock_sheets.lookup_email_by_clinic_and_person.return_value = ""
         mock_reader.extract_text.return_value = "PDFテキスト"
         mock_gen.generate_comment_with_metadata.return_value = _make_metadata()
         mock_merger.make_output_filename.return_value = "out.pdf"
@@ -1832,7 +1832,7 @@ class TestClinicNumberFolderE2E(unittest.TestCase):
         # マスター未登録 → AI 抽出値で代用 / メール未登録 → 下書きスキップ
         mock_sheets.read_master_records.return_value = []
         mock_sheets.lookup_clinic_name.return_value = ""
-        mock_sheets.lookup_email_by_management_number.return_value = ""
+        mock_sheets.lookup_email_by_clinic_and_person.return_value = ""
         mock_reader.extract_text.return_value = "PDFテキスト"
         mock_gen.submit_batch.return_value = "batch_clinic_001"
         mock_gen.get_batch_status.return_value = {
@@ -1916,7 +1916,7 @@ class TestClinicFolderByNumberE2E(unittest.TestCase):
         # マスター未登録 → AI 抽出値で代用 / メール未登録 → 下書きスキップ
         mock_sheets.read_master_records.return_value = []
         mock_sheets.lookup_clinic_name.return_value = ""
-        mock_sheets.lookup_email_by_management_number.return_value = ""
+        mock_sheets.lookup_email_by_clinic_and_person.return_value = ""
         mock_reader.extract_text.return_value = "PDFテキスト"
         # AI 抽出側の医院名表記揺れ — 同じ医院番号 001 でも語が違う
         mock_gen.generate_comment_with_metadata.side_effect = [
@@ -1983,12 +1983,15 @@ class TestMasterSheetIntegrationE2E(unittest.TestCase):
         self._env_patcher.stop()
 
     def _master_record(
-        self, management_number, clinic_name, email,
-        participant_name="X", venue="",
+        self, clinic_number, clinic_name, email,
+        participant_name="田中太郎", venue="",
     ):
+        """テスト用 MasterRecord。``participant_name`` のデフォルトは
+        AI 抽出名 ``田中太郎`` と一致させ、突合がヒットするようにしてある。
+        """
         from src.sheets_client import MasterRecord
         return MasterRecord(
-            management_number=management_number,
+            clinic_number=clinic_number,
             clinic_name=clinic_name,
             participant_name=participant_name,
             venue=venue,
@@ -2020,16 +2023,16 @@ class TestMasterSheetIntegrationE2E(unittest.TestCase):
             mock_creator, mock_merger, mock_fonts, pdf_count=4,
         )
         mock_sheets.read_master_records.return_value = [
-            self._master_record("001-00-0", "001 標準名", "p1@example.com"),
-            self._master_record("002-00-0", "002 標準名", "p2@example.com"),
-            self._master_record("003-00-0", "003 標準名", "p3@example.com"),
-            # 004-00-0 はマスター未登録
+            self._master_record("001", "001 標準名", "p1@example.com"),
+            self._master_record("002", "002 標準名", "p2@example.com"),
+            self._master_record("003", "003 標準名", "p3@example.com"),
+            # 004 (clinic_number) はマスター未登録
         ]
         mock_sheets.lookup_clinic_name.side_effect = (
             lambda recs, cn: real_sheets_client.lookup_clinic_name(recs, cn)
         )
-        mock_sheets.lookup_email_by_management_number.side_effect = (
-            lambda recs, mn: real_sheets_client.lookup_email_by_management_number(recs, mn)
+        mock_sheets.lookup_email_by_clinic_and_person.side_effect = (
+            lambda recs, cn, pn: real_sheets_client.lookup_email_by_clinic_and_person(recs, cn, pn)
         )
         mock_sheets.get_processed_management_numbers.return_value = set()
         mock_sheets.get_recorded_clinic_numbers.return_value = set()
@@ -2037,21 +2040,21 @@ class TestMasterSheetIntegrationE2E(unittest.TestCase):
         with self.assertLogs("jissen_comment", level="WARNING") as log_ctx:
             main.run(test_count=0, profile_name="jissen_default")
 
-        # マスター登録済み 3 件 → create_draft 3 回（CC は常に None）
-        self.assertEqual(mock_gmail.create_draft.call_count, 3)
+        # 4 件すべて create_draft が呼ばれる（未登録は宛先空）
+        self.assertEqual(mock_gmail.create_draft.call_count, 4)
         to_emails = sorted(
             c.kwargs["to_email"] for c in mock_gmail.create_draft.call_args_list
         )
         self.assertEqual(
-            to_emails, ["p1@example.com", "p2@example.com", "p3@example.com"]
+            to_emails, ["", "p1@example.com", "p2@example.com", "p3@example.com"]
         )
         for call in mock_gmail.create_draft.call_args_list:
             self.assertIsNone(call.kwargs["cc_email"])
 
-        # 004 はメール未登録で警告（メール + 医院名 lookup ミス両方）
+        # 004 はマスター未ヒットで宛先空の警告
         joined = "\n".join(log_ctx.output)
-        self.assertIn("メール未登録", joined)
-        self.assertIn("004-00-0", joined)
+        self.assertIn("マスター未ヒット", joined)
+        self.assertIn("004", joined)
         # 医院名 lookup ミスも警告
         self.assertIn("参加者マスター未登録", joined)
 
@@ -2085,14 +2088,14 @@ class TestMasterSheetIntegrationE2E(unittest.TestCase):
             mock_sheets.get_recorded_clinic_numbers.return_value = set()
             mock_sheets.read_master_records.return_value = [
                 self._master_record(
-                    "111-22-3", "標準医院名", "p@example.com"
+                    "111", "標準医院名", "p@example.com"
                 ),
             ]
             mock_sheets.lookup_clinic_name.side_effect = (
                 lambda recs, cn: real_sheets_client.lookup_clinic_name(recs, cn)
             )
-            mock_sheets.lookup_email_by_management_number.side_effect = (
-                lambda recs, mn: real_sheets_client.lookup_email_by_management_number(recs, mn)
+            mock_sheets.lookup_email_by_clinic_and_person.side_effect = (
+                lambda recs, cn, pn: real_sheets_client.lookup_email_by_clinic_and_person(recs, cn, pn)
             )
             mock_drive.download_pdf.return_value = b"%PDF-1.4 fake"
             mock_drive.upload_pdf_to_clinic_person.return_value = {

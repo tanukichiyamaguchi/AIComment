@@ -194,3 +194,51 @@ PR #8 で `supportsAllDrives=True` を追加したが、本番実行で `storage
 - [ ] PDFが `<DRIVE_OUTPUT_FOLDER_ID>/<医院名>/<個人名>/<タイトル>.pdf` でアップロードされる
 - [ ] 出力一覧シートに行が追記される
 - [ ] Driveログ：`Drive認証: OAuthユーザートークンを使用` が出ていること
+
+## Phase 14: メールアドレス突合を「医院管理番号 + 個人名」方式に変更（2026-05-26）
+
+### 背景
+- PDF ファイル名: `xxx-yy-z`（3 セグメント、例 `001-01-0`）
+- これまでの参加者マスター A 列: `xxx-yy`（2 セグメント、例 `001-01`）
+- 両者は別概念であり、文字列マッチングが原理的に成立しない
+- 結果として `lookup_email_by_management_number()` がほぼ常に空文字を返し、Gmail 下書きが「メール未登録」でスキップされていた
+
+### 新仕様（ユーザー確定）
+- 参加者マスター A 列を **医院管理番号 (= 医院コード `xxx` のみ)** に変更
+- 突合キーは **A 列 (医院管理番号) + C 列 (参加者名)**
+- 個人名は強めの正規化（NFKC + 全空白除去 + カナ統一）
+- Levenshtein 距離 ≤ 1 のファジー一致も「同一人物」とみなす
+- 同姓同名複数ヒット → 警告ログを出して先頭を採用
+- ヒットなし → **宛先空のまま Gmail 下書きを作成**（手動補完してもらう）
+
+### マスターシート新スキーマ
+| 列 | 名称 | 例 | 用途 |
+|---|---|---|---|
+| A | 医院管理番号 | `001` | 突合キー + 医院名 lookup |
+| B | 医院名 | `〇〇歯科` | 医院名標準化 |
+| C | 参加者名 | `山田太郎` | 突合キー |
+| D | 申し込み会場 | `東京会場` | 参照用 |
+| E | メールアドレス | `xxx@example.com` | Gmail 下書き宛先 |
+
+### タスク
+- [x] baseline: 全テストパス確認（440 件）
+- [x] sheets_client: `MasterRecord.management_number` → `clinic_number` にリネーム
+- [x] sheets_client: `_MASTER_SHEET_HEADER` の A 列を「医院管理番号」に変更
+- [x] sheets_client: `_normalize_person_name()` 追加（NFKC + 全空白除去 + カナ統一）
+- [x] sheets_client: `_levenshtein_distance()` 追加（純 Python 実装、1 文字差判定用）
+- [x] sheets_client: `lookup_email_by_clinic_and_person()` 追加（完全一致 → ファジー一致 → 不一致の3段階）
+- [x] sheets_client: `lookup_clinic_name()` を新 A 列形式に対応（完全一致）
+- [x] sheets_client: `lookup_email_by_management_number()` を削除
+- [x] gmail_client: 既存 `to_email` 空文字対応で動く（mask_email も空文字対応済）
+- [x] main / batch_main: `_create_gmail_draft` を新 lookup 関数に置換し、不一致時も下書き作成
+- [x] tests/test_sheets_client: 完全一致 / 空白差 / カナ差 / 1 文字差 / 同姓同名 / 不一致 / 医院違いの 7 ケース追加 + 正規化 5 ケース + Levenshtein 6 ケース
+- [x] pytest 全件パス（440 → 456 件）
+- [x] tasks/lessons.md に P-022 を追記
+- [ ] commit + push + draft PR
+
+### 受け入れ条件（次回本番実行時）
+- [ ] 参加者マスター A 列に **医院管理番号（医院コードのみ）** を入れる
+- [ ] PDF ファイル名 `xxx-yy-z` から抽出した医院コード `xxx` がマスター A 列に存在すること
+- [ ] AI 抽出した個人名（または 1 文字違い以内）がマスター C 列に存在すること
+- [ ] ヒットすればその E 列のメールが Gmail 下書きの TO に設定される
+- [ ] ヒットしなければ宛先空で下書きが作成され、ログに「マスター未ヒット」が出る

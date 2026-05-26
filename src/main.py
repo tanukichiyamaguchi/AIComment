@@ -190,35 +190,36 @@ def run(
         clinics_recorded_this_run.add(clinic_number)
 
     def _create_gmail_draft(
-        management_number: str,
+        clinic_number: str,
         person_name: str,
         pdf_path: Path,
     ) -> None:
         """PDF アップロード成功後の副作用として Gmail 下書きを作成する。
 
-        参加者マスターシートから管理番号でメールアドレスを引き、TO に設定する
-        （CC は現運用では使わない）。メール未登録ならスキップ（警告）。例外が
-        発生しても PDF 処理は止めずに次へ進む（fail-soft）。
+        参加者マスターシートから医院管理番号 + 個人名でメールアドレスを引き、
+        TO に設定する（CC は現運用では使わない）。マスター未ヒットでも下書き
+        自体は作成し、TO を空にして手動補完できるようにする（誤発送防止と
+        見落とし防止の両立）。例外が発生しても PDF 処理は止めずに次へ進む
+        （fail-soft）。
 
         下書きの重複作成防止は管理番号デデュープ（P-015）に依存。本関数では
         独自のリトライ・重複チェックは行わない。
         """
         try:
-            email = sheets_client.lookup_email_by_management_number(
-                master_records, management_number,
+            email = sheets_client.lookup_email_by_clinic_and_person(
+                master_records, clinic_number, person_name,
             )
-            if email:
-                gmail_client.create_draft(
-                    to_email=email,
-                    person_name=person_name,
-                    pdf_path=pdf_path,
-                    cc_email=None,  # CC は現運用では使わない
-                )
-            else:
+            if not email:
                 logger.warning(
-                    f"Gmail下書きスキップ: メール未登録 "
-                    f"(管理番号={management_number})"
+                    f"Gmail下書き: 宛先空で作成 (マスター未ヒット, "
+                    f"医院管理番号={clinic_number}, 個人名={person_name!r})"
                 )
+            gmail_client.create_draft(
+                to_email=email,
+                person_name=person_name,
+                pdf_path=pdf_path,
+                cc_email=None,  # CC は現運用では使わない
+            )
         except Exception as e:
             logger.error(f"Gmail下書き作成失敗（処理は続行）: {e}", exc_info=True)
 
@@ -317,10 +318,10 @@ def run(
                     upload_result["clinic_folder_id"],
                 )
 
-                # Gmail 下書きを作成（メール未登録ならスキップ・例外時も続行）。
+                # Gmail 下書きを作成（マスター未ヒットでも宛先空で作成）。
                 # tempdir スコープ内で実行することで PDF ファイルにアクセスできる。
                 _create_gmail_draft(
-                    management_number=mgmt_num,
+                    clinic_number=clinic_number,
                     person_name=person_name,
                     pdf_path=output_path,
                 )
@@ -409,7 +410,7 @@ def run(
                 # メインと同じテンプレート）。メイン経路と同じ ``master_records``
                 # を共有し、API 呼び出しを 1 回読みで済ます。
                 _create_gmail_draft(
-                    management_number=mgmt_num,
+                    clinic_number=clinic_number,
                     person_name=person_name,
                     pdf_path=attachment_path,
                 )

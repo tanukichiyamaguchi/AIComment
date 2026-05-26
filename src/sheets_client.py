@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -170,7 +172,6 @@ def update_status(
 
 def _validate_email(email: str) -> bool:
     """簡易メールアドレスバリデーション。"""
-    import re
     pattern = r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$"
     return bool(re.match(pattern, email))
 
@@ -480,18 +481,19 @@ def append_clinic_folder_record(
 class MasterRecord:
     """参加者マスターシートの 1 行。
 
-    1 行 per 個人。同じ医院番号 (例 ``101``) を持つ複数行 (``101-01`` /
-    ``101-02``) は ``clinic_name`` 列に同じ医院名を重複記入する想定
-    （ユーザー側の利便性のため）。
+    1 行 per 個人。同じ医院（例 医院管理番号 ``101``）に複数参加者が
+    いる場合は同じ医院管理番号で複数行が並ぶ（B 列の医院名も重複記入）。
 
     Attributes:
-        management_number: A 列、``xxx-yy`` 形式の管理番号
+        clinic_number: A 列、医院管理番号（``101`` のような医院単位の番号）。
+            PDF ファイル名先頭の医院コード（``001-01-0`` の ``001``）と
+            直接突合する。
         clinic_name: B 列、医院名（標準表記。「開業準備中」等の固定文字列も入る）
-        participant_name: C 列、参加者名（参照用、システムは使わない）
+        participant_name: C 列、参加者名（個人特定の突合キー）
         venue: D 列、申し込み会場（参照用）
         email: E 列、メールアドレス
     """
-    management_number: str
+    clinic_number: str
     clinic_name: str
     participant_name: str
     venue: str
@@ -499,8 +501,87 @@ class MasterRecord:
 
 
 _MASTER_SHEET_HEADER = [
-    "管理番号", "医院名", "参加者名", "申し込み会場", "メールアドレス"
+    "医院管理番号", "医院名", "参加者名", "申し込み会場", "メールアドレス"
 ]
+
+
+# 個人名の表記揺れ吸収用文字テーブル。NFKC で吸収しきれない、
+# ユーザー入力でよく混ざるパターンを最低限カバーする。
+# - 全角/半角スペース、タブ、ノーブレークスペースは全削除
+# - カタカナはひらがなに統一（半角カナは NFKC で全角に変換済み）
+_WHITESPACE_PATTERN = re.compile(r"[\s　 ]+")
+
+
+def _katakana_to_hiragana(text: str) -> str:
+    """全角カタカナを全角ひらがなに変換する。"""
+    result = []
+    for ch in text:
+        code = ord(ch)
+        if 0x30A1 <= code <= 0x30F6:  # ァ..ヶ
+            result.append(chr(code - 0x60))
+        else:
+            result.append(ch)
+    return "".join(result)
+
+
+def _normalize_person_name(name: str) -> str:
+    """個人名を突合用に強めに正規化する。
+
+    手順:
+        1. NFKC 正規化（全角/半角・互換文字を統一。半角カナ→全角カナも含む）
+        2. 全種類の空白を削除（半角/全角/タブ/ノーブレーク）
+        3. カタカナ → ひらがな統一（``ヤマダ`` と ``やまだ`` を一致扱い）
+        4. 小文字化（ローマ字名の大文字小文字差を吸収）
+
+    旧字体/新字体（``髙`` ↔ ``高`` 等）は変換しないため、マスター側で
+    新字体に統一しておくのが前提。ファジーマッチで 1 文字差まで救う。
+
+    Args:
+        name: 比較対象の個人名
+
+    Returns:
+        正規化後の文字列。空入力なら空文字。
+    """
+    if not name:
+        return ""
+    normalized = unicodedata.normalize("NFKC", name)
+    normalized = _WHITESPACE_PATTERN.sub("", normalized)
+    normalized = _katakana_to_hiragana(normalized)
+    return normalized.lower()
+
+
+def _levenshtein_distance(a: str, a_other: str) -> int:
+    """2 文字列のレーベンシュタイン距離（編集距離）を返す。
+
+    Wagner-Fischer の動的計画法。文字列長が短い前提（個人名は通常 10 文字
+    以下）なので素朴な O(len(a) * len(b)) 実装で十分。
+
+    Args:
+        a: 比較元
+        a_other: 比較先
+
+    Returns:
+        編集距離（挿入/削除/置換 = それぞれコスト 1）。
+    """
+    if a == a_other:
+        return 0
+    if not a:
+        return len(a_other)
+    if not a_other:
+        return len(a)
+
+    previous = list(range(len(a_other) + 1))
+    for i, ch_a in enumerate(a, start=1):
+        current = [i] + [0] * len(a_other)
+        for j, ch_b in enumerate(a_other, start=1):
+            cost = 0 if ch_a == ch_b else 1
+            current[j] = min(
+                current[j - 1] + 1,       # 挿入
+                previous[j] + 1,          # 削除
+                previous[j - 1] + cost,   # 置換
+            )
+        previous = current
+    return previous[-1]
 
 
 def _ensure_master_sheet(
@@ -522,8 +603,8 @@ def read_master_records(
 
     シートが存在しなければ自動作成（ヘッダーのみ書き込む）して空リストを返す。
     形式不正のメール (``_validate_email`` で False) は警告して空扱い、行自体は
-    残す（医院名 lookup には使えるため）。管理番号も医院名も両方空の行は空行
-    として読み飛ばす。
+    残す（医院名 lookup には使えるため）。医院管理番号も医院名も両方空の行は
+    空行として読み飛ばす。
 
     Args:
         spreadsheet_id: スプレッドシート ID。省略時は ``config.SPREADSHEET_ID``。
@@ -559,14 +640,14 @@ def read_master_records(
         while len(row) < 5:
             row.append("")
 
-        management_number = (row[0] or "").strip()
+        clinic_number = (row[0] or "").strip()
         clinic_name = (row[1] or "").strip()
         participant_name = (row[2] or "").strip()
         venue = (row[3] or "").strip()
         email = (row[4] or "").strip()
 
-        # 管理番号も医院名も両方空の行は無視（空行 / コメント行扱い）
-        if not management_number and not clinic_name:
+        # 医院管理番号も医院名も両方空の行は無視（空行 / コメント行扱い）
+        if not clinic_number and not clinic_name:
             continue
 
         if email and not _validate_email(email):
@@ -576,7 +657,7 @@ def read_master_records(
             email = ""
 
         records.append(MasterRecord(
-            management_number=management_number,
+            clinic_number=clinic_number,
             clinic_name=clinic_name,
             participant_name=participant_name,
             venue=venue,
@@ -593,16 +674,16 @@ def lookup_clinic_name(
     records: list[MasterRecord],
     clinic_number: str,
 ) -> str:
-    """医院番号から標準医院名を引く。
+    """医院管理番号から標準医院名を引く。
 
-    管理番号の prefix（``101-01`` → ``101``）が ``clinic_number`` と一致する
-    最初の行の ``clinic_name`` を返す。複数行ある場合は最初に見つかった値を
-    使う（同一医院は同じ医院名で登録されている前提）。一致行がない、または
+    A 列（医院管理番号）が ``clinic_number`` と完全一致する最初の行の
+    ``clinic_name`` を返す。複数行ある場合は最初に見つかった値を使う
+    （同一医院は同じ医院名で登録されている前提）。一致行がない、または
     医院名が空文字なら空文字を返す。
 
     Args:
         records: ``read_master_records`` の戻り値
-        clinic_number: 医院番号（``101`` のような数字部分、``-`` を含まない）
+        clinic_number: 医院管理番号（``101`` のような数字部分）
 
     Returns:
         標準医院名。未登録なら空文字。呼び出し側は空文字なら AI 抽出値で代用。
@@ -610,30 +691,88 @@ def lookup_clinic_name(
     if not clinic_number:
         return ""
 
-    prefix = f"{clinic_number}-"
     for r in records:
-        if r.management_number.startswith(prefix) and r.clinic_name:
+        if r.clinic_number == clinic_number and r.clinic_name:
             return r.clinic_name
     return ""
 
 
-def lookup_email_by_management_number(
+def lookup_email_by_clinic_and_person(
     records: list[MasterRecord],
-    management_number: str,
+    clinic_number: str,
+    person_name: str,
 ) -> str:
-    """管理番号からメールアドレスを引く。
+    """医院管理番号 + 個人名から参加者のメールアドレスを引く。
+
+    突合手順:
+        1. 医院管理番号 (A 列) が ``clinic_number`` に完全一致する行に絞り込む
+        2. 個人名 (C 列) を ``_normalize_person_name`` で正規化して
+           比較（NFKC + 全空白除去 + ひらがな統一 + 小文字化）
+        3. 完全一致行が 1 件 → そのメールを返す
+        4. 完全一致行が 2 件以上 → 警告ログ + 先頭採用
+        5. 完全一致なし → Levenshtein 距離 ≤ 1 でファジー一致を試行
+        6. ファジー一致 1 件 → そのメールを返す（fuzzy match ログを残す）
+        7. ファジー一致 2 件以上 → 警告ログ + 先頭採用
+        8. ヒットなし → 空文字を返す（呼び出し側は宛先空で下書きを作る）
 
     Args:
         records: ``read_master_records`` の戻り値
-        management_number: 管理番号（``101-01`` 形式の完全な文字列）
+        clinic_number: 医院管理番号（``001`` のような数字部分）
+        person_name: PDF 本文から AI 抽出した個人名
 
     Returns:
         メールアドレス。未登録、または空文字なら空文字を返す。
     """
-    if not management_number:
+    if not clinic_number or not person_name:
         return ""
 
-    for r in records:
-        if r.management_number == management_number:
-            return r.email
+    candidates = [r for r in records if r.clinic_number == clinic_number]
+    if not candidates:
+        logger.warning(
+            f"参加者マスター: 医院管理番号 {clinic_number} に該当行なし "
+            f"(PDF 個人名={person_name!r})"
+        )
+        return ""
+
+    normalized_target = _normalize_person_name(person_name)
+
+    # 完全一致（正規化後）
+    exact = [
+        r for r in candidates
+        if _normalize_person_name(r.participant_name) == normalized_target
+    ]
+    if len(exact) == 1:
+        return exact[0].email
+    if len(exact) > 1:
+        logger.warning(
+            f"参加者マスター: 医院 {clinic_number} に同姓同名複数ヒット "
+            f"({person_name!r} で {len(exact)}件) → 先頭採用"
+        )
+        return exact[0].email
+
+    # ファジー一致（Levenshtein 距離 ≤ 1）
+    fuzzy = [
+        r for r in candidates
+        if _levenshtein_distance(
+            _normalize_person_name(r.participant_name), normalized_target
+        ) <= 1
+    ]
+    if len(fuzzy) == 1:
+        logger.info(
+            f"参加者マスター: ファジー一致採用 "
+            f"(PDF={person_name!r} ↔ マスター={fuzzy[0].participant_name!r})"
+        )
+        return fuzzy[0].email
+    if len(fuzzy) > 1:
+        logger.warning(
+            f"参加者マスター: 医院 {clinic_number} にファジー候補複数 "
+            f"({person_name!r} で {len(fuzzy)}件) → 先頭採用 "
+            f"({fuzzy[0].participant_name!r})"
+        )
+        return fuzzy[0].email
+
+    logger.warning(
+        f"参加者マスター: 医院 {clinic_number} 内に "
+        f"個人名 {person_name!r} に一致する参加者なし"
+    )
     return ""
