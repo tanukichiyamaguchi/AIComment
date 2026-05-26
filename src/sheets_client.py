@@ -11,10 +11,10 @@ from typing import Any
 from googleapiclient.discovery import build
 
 from src.config import (
-    EMAIL_SHEET_NAME,
     GOOGLE_API_NUM_RETRIES,
     GOOGLE_CREDENTIALS_JSON,
     GOOGLE_SCOPES,
+    MASTER_SHEET_NAME,
     OUTPUT_SHEET_NAME,
     SPREADSHEET_ID,
 )
@@ -190,8 +190,9 @@ def _ensure_sheet_with_header(
 ) -> None:
     """指定シートが無ければ作成し、ヘッダー行が空なら書き込む（汎用ヘルパー）。
 
-    出力一覧シート（6列）と医院フォルダURLシート（3列）の両方で使う。
-    ヘッダーの列数は ``header`` の長さから動的に決める（A1 から N 列ぶん）。
+    出力一覧シート（6列）と医院フォルダURLシート（3列）と参加者マスター
+    シート（5列）の 3 種類で使う。ヘッダーの列数は ``header`` の長さから動的に
+    決める（A1 から N 列ぶん）。
 
     Args:
         service: Sheets API サービス
@@ -438,7 +439,7 @@ def append_clinic_folder_record(
 
     Args:
         clinic_number: 医院番号（管理番号の先頭セグメント、3〜5桁）
-        clinic_name: 医院名（AI 抽出値）
+        clinic_name: 医院名（参加者マスターから引いた標準表記。空なら AI 抽出値）
         clinic_folder_url: 医院フォルダの Drive 閲覧 URL
         spreadsheet_id: スプレッドシートID（省略時は設定値）
         sheet_name: 医院シート名（``<出力シート名>_医院``）。
@@ -472,63 +473,72 @@ def append_clinic_folder_record(
     )
 
 
-# ── メールアドレス一覧シート（Gmail 下書き作成用ルックアップ表） ──
+# ── 参加者マスターシート（医院名標準化 + Gmail 下書き用ルックアップ表） ──
 
 
 @dataclass
-class EmailRecord:
-    """メールアドレスシートの 1 行。
+class MasterRecord:
+    """参加者マスターシートの 1 行。
 
-    1 行 per (医院, 個人)。医院メール（E 列）は同一医院の複数行で重複記入可
+    1 行 per 個人。同じ医院番号 (例 ``101``) を持つ複数行 (``101-01`` /
+    ``101-02``) は ``clinic_name`` 列に同じ医院名を重複記入する想定
     （ユーザー側の利便性のため）。
+
+    Attributes:
+        management_number: A 列、``xxx-yy`` 形式の管理番号
+        clinic_name: B 列、医院名（標準表記。「開業準備中」等の固定文字列も入る）
+        participant_name: C 列、参加者名（参照用、システムは使わない）
+        venue: D 列、申し込み会場（参照用）
+        email: E 列、メールアドレス
     """
-    clinic_number: str  # A 列: 医院番号
-    clinic_name: str    # B 列: 医院名（参照用）
-    person_name: str    # C 列: 個人名
-    person_email: str   # D 列: 個人メール
-    clinic_email: str   # E 列: 医院メール
+    management_number: str
+    clinic_name: str
+    participant_name: str
+    venue: str
+    email: str
 
 
-_EMAIL_SHEET_HEADER = [
-    "医院番号", "医院名", "個人名", "個人メール", "医院メール"
+_MASTER_SHEET_HEADER = [
+    "管理番号", "医院名", "参加者名", "申し込み会場", "メールアドレス"
 ]
 
 
-def _ensure_email_sheet(
+def _ensure_master_sheet(
     service: Any,
     spreadsheet_id: str,
     sheet_name: str,
 ) -> None:
-    """メールアドレス一覧シート（5列）が無ければ作成し、ヘッダー行を書き込む。"""
+    """参加者マスターシート（5列）が無ければ作成し、ヘッダー行を書き込む。"""
     _ensure_sheet_with_header(
-        service, spreadsheet_id, sheet_name, _EMAIL_SHEET_HEADER
+        service, spreadsheet_id, sheet_name, _MASTER_SHEET_HEADER
     )
 
 
-def read_email_records(
+def read_master_records(
     spreadsheet_id: str | None = None,
     sheet_name: str | None = None,
-) -> list[EmailRecord]:
-    """メールアドレス一覧シートから全行を読み取る。
+) -> list[MasterRecord]:
+    """参加者マスターシートを全件読み取る。
 
-    シートが存在しなければ自動作成し（ヘッダーのみ書き込む）空リストを返す。
-    形式不正のメールはログ警告して空扱い（既存 ``_validate_email`` を使う）。
-    医院番号・個人名のどちらも空の行は読み飛ばす。
+    シートが存在しなければ自動作成（ヘッダーのみ書き込む）して空リストを返す。
+    形式不正のメール (``_validate_email`` で False) は警告して空扱い、行自体は
+    残す（医院名 lookup には使えるため）。管理番号も医院名も両方空の行は空行
+    として読み飛ばす。
 
     Args:
-        spreadsheet_id: スプレッドシートID（省略時は設定値 ``SPREADSHEET_ID``）
-        sheet_name: シート名（省略時は設定値 ``EMAIL_SHEET_NAME``）
+        spreadsheet_id: スプレッドシート ID。省略時は ``config.SPREADSHEET_ID``。
+        sheet_name: タブ名。省略時は ``MASTER_SHEET_NAME``。
 
     Returns:
-        EmailRecord のリスト。シート新規作成直後（ヘッダーのみ）は空リスト。
+        全行を ``MasterRecord`` のリストで返す。空行はスキップ。
     """
     spreadsheet_id = spreadsheet_id or SPREADSHEET_ID
     if not spreadsheet_id:
         raise ValueError("SPREADSHEET_IDが設定されていません")
-    sheet_name = sheet_name or EMAIL_SHEET_NAME
+    sheet_name = sheet_name or MASTER_SHEET_NAME
 
     service = get_sheets_service()
-    _ensure_email_sheet(service, spreadsheet_id, sheet_name)
+    _ensure_master_sheet(service, spreadsheet_id, sheet_name)
 
     result = service.spreadsheets().values().get(
         spreadsheetId=spreadsheet_id,
@@ -538,93 +548,92 @@ def read_email_records(
     rows = result.get("values", [])
     if not rows:
         logger.info(
-            f"Sheets: メールアドレスシートが空 (ヘッダーのみ): {sheet_name}"
+            f"Sheets: 参加者マスターシートが空 (ヘッダーのみ): {sheet_name}"
         )
         return []
 
-    records: list[EmailRecord] = []
+    records: list[MasterRecord] = []
     # ヘッダー行はスキップ（A1 はヘッダー）
     for i, row in enumerate(rows[1:], start=2):
         # 列が足りない場合は空文字で補完
         while len(row) < 5:
             row.append("")
 
-        clinic_number = (row[0] or "").strip()
+        management_number = (row[0] or "").strip()
         clinic_name = (row[1] or "").strip()
-        person_name = (row[2] or "").strip()
-        person_email = (row[3] or "").strip()
-        clinic_email = (row[4] or "").strip()
+        participant_name = (row[2] or "").strip()
+        venue = (row[3] or "").strip()
+        email = (row[4] or "").strip()
 
-        # 医院番号も個人名も両方空の行は無視（空行 / コメント行扱い）
-        if not clinic_number and not person_name:
+        # 管理番号も医院名も両方空の行は無視（空行 / コメント行扱い）
+        if not management_number and not clinic_name:
             continue
 
-        if person_email and not _validate_email(person_email):
+        if email and not _validate_email(email):
             logger.warning(
-                f"Sheets: メールシート 行{i} 個人メールの形式が不正のため空扱い"
+                f"Sheets: 参加者マスター 行{i} メールアドレスの形式が不正のため空扱い"
             )
-            person_email = ""
-        if clinic_email and not _validate_email(clinic_email):
-            logger.warning(
-                f"Sheets: メールシート 行{i} 医院メールの形式が不正のため空扱い"
-            )
-            clinic_email = ""
+            email = ""
 
-        records.append(EmailRecord(
-            clinic_number=clinic_number,
+        records.append(MasterRecord(
+            management_number=management_number,
             clinic_name=clinic_name,
-            person_name=person_name,
-            person_email=person_email,
-            clinic_email=clinic_email,
+            participant_name=participant_name,
+            venue=venue,
+            email=email,
         ))
 
     logger.info(
-        f"Sheets: メールアドレスシート {len(records)}件を取得 ({sheet_name})"
+        f"Sheets: 参加者マスター {len(records)}件を取得 ({sheet_name})"
     )
     return records
 
 
-def lookup_email(
-    records: list[EmailRecord],
+def lookup_clinic_name(
+    records: list[MasterRecord],
     clinic_number: str,
-    person_name: str,
-) -> tuple[str, str]:
-    """メールルックアップ。``(to_email, cc_email)`` を返す。
+) -> str:
+    """医院番号から標準医院名を引く。
 
-    ルールの優先順位:
-        1. ``(clinic_number, person_name)`` 完全一致行があり、個人メール非空
-           → ``(個人メール, 医院メール)``  ※医院メール空なら ``(個人メール, "")``
-        2. 上記行で個人メール空、医院メール非空 → ``(医院メール, "")``
-        3. 完全一致行が無い → 同じ ``clinic_number`` の他の行を 1 つ拾い
-           その E 列を医院メールとして使う → ``(医院メール, "")``
-        4. すべて空 → ``("", "")``
-
-    呼び出し側は ``to_email`` が空でない場合のみ下書きを作る。
+    管理番号の prefix（``101-01`` → ``101``）が ``clinic_number`` と一致する
+    最初の行の ``clinic_name`` を返す。複数行ある場合は最初に見つかった値を
+    使う（同一医院は同じ医院名で登録されている前提）。一致行がない、または
+    医院名が空文字なら空文字を返す。
 
     Args:
-        records: ``read_email_records`` の戻り値
-        clinic_number: 医院番号（管理番号の先頭セグメント）
-        person_name: 個人名（AI 抽出値）
+        records: ``read_master_records`` の戻り値
+        clinic_number: 医院番号（``101`` のような数字部分、``-`` を含まない）
 
     Returns:
-        ``(to_email, cc_email)``。どちらも空文字列ならメール未登録扱い。
+        標準医院名。未登録なら空文字。呼び出し側は空文字なら AI 抽出値で代用。
     """
-    # 1. 完全一致を探す
-    for r in records:
-        if r.clinic_number == clinic_number and r.person_name == person_name:
-            if r.person_email:
-                # 個人メールあり → TO=個人, CC=医院（医院メールが空ならCCなし）
-                return (r.person_email, r.clinic_email)
-            if r.clinic_email:
-                # 個人メール空、医院メールあり → TO=医院
-                return (r.clinic_email, "")
-            # 両方空 → 同じ医院番号の他の行へフォールバックさせる
-            break
+    if not clinic_number:
+        return ""
 
-    # 3. 同じ医院番号の他の行から医院メールを 1 つ拾う
+    prefix = f"{clinic_number}-"
     for r in records:
-        if r.clinic_number == clinic_number and r.clinic_email:
-            return (r.clinic_email, "")
+        if r.management_number.startswith(prefix) and r.clinic_name:
+            return r.clinic_name
+    return ""
 
-    # 4. すべて空
-    return ("", "")
+
+def lookup_email_by_management_number(
+    records: list[MasterRecord],
+    management_number: str,
+) -> str:
+    """管理番号からメールアドレスを引く。
+
+    Args:
+        records: ``read_master_records`` の戻り値
+        management_number: 管理番号（``101-01`` 形式の完全な文字列）
+
+    Returns:
+        メールアドレス。未登録、または空文字なら空文字を返す。
+    """
+    if not management_number:
+        return ""
+
+    for r in records:
+        if r.management_number == management_number:
+            return r.email
+    return ""

@@ -76,7 +76,13 @@ def _install_main_mocks(
     mock_drive, mock_sheets, mock_gen, mock_reader, mock_creator,
     mock_merger, mock_fonts, *, pdf_count: int = 5,
 ) -> None:
-    """main.run() 用の標準モック挙動を一括セットアップする。"""
+    """main.run() 用の標準モック挙動を一括セットアップする。
+
+    参加者マスター系のデフォルト戻り値（未登録扱い）も同時設定する:
+        - read_master_records → []
+        - lookup_clinic_name → "" (AI 抽出値にフォールバック)
+        - lookup_email_by_management_number → "" (下書きスキップ)
+    """
     mock_drive.list_pdfs.return_value = _make_pdf_files(pdf_count)
     mock_drive.download_pdf.return_value = b"%PDF-1.4 fake"
     mock_drive.upload_pdf_to_clinic_person.return_value = {
@@ -90,6 +96,10 @@ def _install_main_mocks(
     mock_merger.make_output_filename.return_value = (
         "山田歯科＿田中太郎＿事例タイトル.pdf"
     )
+    # 参加者マスター系の既定: マスター未登録 → AI 抽出値で代用 / メール未登録
+    mock_sheets.read_master_records.return_value = []
+    mock_sheets.lookup_clinic_name.return_value = ""
+    mock_sheets.lookup_email_by_management_number.return_value = ""
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -1022,6 +1032,10 @@ class TestLegacyBehaviorRegression(unittest.TestCase):
             "sample_title": "売上向上の取り組み",
             "comment": "コメント本文",
         }
+        # マスター未登録 → AI 抽出値で代用
+        mock_sheets.read_master_records.return_value = []
+        mock_sheets.lookup_clinic_name.return_value = ""
+        mock_sheets.lookup_email_by_management_number.return_value = ""
 
         # pdf_merger は merge_pdfs だけモックし、make_output_filename は本物を使う
         with patch("src.main.pdf_merger.merge_pdfs"):
@@ -1565,6 +1579,10 @@ class TestAttachmentPassthroughE2E(unittest.TestCase):
         mock_merger.make_output_filename.return_value = (
             "山田歯科＿田中太郎＿事例タイトル.pdf"
         )
+        # マスター未登録 → AI 抽出値で代用 / メール未登録 → 下書きスキップ
+        mock_sheets.read_master_records.return_value = []
+        mock_sheets.lookup_clinic_name.return_value = ""
+        mock_sheets.lookup_email_by_management_number.return_value = ""
 
         main.run(test_count=0, profile_name="jissen_default")
 
@@ -1639,6 +1657,10 @@ class TestAttachmentPassthroughE2E(unittest.TestCase):
         mock_merger.make_output_filename.return_value = (
             "山田歯科＿田中太郎＿事例タイトル.pdf"
         )
+        # マスター未登録 → AI 抽出値で代用 / メール未登録 → 下書きスキップ
+        mock_sheets.read_master_records.return_value = []
+        mock_sheets.lookup_clinic_name.return_value = ""
+        mock_sheets.lookup_email_by_management_number.return_value = ""
 
         with patch("src.batch_main.time.sleep"):
             batch_main.run(
@@ -1717,6 +1739,10 @@ class TestClinicNumberFolderE2E(unittest.TestCase):
         }
         mock_sheets.get_processed_management_numbers.return_value = set()
         mock_sheets.get_recorded_clinic_numbers.return_value = set()
+        # マスター未登録 → AI 抽出値で代用 / メール未登録 → 下書きスキップ
+        mock_sheets.read_master_records.return_value = []
+        mock_sheets.lookup_clinic_name.return_value = ""
+        mock_sheets.lookup_email_by_management_number.return_value = ""
         mock_reader.extract_text.return_value = "PDFテキスト"
         mock_gen.generate_comment_with_metadata.return_value = _make_metadata()
         mock_merger.make_output_filename.return_value = "out.pdf"
@@ -1803,6 +1829,10 @@ class TestClinicNumberFolderE2E(unittest.TestCase):
         }
         mock_sheets.get_processed_management_numbers.return_value = set()
         mock_sheets.get_recorded_clinic_numbers.return_value = set()
+        # マスター未登録 → AI 抽出値で代用 / メール未登録 → 下書きスキップ
+        mock_sheets.read_master_records.return_value = []
+        mock_sheets.lookup_clinic_name.return_value = ""
+        mock_sheets.lookup_email_by_management_number.return_value = ""
         mock_reader.extract_text.return_value = "PDFテキスト"
         mock_gen.submit_batch.return_value = "batch_clinic_001"
         mock_gen.get_batch_status.return_value = {
@@ -1883,6 +1913,10 @@ class TestClinicFolderByNumberE2E(unittest.TestCase):
         }
         mock_sheets.get_processed_management_numbers.return_value = set()
         mock_sheets.get_recorded_clinic_numbers.return_value = set()
+        # マスター未登録 → AI 抽出値で代用 / メール未登録 → 下書きスキップ
+        mock_sheets.read_master_records.return_value = []
+        mock_sheets.lookup_clinic_name.return_value = ""
+        mock_sheets.lookup_email_by_management_number.return_value = ""
         mock_reader.extract_text.return_value = "PDFテキスト"
         # AI 抽出側の医院名表記揺れ — 同じ医院番号 001 でも語が違う
         mock_gen.generate_comment_with_metadata.side_effect = [
@@ -1931,12 +1965,14 @@ class TestClinicFolderByNumberE2E(unittest.TestCase):
         self.assertEqual(recorded, ["001"])
 
 
-class TestGmailDraftIntegrationE2E(unittest.TestCase):
-    """Gmail 下書き作成統合の E2E スモークテスト。
 
-    メールシート読み込み → 個人/医院メールルックアップ → 下書き作成 までを
-    mock で通し、main.run と batch_main.step4 の両方が同じ振る舞いをすることを
-    検証する。
+
+class TestMasterSheetIntegrationE2E(unittest.TestCase):
+    """参加者マスター統合の E2E スモークテスト。
+
+    参加者マスターシート読み込み → 医院名標準化 + メールルックアップ → 下書き
+    作成までを mock で通し、main.run と batch_main.step4 の両方が同じ
+    振る舞いをすることを検証する。
     """
 
     def setUp(self):
@@ -1946,17 +1982,17 @@ class TestGmailDraftIntegrationE2E(unittest.TestCase):
     def tearDown(self):
         self._env_patcher.stop()
 
-    def _email_record(
-        self, clinic_number, person_name, person_email, clinic_email,
-        clinic_name="X",
+    def _master_record(
+        self, management_number, clinic_name, email,
+        participant_name="X", venue="",
     ):
-        from src.sheets_client import EmailRecord
-        return EmailRecord(
-            clinic_number=clinic_number,
+        from src.sheets_client import MasterRecord
+        return MasterRecord(
+            management_number=management_number,
             clinic_name=clinic_name,
-            person_name=person_name,
-            person_email=person_email,
-            clinic_email=clinic_email,
+            participant_name=participant_name,
+            venue=venue,
+            email=email,
         )
 
     @patch("src.main.ensure_fonts")
@@ -1967,15 +2003,15 @@ class TestGmailDraftIntegrationE2E(unittest.TestCase):
     @patch("src.main.gmail_client")
     @patch("src.main.sheets_client")
     @patch("src.main.drive_client")
-    def test_main_e2e_reads_email_sheet_and_creates_drafts(
+    def test_main_e2e_reads_master_sheet_and_creates_drafts(
         self, mock_drive, mock_sheets, mock_gmail, mock_gen, mock_reader,
         mock_creator, mock_merger, mock_fonts,
     ):
-        """通常モード E2E: メールシート読み込み → ルックアップ → create_draft までが通る。
+        """通常モード E2E: マスターシート読み込み → 医院名標準化 + メール lookup → create_draft。
 
-        3 件の PDF（医院 001 / 002 / 003）と、シート未登録の 1 件（004）を
-        混在させ、登録済みの 3 件は TO 個人 / CC 医院で create_draft、
-        未登録の 1 件はスキップ + warning ログ。
+        4 件の PDF（管理番号 001-00-0 / 002-00-0 / 003-00-0 / 004-00-0）のうち
+        003 までマスター登録済み、004 は未登録。登録済み 3 件は TO がマスターの
+        メール、CC=None で create_draft。未登録 1 件は下書きスキップ + 警告。
         """
         from src import sheets_client as real_sheets_client
 
@@ -1983,20 +2019,17 @@ class TestGmailDraftIntegrationE2E(unittest.TestCase):
             mock_drive, mock_sheets, mock_gen, mock_reader,
             mock_creator, mock_merger, mock_fonts, pdf_count=4,
         )
-        mock_sheets.read_email_records.return_value = [
-            self._email_record(
-                "001", "田中太郎", "p1@example.com", "c1@example.com"
-            ),
-            self._email_record(
-                "002", "田中太郎", "p2@example.com", "c2@example.com"
-            ),
-            self._email_record(
-                "003", "田中太郎", "p3@example.com", "c3@example.com"
-            ),
-            # 004 はシート未登録
+        mock_sheets.read_master_records.return_value = [
+            self._master_record("001-00-0", "001 標準名", "p1@example.com"),
+            self._master_record("002-00-0", "002 標準名", "p2@example.com"),
+            self._master_record("003-00-0", "003 標準名", "p3@example.com"),
+            # 004-00-0 はマスター未登録
         ]
-        mock_sheets.lookup_email.side_effect = (
-            lambda recs, cn, pn: real_sheets_client.lookup_email(recs, cn, pn)
+        mock_sheets.lookup_clinic_name.side_effect = (
+            lambda recs, cn: real_sheets_client.lookup_clinic_name(recs, cn)
+        )
+        mock_sheets.lookup_email_by_management_number.side_effect = (
+            lambda recs, mn: real_sheets_client.lookup_email_by_management_number(recs, mn)
         )
         mock_sheets.get_processed_management_numbers.return_value = set()
         mock_sheets.get_recorded_clinic_numbers.return_value = set()
@@ -2004,26 +2037,28 @@ class TestGmailDraftIntegrationE2E(unittest.TestCase):
         with self.assertLogs("jissen_comment", level="WARNING") as log_ctx:
             main.run(test_count=0, profile_name="jissen_default")
 
-        # メール 3 件登録済み → create_draft 3 回
+        # マスター登録済み 3 件 → create_draft 3 回（CC は常に None）
         self.assertEqual(mock_gmail.create_draft.call_count, 3)
         to_emails = sorted(
             c.kwargs["to_email"] for c in mock_gmail.create_draft.call_args_list
         )
-        self.assertEqual(to_emails, ["p1@example.com", "p2@example.com", "p3@example.com"])
-        cc_emails = sorted(
-            c.kwargs["cc_email"] for c in mock_gmail.create_draft.call_args_list
+        self.assertEqual(
+            to_emails, ["p1@example.com", "p2@example.com", "p3@example.com"]
         )
-        self.assertEqual(cc_emails, ["c1@example.com", "c2@example.com", "c3@example.com"])
+        for call in mock_gmail.create_draft.call_args_list:
+            self.assertIsNone(call.kwargs["cc_email"])
 
-        # 004 はメール未登録で warning
+        # 004 はメール未登録で警告（メール + 医院名 lookup ミス両方）
         joined = "\n".join(log_ctx.output)
         self.assertIn("メール未登録", joined)
-        self.assertIn("004", joined)
+        self.assertIn("004-00-0", joined)
+        # 医院名 lookup ミスも警告
+        self.assertIn("参加者マスター未登録", joined)
 
         # 4 件全て出力一覧シートには記録される（PDF 処理自体は完了）
         self.assertEqual(mock_sheets.append_output_record.call_count, 4)
-        # read_email_records は実行全体で 1 回だけ
-        self.assertEqual(mock_sheets.read_email_records.call_count, 1)
+        # read_master_records は実行全体で 1 回だけ
+        self.assertEqual(mock_sheets.read_master_records.call_count, 1)
 
     @patch("src.batch_main.pdf_merger")
     @patch("src.batch_main.pdf_creator")
@@ -2031,11 +2066,11 @@ class TestGmailDraftIntegrationE2E(unittest.TestCase):
     @patch("src.batch_main.drive_client")
     @patch("src.batch_main.sheets_client")
     @patch("src.batch_main.ensure_fonts")
-    def test_batch_step4_e2e_reads_email_sheet_and_creates_drafts(
+    def test_batch_step4_e2e_reads_master_sheet_and_creates_drafts(
         self, mock_fonts, mock_sheets, mock_drive, mock_gmail,
         mock_creator, mock_merger,
     ):
-        """Batch モード E2E: Step4 でメールシート読み込み → ルックアップ → create_draft。
+        """Batch モード E2E: Step4 でマスターシート読み込み → 医院名標準化 + メール lookup → create_draft。
 
         通常モードと同じ振る舞いを Step4 でも保証する。
         """
@@ -2048,13 +2083,16 @@ class TestGmailDraftIntegrationE2E(unittest.TestCase):
         att_file.write_text("[]")
         try:
             mock_sheets.get_recorded_clinic_numbers.return_value = set()
-            mock_sheets.read_email_records.return_value = [
-                self._email_record(
-                    "111", "田中太郎", "p@example.com", "c@example.com"
+            mock_sheets.read_master_records.return_value = [
+                self._master_record(
+                    "111-22-3", "標準医院名", "p@example.com"
                 ),
             ]
-            mock_sheets.lookup_email.side_effect = (
-                lambda recs, cn, pn: real_sheets_client.lookup_email(recs, cn, pn)
+            mock_sheets.lookup_clinic_name.side_effect = (
+                lambda recs, cn: real_sheets_client.lookup_clinic_name(recs, cn)
+            )
+            mock_sheets.lookup_email_by_management_number.side_effect = (
+                lambda recs, mn: real_sheets_client.lookup_email_by_management_number(recs, mn)
             )
             mock_drive.download_pdf.return_value = b"%PDF-1.4 fake"
             mock_drive.upload_pdf_to_clinic_person.return_value = {
@@ -2091,14 +2129,17 @@ class TestGmailDraftIntegrationE2E(unittest.TestCase):
 
             batch_main.step4_generate_pdfs(profile, results=results, items=items)
 
-            # メール登録済み → create_draft 1 回
+            # マスター登録済み → create_draft 1 回（CC は None）
             mock_gmail.create_draft.assert_called_once()
             kwargs = mock_gmail.create_draft.call_args.kwargs
             self.assertEqual(kwargs["to_email"], "p@example.com")
-            self.assertEqual(kwargs["cc_email"], "c@example.com")
+            self.assertIsNone(kwargs["cc_email"])
             self.assertEqual(kwargs["person_name"], "田中太郎")
-            # read_email_records は Step4 全体で 1 回
-            self.assertEqual(mock_sheets.read_email_records.call_count, 1)
+            # 医院名はマスター標準名で upload される
+            upload_kwargs = mock_drive.upload_pdf_to_clinic_person.call_args.kwargs
+            self.assertEqual(upload_kwargs["clinic_name"], "標準医院名")
+            # read_master_records は Step4 全体で 1 回
+            self.assertEqual(mock_sheets.read_master_records.call_count, 1)
         finally:
             if att_backup is None:
                 att_file.unlink(missing_ok=True)
