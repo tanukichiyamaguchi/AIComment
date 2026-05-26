@@ -66,6 +66,12 @@ GOOGLE_API_NUM_RETRIES = 5
 # ── 出力一覧シート設定 ──
 OUTPUT_SHEET_NAME = "出力一覧"
 
+# ── メールアドレス一覧シート設定 ──
+# Gmail 下書き作成時の TO/CC を引くためのルックアップ表。シートが無ければ
+# 初回実行時に自動作成し、ヘッダー（5 列）だけ書き込んだ空シートになる。
+# シート名はプロファイルでオーバーライド可能（``ProfileConfig.email_sheet_name``）。
+EMAIL_SHEET_NAME = "メールアドレス一覧"
+
 # ── フォント設定 ──
 FONT_REGULAR = ASSETS_DIR / "NotoSansJP-Regular.ttf"
 FONT_BOLD = ASSETS_DIR / "NotoSansJP-Bold.ttf"

@@ -652,5 +652,325 @@ class TestGoogleApiRetry(unittest.TestCase):
         )
 
 
+# ─────────────────────────────────────────────────────────────────────
+# メールアドレス一覧シート（Gmail 下書き用ルックアップ表）
+# ─────────────────────────────────────────────────────────────────────
+
+
+def _build_email_sheet_service(
+    existing_sheet_titles: list[str],
+    values: list[list[str]] | None,
+) -> MagicMock:
+    """メールシート読み取り用の Sheets サービス mock を作る。
+
+    ``values`` は ``A:E`` の全行（ヘッダー含む）を表す。``None`` 指定で
+    ``values`` キー無しを再現する。
+    """
+    service = MagicMock()
+    service.spreadsheets.return_value.get.return_value.execute.return_value = {
+        "sheets": [
+            {"properties": {"title": t}} for t in existing_sheet_titles
+        ]
+    }
+    # _ensure_sheet_with_header はヘッダー range で values.get を呼び、
+    # その後 read_email_records が A:E で values.get を呼ぶ。両方を同じ
+    # mock で返すと「ヘッダーは既にある」「データもこの内容」と見せかけられる。
+    get_result: dict = {}
+    if values is not None:
+        get_result["values"] = values
+    service.spreadsheets.return_value.values.return_value.get.return_value.execute.return_value = get_result
+    return service
+
+
+class TestReadEmailRecords(unittest.TestCase):
+    """``read_email_records``（メールアドレスシート読み取り）。"""
+
+    @patch("src.sheets_client.get_sheets_service")
+    def test_reads_records_from_existing_sheet(self, mock_get_service):
+        """既存シートから複数行を読み取り EmailRecord のリストを返す。"""
+        service = _build_email_sheet_service(
+            ["メールアドレス一覧"],
+            [
+                ["医院番号", "医院名", "個人名", "個人メール", "医院メール"],
+                ["001", "三浦歯科医院", "白川 蓮", "ren@example.com", "clinic@example.com"],
+                ["002", "山本歯科", "田中 太郎", "tanaka@example.com", "ymt@example.com"],
+            ],
+        )
+        mock_get_service.return_value = service
+
+        records = sheets_client.read_email_records(
+            spreadsheet_id="sid", sheet_name="メールアドレス一覧",
+        )
+
+        self.assertEqual(len(records), 2)
+        self.assertEqual(records[0].clinic_number, "001")
+        self.assertEqual(records[0].clinic_name, "三浦歯科医院")
+        self.assertEqual(records[0].person_name, "白川 蓮")
+        self.assertEqual(records[0].person_email, "ren@example.com")
+        self.assertEqual(records[0].clinic_email, "clinic@example.com")
+        self.assertEqual(records[1].clinic_number, "002")
+        self.assertEqual(records[1].person_email, "tanaka@example.com")
+
+    @patch("src.sheets_client.get_sheets_service")
+    def test_creates_sheet_when_not_exists_and_returns_empty(
+        self, mock_get_service
+    ):
+        """シートが存在しなければ自動作成し（ヘッダー書き込み）空リストを返す。"""
+        service = _build_email_sheet_service(["Sheet1"], None)
+        mock_get_service.return_value = service
+
+        records = sheets_client.read_email_records(
+            spreadsheet_id="sid", sheet_name="メールアドレス一覧",
+        )
+
+        # addSheet が呼ばれた（シート作成）
+        batch_update_call = service.spreadsheets.return_value.batchUpdate.call_args
+        add_sheet_request = batch_update_call.kwargs["body"]["requests"][0]["addSheet"]
+        self.assertEqual(
+            add_sheet_request["properties"]["title"], "メールアドレス一覧"
+        )
+        # ヘッダー書き込みが行われた（5 列）
+        update_call = service.spreadsheets.return_value.values.return_value.update.call_args
+        self.assertIn("メールアドレス一覧!A1:E1", update_call.kwargs["range"])
+        self.assertEqual(
+            update_call.kwargs["body"]["values"][0],
+            ["医院番号", "医院名", "個人名", "個人メール", "医院メール"],
+        )
+        # 空リストが返る（シート新規作成直後はデータ 0 件）
+        self.assertEqual(records, [])
+
+    @patch("src.sheets_client.get_sheets_service")
+    def test_invalid_person_email_is_masked_with_warning(self, mock_get_service):
+        """形式不正の個人メールは空扱い + warning ログ。"""
+        service = _build_email_sheet_service(
+            ["メールアドレス一覧"],
+            [
+                ["医院番号", "医院名", "個人名", "個人メール", "医院メール"],
+                ["001", "三浦歯科", "白川 蓮", "not-an-email", "clinic@example.com"],
+            ],
+        )
+        mock_get_service.return_value = service
+
+        with self.assertLogs("jissen_comment", level="WARNING") as log_ctx:
+            records = sheets_client.read_email_records(
+                spreadsheet_id="sid", sheet_name="メールアドレス一覧",
+            )
+
+        self.assertEqual(len(records), 1)
+        # 個人メールは形式不正のため空扱い、医院メールはそのまま
+        self.assertEqual(records[0].person_email, "")
+        self.assertEqual(records[0].clinic_email, "clinic@example.com")
+        joined = "\n".join(log_ctx.output)
+        self.assertIn("個人メール", joined)
+        self.assertIn("形式が不正", joined)
+
+    @patch("src.sheets_client.get_sheets_service")
+    def test_invalid_clinic_email_is_masked_with_warning(self, mock_get_service):
+        """形式不正の医院メールも空扱い + warning ログ。"""
+        service = _build_email_sheet_service(
+            ["メールアドレス一覧"],
+            [
+                ["医院番号", "医院名", "個人名", "個人メール", "医院メール"],
+                ["001", "三浦歯科", "白川 蓮", "ren@example.com", "broken-clinic"],
+            ],
+        )
+        mock_get_service.return_value = service
+
+        with self.assertLogs("jissen_comment", level="WARNING") as log_ctx:
+            records = sheets_client.read_email_records(
+                spreadsheet_id="sid", sheet_name="メールアドレス一覧",
+            )
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].person_email, "ren@example.com")
+        self.assertEqual(records[0].clinic_email, "")
+        joined = "\n".join(log_ctx.output)
+        self.assertIn("医院メール", joined)
+
+    @patch("src.sheets_client.get_sheets_service")
+    def test_empty_rows_are_skipped(self, mock_get_service):
+        """医院番号も個人名も空の行は読み飛ばす。"""
+        service = _build_email_sheet_service(
+            ["メールアドレス一覧"],
+            [
+                ["医院番号", "医院名", "個人名", "個人メール", "医院メール"],
+                ["001", "三浦歯科", "白川 蓮", "ren@example.com", ""],
+                ["", "", "", "", ""],  # 空行
+                ["002", "山本歯科", "田中 太郎", "tanaka@example.com", ""],
+            ],
+        )
+        mock_get_service.return_value = service
+
+        records = sheets_client.read_email_records(
+            spreadsheet_id="sid", sheet_name="メールアドレス一覧",
+        )
+
+        self.assertEqual(len(records), 2)
+        self.assertEqual(records[0].clinic_number, "001")
+        self.assertEqual(records[1].clinic_number, "002")
+
+    @patch("src.sheets_client.get_sheets_service")
+    def test_passes_num_retries(self, mock_get_service):
+        """全 ``execute()`` に num_retries=GOOGLE_API_NUM_RETRIES が渡る（P-017）。"""
+        service = _build_email_sheet_service(
+            ["メールアドレス一覧"],
+            [
+                ["医院番号", "医院名", "個人名", "個人メール", "医院メール"],
+                ["001", "三浦歯科", "白川 蓮", "ren@example.com", ""],
+            ],
+        )
+        mock_get_service.return_value = service
+
+        sheets_client.read_email_records(
+            spreadsheet_id="sid", sheet_name="メールアドレス一覧",
+        )
+
+        meta_execute = service.spreadsheets.return_value.get.return_value.execute
+        self.assertEqual(
+            meta_execute.call_args.kwargs.get("num_retries"),
+            sheets_client.GOOGLE_API_NUM_RETRIES,
+        )
+        values_execute = (
+            service.spreadsheets.return_value.values.return_value.get
+            .return_value.execute
+        )
+        self.assertEqual(
+            values_execute.call_args.kwargs.get("num_retries"),
+            sheets_client.GOOGLE_API_NUM_RETRIES,
+        )
+
+    @patch("src.sheets_client.get_sheets_service")
+    def test_uses_default_sheet_name_when_omitted(self, mock_get_service):
+        """sheet_name 省略時は EMAIL_SHEET_NAME にフォールバックする。"""
+        service = _build_email_sheet_service(
+            [sheets_client.EMAIL_SHEET_NAME],
+            [
+                ["医院番号", "医院名", "個人名", "個人メール", "医院メール"],
+                ["001", "A", "B", "b@example.com", "a@example.com"],
+            ],
+        )
+        mock_get_service.return_value = service
+
+        sheets_client.read_email_records(spreadsheet_id="sid")
+
+        get_call = service.spreadsheets.return_value.values.return_value.get.call_args
+        self.assertIn(sheets_client.EMAIL_SHEET_NAME, get_call.kwargs["range"])
+
+    def test_raises_when_spreadsheet_id_missing(self):
+        """``SPREADSHEET_ID`` 未設定なら ValueError。"""
+        with patch.object(sheets_client, "SPREADSHEET_ID", ""):
+            with self.assertRaises(ValueError):
+                sheets_client.read_email_records()
+
+
+class TestLookupEmail(unittest.TestCase):
+    """``lookup_email`` のルックアップ・フォールバックロジック。"""
+
+    def _records(self) -> list[sheets_client.EmailRecord]:
+        return [
+            sheets_client.EmailRecord(
+                clinic_number="001",
+                clinic_name="三浦歯科医院",
+                person_name="白川 蓮",
+                person_email="ren@example.com",
+                clinic_email="miura@example.com",
+            ),
+            sheets_client.EmailRecord(
+                clinic_number="001",
+                clinic_name="三浦歯科医院",
+                person_name="鈴木 一郎",
+                person_email="",
+                clinic_email="miura@example.com",
+            ),
+            sheets_client.EmailRecord(
+                clinic_number="002",
+                clinic_name="山本歯科",
+                person_name="田中 太郎",
+                person_email="",
+                clinic_email="yamamoto@example.com",
+            ),
+            sheets_client.EmailRecord(
+                clinic_number="003",
+                clinic_name="佐藤医院",
+                person_name="佐藤 二郎",
+                person_email="",
+                clinic_email="",
+            ),
+        ]
+
+    def test_exact_match_with_person_email_returns_person_and_clinic(self):
+        """完全一致で個人メールあり → (個人メール, 医院メール)。"""
+        records = self._records()
+        to_email, cc_email = sheets_client.lookup_email(records, "001", "白川 蓮")
+        self.assertEqual(to_email, "ren@example.com")
+        self.assertEqual(cc_email, "miura@example.com")
+
+    def test_exact_match_with_person_email_no_clinic_returns_person_only(self):
+        """完全一致で個人メールあり・医院メール空 → (個人メール, "")。"""
+        records = [
+            sheets_client.EmailRecord(
+                clinic_number="010",
+                clinic_name="X 医院",
+                person_name="X 個人",
+                person_email="x@example.com",
+                clinic_email="",  # 医院メール空
+            ),
+        ]
+        to_email, cc_email = sheets_client.lookup_email(records, "010", "X 個人")
+        self.assertEqual(to_email, "x@example.com")
+        self.assertEqual(cc_email, "")
+
+    def test_exact_match_with_empty_person_email_uses_clinic(self):
+        """完全一致で個人メール空、医院メールあり → (医院メール, "")。"""
+        records = self._records()
+        to_email, cc_email = sheets_client.lookup_email(records, "001", "鈴木 一郎")
+        self.assertEqual(to_email, "miura@example.com")
+        self.assertEqual(cc_email, "")
+
+    def test_no_exact_match_falls_back_to_clinic_email_from_other_row(self):
+        """完全一致なし → 同じ医院番号の他の行から医院メールを拾う → (医院メール, "")。"""
+        records = self._records()
+        # 医院番号 001 の他の個人 → メールシートに直接の行がない人物
+        to_email, cc_email = sheets_client.lookup_email(records, "001", "未登録 個人")
+        self.assertEqual(to_email, "miura@example.com")
+        self.assertEqual(cc_email, "")
+
+    def test_no_exact_match_no_clinic_email_returns_empty(self):
+        """完全一致なし・同じ医院番号の他の行も医院メール空 → ("", "")。"""
+        records = self._records()
+        # 医院番号 003 は佐藤医院があるが、その行の医院メールも空。
+        to_email, cc_email = sheets_client.lookup_email(records, "003", "未登録 X")
+        self.assertEqual(to_email, "")
+        self.assertEqual(cc_email, "")
+
+    def test_no_match_for_unknown_clinic_returns_empty(self):
+        """医院番号が一切ない → ("", "")。"""
+        records = self._records()
+        to_email, cc_email = sheets_client.lookup_email(records, "999", "未登録 個人")
+        self.assertEqual(to_email, "")
+        self.assertEqual(cc_email, "")
+
+    def test_all_empty_records_returns_empty(self):
+        """records 全部空メール → ("", "")。"""
+        records = [
+            sheets_client.EmailRecord(
+                clinic_number="001",
+                clinic_name="A",
+                person_name="P",
+                person_email="",
+                clinic_email="",
+            ),
+        ]
+        to_email, cc_email = sheets_client.lookup_email(records, "001", "P")
+        self.assertEqual(to_email, "")
+        self.assertEqual(cc_email, "")
+
+    def test_empty_records_list_returns_empty(self):
+        """records が空リスト → ("", "")。"""
+        to_email, cc_email = sheets_client.lookup_email([], "001", "X")
+        self.assertEqual(to_email, "")
+        self.assertEqual(cc_email, "")
+
+
 if __name__ == "__main__":
     unittest.main()

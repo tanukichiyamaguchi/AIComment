@@ -23,6 +23,8 @@ from typing import Any
 
 import yaml
 
+from src.config import EMAIL_SHEET_NAME
+
 PROFILES_DIR = Path(__file__).resolve().parent.parent / "profiles"
 
 _REQUIRED_FIELDS: tuple[str, ...] = (
@@ -42,6 +44,10 @@ class ProfileConfig:
 
     シークレット参照（``*_secret`` フィールド）は ``load_profile`` 内で
     環境変数を参照して解決済みの値（folder ID 等）に置き換わる。
+
+    ``email_sheet_name`` は Gmail 下書き作成用のメールアドレス一覧シートの
+    タブ名。YAML で省略可能で、省略時は ``EMAIL_SHEET_NAME`` グローバル値
+    （``メールアドレス一覧``）にフォールバックする。
     """
 
     name: str
@@ -52,6 +58,7 @@ class ProfileConfig:
     output_folder_id: str
     output_sheet_name: str
     prompt_template: str
+    email_sheet_name: str = EMAIL_SHEET_NAME
 
 
 def load_profile(profile_name: str) -> ProfileConfig:
@@ -103,6 +110,14 @@ def load_profile(profile_name: str) -> ProfileConfig:
             f"'{output_secret_name}' が未設定"
         )
 
+    # メールアドレスシート名は YAML で省略可能（必須フィールド外）。
+    # 省略時はグローバル既定値 ``EMAIL_SHEET_NAME`` を使う。
+    email_sheet_name = (
+        str(data["email_sheet_name"])
+        if "email_sheet_name" in data
+        else EMAIL_SHEET_NAME
+    )
+
     return ProfileConfig(
         name=profile_name,
         display_name=str(data["display_name"]),
@@ -112,6 +127,7 @@ def load_profile(profile_name: str) -> ProfileConfig:
         output_folder_id=output_id,
         output_sheet_name=str(data["output_sheet_name"]),
         prompt_template=str(data["prompt_template"]),
+        email_sheet_name=email_sheet_name,
     )
 
 

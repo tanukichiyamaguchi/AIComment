@@ -867,5 +867,240 @@ class TestStep4AttachmentPassthrough(unittest.TestCase):
         self.assertEqual(mock_sheets.append_output_record.call_count, 1)
 
 
+class TestStep4GmailDraftIntegration(unittest.TestCase):
+    """``step4_generate_pdfs`` の Gmail 下書き作成統合（Batch モード）。
+
+    Step4 でメインの PDF アップロード成功後 + シート追記後、メールアドレス一覧
+    シートを引いて Gmail 下書きを作成する。``_process_attachments`` でも同じ
+    ロジックで添付資料経路の下書きを作成する。
+    """
+
+    def setUp(self):
+        # _process_attachments が batch_attachments.json を読むため空ファイル
+        # を用意し、副作用を出さないようにする。
+        self._att_file = LOGS_DIR / "batch_attachments.json"
+        self._att_backup = (
+            self._att_file.read_text() if self._att_file.exists() else None
+        )
+        LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        self._att_file.write_text("[]")
+
+    def tearDown(self):
+        if self._att_backup is None:
+            self._att_file.unlink(missing_ok=True)
+        else:
+            self._att_file.write_text(self._att_backup)
+
+    def _email_record(
+        self, clinic_number, person_name, person_email, clinic_email,
+        clinic_name="X",
+    ):
+        from src.sheets_client import EmailRecord
+        return EmailRecord(
+            clinic_number=clinic_number,
+            clinic_name=clinic_name,
+            person_name=person_name,
+            person_email=person_email,
+            clinic_email=clinic_email,
+        )
+
+    @patch("src.batch_main.pdf_merger")
+    @patch("src.batch_main.pdf_creator")
+    @patch("src.batch_main.gmail_client")
+    @patch("src.batch_main.drive_client")
+    @patch("src.batch_main.sheets_client")
+    @patch("src.batch_main.ensure_fonts")
+    def test_main_pdf_creates_draft_with_person_email_and_clinic_cc(
+        self, mock_fonts, mock_sheets, mock_drive, mock_gmail,
+        mock_creator, mock_merger,
+    ):
+        """個人メール + 医院メール → TO=個人, CC=医院 で create_draft。"""
+        from src import sheets_client as real_sheets_client
+
+        mock_sheets.get_recorded_clinic_numbers.return_value = set()
+        mock_sheets.read_email_records.return_value = [
+            self._email_record(
+                "111", "田中太郎", "tanaka@example.com", "ymd@example.com"
+            ),
+        ]
+        mock_sheets.lookup_email.side_effect = (
+            lambda recs, cn, pn: real_sheets_client.lookup_email(recs, cn, pn)
+        )
+        _install_step4_mocks(mock_drive, mock_merger)
+        profile = _make_profile()
+
+        batch_main.step4_generate_pdfs(
+            profile,
+            results=_make_batch_results(1),
+            items=_make_batch_items(["111-22-3実践事例.pdf"]),
+        )
+
+        mock_gmail.create_draft.assert_called_once()
+        kwargs = mock_gmail.create_draft.call_args.kwargs
+        self.assertEqual(kwargs["to_email"], "tanaka@example.com")
+        self.assertEqual(kwargs["cc_email"], "ymd@example.com")
+        self.assertEqual(kwargs["person_name"], "田中太郎")
+
+    @patch("src.batch_main.pdf_merger")
+    @patch("src.batch_main.pdf_creator")
+    @patch("src.batch_main.gmail_client")
+    @patch("src.batch_main.drive_client")
+    @patch("src.batch_main.sheets_client")
+    @patch("src.batch_main.ensure_fonts")
+    def test_unregistered_email_skips_draft_with_warning(
+        self, mock_fonts, mock_sheets, mock_drive, mock_gmail,
+        mock_creator, mock_merger,
+    ):
+        """メール未登録 → create_draft なし + warning ログ。PDF 処理は完了。"""
+        from src import sheets_client as real_sheets_client
+
+        mock_sheets.get_recorded_clinic_numbers.return_value = set()
+        mock_sheets.read_email_records.return_value = []
+        mock_sheets.lookup_email.side_effect = (
+            lambda recs, cn, pn: real_sheets_client.lookup_email(recs, cn, pn)
+        )
+        _install_step4_mocks(mock_drive, mock_merger)
+        profile = _make_profile()
+
+        with self.assertLogs("jissen_comment", level="WARNING") as log_ctx:
+            batch_main.step4_generate_pdfs(
+                profile,
+                results=_make_batch_results(1),
+                items=_make_batch_items(["111-22-3実践事例.pdf"]),
+            )
+
+        mock_gmail.create_draft.assert_not_called()
+        joined = "\n".join(log_ctx.output)
+        self.assertIn("メール未登録", joined)
+        self.assertIn("111", joined)
+        # PDF 処理は通常通り完了
+        mock_drive.upload_pdf_to_clinic_person.assert_called_once()
+        mock_sheets.append_output_record.assert_called_once()
+
+    @patch("src.batch_main.pdf_merger")
+    @patch("src.batch_main.pdf_creator")
+    @patch("src.batch_main.gmail_client")
+    @patch("src.batch_main.drive_client")
+    @patch("src.batch_main.sheets_client")
+    @patch("src.batch_main.ensure_fonts")
+    def test_draft_creation_exception_does_not_stop_processing(
+        self, mock_fonts, mock_sheets, mock_drive, mock_gmail,
+        mock_creator, mock_merger,
+    ):
+        """create_draft が例外を投げても次の PDF に進む（fail-soft）。"""
+        from src import sheets_client as real_sheets_client
+
+        mock_sheets.get_recorded_clinic_numbers.return_value = set()
+        mock_sheets.read_email_records.return_value = [
+            self._email_record(
+                "111", "田中太郎", "t@example.com", "",
+            ),
+            self._email_record(
+                "222", "田中太郎", "next@example.com", "",
+            ),
+        ]
+        mock_sheets.lookup_email.side_effect = (
+            lambda recs, cn, pn: real_sheets_client.lookup_email(recs, cn, pn)
+        )
+        mock_gmail.create_draft.side_effect = [
+            RuntimeError("Gmail API down"),
+            "draft_ok",
+        ]
+        _install_step4_mocks(mock_drive, mock_merger)
+        profile = _make_profile()
+
+        batch_main.step4_generate_pdfs(
+            profile,
+            results=_make_batch_results(2),
+            items=_make_batch_items(
+                ["111-22-3実践事例A.pdf", "222-22-3実践事例B.pdf"]
+            ),
+        )
+
+        # 両方の PDF が処理される（最初の Gmail 失敗で停止しない）
+        self.assertEqual(mock_drive.upload_pdf_to_clinic_person.call_count, 2)
+        self.assertEqual(mock_sheets.append_output_record.call_count, 2)
+        # create_draft は両方の PDF で呼ばれる
+        self.assertEqual(mock_gmail.create_draft.call_count, 2)
+
+    @patch("src.batch_main.pdf_merger")
+    @patch("src.batch_main.pdf_creator")
+    @patch("src.batch_main.gmail_client")
+    @patch("src.batch_main.drive_client")
+    @patch("src.batch_main.sheets_client")
+    @patch("src.batch_main.ensure_fonts")
+    def test_email_records_read_once_per_step4(
+        self, mock_fonts, mock_sheets, mock_drive, mock_gmail,
+        mock_creator, mock_merger,
+    ):
+        """Step4 全体で read_email_records は 1 回だけ呼ばれる。"""
+        from src import sheets_client as real_sheets_client
+
+        mock_sheets.get_recorded_clinic_numbers.return_value = set()
+        mock_sheets.read_email_records.return_value = []
+        mock_sheets.lookup_email.side_effect = (
+            lambda recs, cn, pn: real_sheets_client.lookup_email(recs, cn, pn)
+        )
+        _install_step4_mocks(mock_drive, mock_merger)
+        profile = _make_profile()
+
+        batch_main.step4_generate_pdfs(
+            profile,
+            results=_make_batch_results(3),
+            items=_make_batch_items(
+                ["111-22-3.pdf", "112-22-3.pdf", "113-22-3.pdf"]
+            ),
+        )
+
+        # 3 件処理しても read_email_records は 1 回だけ
+        self.assertEqual(mock_sheets.read_email_records.call_count, 1)
+
+    @patch("src.batch_main.pdf_merger")
+    @patch("src.batch_main.pdf_creator")
+    @patch("src.batch_main.gmail_client")
+    @patch("src.batch_main.drive_client")
+    @patch("src.batch_main.sheets_client")
+    @patch("src.batch_main.ensure_fonts")
+    def test_attachment_path_also_creates_gmail_draft(
+        self, mock_fonts, mock_sheets, mock_drive, mock_gmail,
+        mock_creator, mock_merger,
+    ):
+        """添付資料経路でも create_draft が呼ばれる（同じ個人宛、件名はメインと同じ）。"""
+        from src import sheets_client as real_sheets_client
+
+        mock_sheets.get_recorded_clinic_numbers.return_value = set()
+        mock_sheets.read_email_records.return_value = [
+            self._email_record(
+                "111", "田中太郎", "tanaka@example.com", "clinic@example.com"
+            ),
+        ]
+        mock_sheets.lookup_email.side_effect = (
+            lambda recs, cn, pn: real_sheets_client.lookup_email(recs, cn, pn)
+        )
+        _install_step4_mocks(mock_drive, mock_merger)
+        # 添付資料 1 件を batch_attachments.json に入れる
+        self._att_file.write_text(json.dumps([
+            {
+                "file_id": "id_att",
+                "file_name": "111-22-3【添付資料】補足.pdf",
+                "management_number": "111-22-3",
+            }
+        ]))
+        profile = _make_profile()
+
+        batch_main.step4_generate_pdfs(
+            profile,
+            results=_make_batch_results(1),
+            items=_make_batch_items(["111-22-3実践事例.pdf"]),
+        )
+
+        # メイン + 添付資料 で create_draft が 2 回呼ばれる
+        self.assertEqual(mock_gmail.create_draft.call_count, 2)
+        for call in mock_gmail.create_draft.call_args_list:
+            self.assertEqual(call.kwargs["to_email"], "tanaka@example.com")
+            self.assertEqual(call.kwargs["person_name"], "田中太郎")
+            self.assertEqual(call.kwargs["cc_email"], "clinic@example.com")
+
+
 if __name__ == "__main__":
     unittest.main()
