@@ -1983,15 +1983,18 @@ class TestMasterSheetIntegrationE2E(unittest.TestCase):
         self._env_patcher.stop()
 
     def _master_record(
-        self, clinic_number, clinic_name, email,
+        self, management_number, clinic_name, email,
         participant_name="田中太郎", venue="",
     ):
-        """テスト用 MasterRecord。``participant_name`` のデフォルトは
-        AI 抽出名 ``田中太郎`` と一致させ、突合がヒットするようにしてある。
+        """テスト用 MasterRecord。
+
+        ``management_number`` は ``xxx-yy`` 形式（例 ``001-01``）で渡す。
+        医院コードは property で先頭セグメントから派生する。
+        ``participant_name`` のデフォルトは AI 抽出名 ``田中太郎`` と一致。
         """
         from src.sheets_client import MasterRecord
         return MasterRecord(
-            clinic_number=clinic_number,
+            management_number=management_number,
             clinic_name=clinic_name,
             participant_name=participant_name,
             venue=venue,
@@ -2023,9 +2026,9 @@ class TestMasterSheetIntegrationE2E(unittest.TestCase):
             mock_creator, mock_merger, mock_fonts, pdf_count=4,
         )
         mock_sheets.read_master_records.return_value = [
-            self._master_record("001", "001 標準名", "p1@example.com"),
-            self._master_record("002", "002 標準名", "p2@example.com"),
-            self._master_record("003", "003 標準名", "p3@example.com"),
+            self._master_record("001-00", "001 標準名", "p1@example.com"),
+            self._master_record("002-00", "002 標準名", "p2@example.com"),
+            self._master_record("003-00", "003 標準名", "p3@example.com"),
             # 004 (clinic_number) はマスター未登録
         ]
         mock_sheets.lookup_clinic_name.side_effect = (
@@ -2051,9 +2054,9 @@ class TestMasterSheetIntegrationE2E(unittest.TestCase):
         for call in mock_gmail.create_draft.call_args_list:
             self.assertIsNone(call.kwargs["cc_email"])
 
-        # 004 はマスター未ヒットで宛先空の警告
+        # 004 はマスター未ヒットで宛先空の警告（メール未ヒットログが出る）
         joined = "\n".join(log_ctx.output)
-        self.assertIn("マスター未ヒット", joined)
+        self.assertIn("メール未ヒット", joined)
         self.assertIn("004", joined)
         # 医院名 lookup ミスも警告
         self.assertIn("参加者マスター未登録", joined)
@@ -2088,7 +2091,7 @@ class TestMasterSheetIntegrationE2E(unittest.TestCase):
             mock_sheets.get_recorded_clinic_numbers.return_value = set()
             mock_sheets.read_master_records.return_value = [
                 self._master_record(
-                    "111", "標準医院名", "p@example.com"
+                    "111-22", "標準医院名", "p@example.com"
                 ),
             ]
             mock_sheets.lookup_clinic_name.side_effect = (

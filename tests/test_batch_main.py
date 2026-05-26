@@ -908,16 +908,18 @@ class TestStep4MasterSheetIntegration(unittest.TestCase):
             self._att_file.write_text(self._att_backup)
 
     def _master_record(
-        self, clinic_number, clinic_name, email,
+        self, management_number, clinic_name, email,
         participant_name="田中太郎", venue="",
     ):
-        """テスト用 MasterRecord。``participant_name`` のデフォルトは
-        ``_make_batch_results`` の AI 抽出名と一致させ、突合がヒットするように
-        してある。
+        """テスト用 MasterRecord。
+
+        ``management_number`` は ``xxx-yy`` 形式（例 ``111-22``）で渡す。
+        医院コードは property で先頭セグメントから派生する。
+        ``participant_name`` のデフォルトは AI 抽出名 ``田中太郎`` と一致。
         """
         from src.sheets_client import MasterRecord
         return MasterRecord(
-            clinic_number=clinic_number,
+            management_number=management_number,
             clinic_name=clinic_name,
             participant_name=participant_name,
             venue=venue,
@@ -940,7 +942,7 @@ class TestStep4MasterSheetIntegration(unittest.TestCase):
         mock_sheets.get_recorded_clinic_numbers.return_value = set()
         mock_sheets.read_master_records.return_value = [
             self._master_record(
-                "111", "標準医院名", "tanaka@example.com"
+                "111-22", "標準医院名", "tanaka@example.com"
             ),
         ]
         mock_sheets.lookup_clinic_name.side_effect = (
@@ -979,7 +981,7 @@ class TestStep4MasterSheetIntegration(unittest.TestCase):
 
         mock_sheets.get_recorded_clinic_numbers.return_value = set()
         mock_sheets.read_master_records.return_value = [
-            self._master_record("111", "標準医院名", "t@example.com"),
+            self._master_record("111-22", "標準医院名", "t@example.com"),
         ]
         mock_sheets.lookup_clinic_name.side_effect = (
             lambda recs, cn: real_sheets_client.lookup_clinic_name(recs, cn)
@@ -1077,7 +1079,7 @@ class TestStep4MasterSheetIntegration(unittest.TestCase):
         kwargs = mock_gmail.create_draft.call_args.kwargs
         self.assertEqual(kwargs["to_email"], "")
         joined = "\n".join(log_ctx.output)
-        self.assertIn("マスター未ヒット", joined)
+        self.assertIn("メール未ヒット", joined)
         self.assertIn("111", joined)
         # PDF 処理は通常通り完了
         mock_drive.upload_pdf_to_clinic_person.assert_called_once()
@@ -1098,8 +1100,8 @@ class TestStep4MasterSheetIntegration(unittest.TestCase):
 
         mock_sheets.get_recorded_clinic_numbers.return_value = set()
         mock_sheets.read_master_records.return_value = [
-            self._master_record("111", "三浦歯科医院", "t@example.com"),
-            self._master_record("222", "山本歯科", "next@example.com"),
+            self._master_record("111-22", "三浦歯科医院", "t@example.com"),
+            self._master_record("222-22", "山本歯科", "next@example.com"),
         ]
         mock_sheets.lookup_clinic_name.side_effect = (
             lambda recs, cn: real_sheets_client.lookup_clinic_name(recs, cn)
@@ -1173,13 +1175,17 @@ class TestStep4MasterSheetIntegration(unittest.TestCase):
         self, mock_fonts, mock_sheets, mock_drive, mock_gmail,
         mock_creator, mock_merger,
     ):
-        """添付資料経路でも create_draft が呼ばれる（同じ管理番号、件名はメインと同じ）。"""
+        """添付資料経路の PDF も同じメールアドレスのグループにまとめられる。
+
+        メイン + 添付資料が同じ個人 (=同じメールアドレス) → 1 通の下書きに
+        両方添付される。
+        """
         from src import sheets_client as real_sheets_client
 
         mock_sheets.get_recorded_clinic_numbers.return_value = set()
         mock_sheets.read_master_records.return_value = [
             self._master_record(
-                "111", "三浦歯科医院", "tanaka@example.com"
+                "111-22", "三浦歯科医院", "tanaka@example.com"
             ),
         ]
         mock_sheets.lookup_clinic_name.side_effect = (
@@ -1205,13 +1211,14 @@ class TestStep4MasterSheetIntegration(unittest.TestCase):
             items=_make_batch_items(["111-22-3実践事例.pdf"]),
         )
 
-        # メイン + 添付資料 で create_draft が 2 回呼ばれる
-        self.assertEqual(mock_gmail.create_draft.call_count, 2)
-        # 両方とも同じ to/person_name、CC なし
-        for call in mock_gmail.create_draft.call_args_list:
-            self.assertEqual(call.kwargs["to_email"], "tanaka@example.com")
-            self.assertEqual(call.kwargs["person_name"], "田中太郎")
-            self.assertIsNone(call.kwargs["cc_email"])
+        # メイン + 添付資料が同じ tanaka@example.com に集約 → 下書きは 1 通
+        mock_gmail.create_draft.assert_called_once()
+        kwargs = mock_gmail.create_draft.call_args.kwargs
+        self.assertEqual(kwargs["to_email"], "tanaka@example.com")
+        self.assertEqual(kwargs["person_name"], "田中太郎")
+        self.assertIsNone(kwargs["cc_email"])
+        # 添付ファイルは 2 件（メイン PDF + 添付資料 PDF）
+        self.assertEqual(len(kwargs["pdf_paths"]), 2)
 
 
 if __name__ == "__main__":

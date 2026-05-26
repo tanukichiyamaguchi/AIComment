@@ -195,6 +195,55 @@ PR #8 で `supportsAllDrives=True` を追加したが、本番実行で `storage
 - [ ] 出力一覧シートに行が追記される
 - [ ] Driveログ：`Drive認証: OAuthユーザートークンを使用` が出ていること
 
+## Phase 15: マスター列構造修正 + 同一人物の PDF を 1 通の下書きに集約（2026-05-26）
+
+### 背景
+PR #37 マージ後、本番実行で「下書きは作られるが宛先が空」になっていた。
+原因はマスターシート A 列の構造想定違い:
+- コードが期待: A 列 = 医院コード `001`（医院管理番号として）
+- ユーザーの実装: A 列 = 管理番号 `101-01` のまま、別途 A 列に医院コードを
+  入れようとして空にしていた
+
+ユーザー要件の整理:
+1. **A 列は管理番号 (`xxx-yy`) のまま運用したい**（管理シートを変えたくない）
+2. **コード側で先頭セグメントから医院コードを派生** させる
+3. 加えて、**同一人物の複数 PDF は 1 通の下書きに集約** したい
+   （現状は PDF ごとに別下書き）
+
+### 実装
+- `MasterRecord.management_number` を A 列とし、`clinic_number` は property
+  として先頭セグメント（`-` の前）を返す（``101-01`` → ``101``、``101``
+  単独もそのまま医院コードとして扱う）
+- ヘッダーを元の 5 列に戻す: `["管理番号", "医院名", "参加者名", "申し込み会場", "メールアドレス"]`
+- `lookup_clinic_name` / `lookup_email_by_clinic_and_person` を派生
+  `clinic_number` プロパティ基準に変更
+- `gmail_client.create_draft`: `pdf_path` → `pdf_paths` (list 対応)。
+  単一パスも後方互換で受け付ける
+- `main.py` / `batch_main.py`: ループ中は `_collect_draft_item` で
+  `(email, person_name, pdf_path)` を蓄積し、ループ終了後に
+  `_create_grouped_drafts_*` でメールアドレスごとに 1 通の下書きに集約。
+  PDF はセッションスコープの tempdir に保持し集約完了後に削除
+- メール空の項目は集約せず PDF ごとに個別の宛先空下書きを作成
+
+### 集約方針（ユーザー確定）
+- グループキー: メールアドレスのみ
+- 件名・本文テンプレート: 現行のまま（変更しない）
+- 同一メール / 異なる個人名: 警告ログ + 先頭の個人名を採用
+- メール空: 集約せず個別下書き（手動補完用）
+
+### タスク
+- [x] `MasterRecord` を `management_number` 中心に戻し `clinic_number` を property 化
+- [x] `_MASTER_SHEET_HEADER` を 5 列に戻す（管理番号 / 医院名 / 参加者名 / 申し込み会場 / メールアドレス）
+- [x] `read_master_records` の読み取り範囲を A:E に
+- [x] `lookup_clinic_name` / `lookup_email_by_clinic_and_person` を派生 clinic_number 基準に
+- [x] `gmail_client.create_draft` に `pdf_paths` (list) 対応を追加（後方互換あり）
+- [x] `main.py` でセッションスコープ tempdir + 集約下書き作成に切り替え
+- [x] `batch_main.py` でも同様の集約フローに切り替え
+- [x] `_create_gmail_draft_safe` を削除（`_collect_draft_item_batch` + `_create_grouped_drafts_for_batch` に分解）
+- [x] テスト更新（管理番号 `xxx-yy` 形式に統一、集約後の挙動を検証）
+- [x] 全 457 件パス
+- [ ] commit + push + PR
+
 ## Phase 14: メールアドレス突合を「医院管理番号 + 個人名」方式に変更（2026-05-26）
 
 ### 背景
