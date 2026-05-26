@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import re
 import sys
-from pathlib import Path
+import unicodedata
 
 from src.config import LOG_LEVEL, LOG_FILE, LOGS_DIR, ASSETS_DIR, FONT_REGULAR, FONT_BOLD
 
@@ -83,6 +83,102 @@ def sanitize_filename(
     if not cleaned:
         return fallback
     return cleaned[:max_length]
+
+
+# 実践事例 PDF のファイル名先頭に埋め込まれた管理番号のパターン。
+# ``<3〜5桁>-<2桁>-<1桁>``（先頭セグメント = 医院番号は 3〜5 桁可変、
+# 2・3 番目のセグメントは桁数固定）。先頭セグメントの ``(...)`` は
+# ``extract_clinic_number`` が医院番号として再利用する。
+_MANAGEMENT_NUMBER_PATTERN = re.compile(r"^(\d{3,5})-\d{2}-\d")
+
+
+def extract_management_number(filename: str) -> str:
+    """PDFファイル名の先頭から管理番号を抽出する。
+
+    実践事例 PDF はファイル名の先頭に ``NNN-NN-N`` 形式
+    （先頭セグメント 3〜5 桁 - 数字2 - 数字1）の管理番号が埋め込まれている。
+    例: ``001-01-0実践事例.pdf`` → ``001-01-0``、``00123-45-6.pdf`` → ``00123-45-6``。
+
+    Args:
+        filename: PDF のファイル名
+
+    Returns:
+        抽出した管理番号（先頭セグメントの桁数に応じて 7〜9 文字）。
+        先頭がパターンに合致しない場合は空文字列。
+        （呼び出し側で空文字列を検知して warning ログを出すこと）
+    """
+    if not isinstance(filename, str):
+        filename = str(filename)
+    match = _MANAGEMENT_NUMBER_PATTERN.match(filename)
+    return match.group(0) if match else ""
+
+
+def extract_clinic_number(filename: str) -> str:
+    """PDFファイル名先頭の管理番号から医院番号（最初のハイフンより前）を抽出する。
+
+    管理番号 ``NNN-NN-N`` の先頭セグメント（3〜5桁）が医院番号。
+    例: ``001-01-0実践事例.pdf`` → ``001``、``00123-45-6.pdf`` → ``00123``。
+    管理番号がファイル名先頭から抽出できない場合は空文字列を返す。
+
+    Args:
+        filename: PDF のファイル名
+
+    Returns:
+        抽出した医院番号（3〜5桁の数字文字列）。
+        先頭がパターンに合致しない場合は空文字列。
+    """
+    if not isinstance(filename, str):
+        filename = str(filename)
+    match = _MANAGEMENT_NUMBER_PATTERN.match(filename)
+    return match.group(1) if match else ""
+
+
+# 添付資料 PDF をファイル名から識別するためのマーカー（全角の隅付き括弧込み）。
+# このマーカーを含む PDF は実践事例の補足資料であり、AI 処理（テキスト抽出 /
+# Claude API 呼び出し / コメントページ生成 / PDF 結合）を一切せず、
+# メイン実践事例 PDF と同じ出力フォルダへ元ファイルのままコピーする。
+_ATTACHMENT_MARKER = "【添付資料】"
+
+
+def is_attachment_filename(filename: str) -> bool:
+    """ファイル名が添付資料を示すか判定する。
+
+    ファイル名に「【添付資料】」（全角の【】込み）を含む PDF は、
+    実践事例の補足資料。AI 処理せず、メインと同じ出力フォルダに
+    元ファイルのままコピーする対象。
+
+    Args:
+        filename: PDF のファイル名
+
+    Returns:
+        ファイル名に添付資料マーカーを含むなら True。
+    """
+    if not isinstance(filename, str):
+        filename = str(filename)
+    return _ATTACHMENT_MARKER in filename
+
+
+def normalize_name_for_match(name: str) -> str:
+    """医院名・氏名のマッチング用に正規化する。
+
+    AIが抽出する医院名・氏名は、同じ医院/人物でも軽微な表記揺れ
+    （半角/全角、空白の有無）が発生する。Driveフォルダの重複作成を防ぐため、
+    ルックアップ時のみこの正規化済み形で比較する。
+
+    変換内容:
+        - NFKC 正規化（全角英数字・記号を半角に統一）
+        - 全種類の空白文字（半角・全角・タブ等）をすべて除去
+
+    変換しないこと（保守的判定のため）:
+        - 大文字小文字（"WKWK" と "wkwk" は別物として扱う）
+        - 句読点・記号（"森本歯科" と "森本歯科クリニック" は別物）
+
+    マッチング比較**専用**で、表示・保存には使わない（元の表記を保持する）。
+    """
+    if not isinstance(name, str):
+        name = str(name)
+    nfkc = unicodedata.normalize("NFKC", name)
+    return re.sub(r"\s+", "", nfkc)
 
 
 def ensure_fonts() -> None:

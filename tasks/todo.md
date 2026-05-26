@@ -1,5 +1,90 @@
 # じっせん君コメントシステム - Task Tracker
 
+## Phase 12: 参加者マスターシート統合リファクタ（2026-05-26）
+
+### ゴール
+PR #35 で導入した「メールアドレス一覧」シート方式を廃止し、
+ユーザーが既に運用している「管理シート」（5列: 管理番号 / 医院名 / 参加者名 /
+申し込み会場 / メールアドレス）を **唯一の lookup ソース** にする。
+医院名表記の統一とメール lookup の両方を 1 シートで完結させる。
+
+### 設計判断
+- シート名はプロファイル YAML で per-seminar 指定可能。デフォルトは `参加者マスター`
+- 医院名 lookup ミス時 → AI 抽出値で代用（現状維持の挙動）
+- メール lookup ミス時 → Gmail 下書きだけスキップ、PDF 処理は続行（fail-soft）
+- 「開業準備中」など B 列の固定文字列もそのまま標準医院名として扱う
+
+### タスク
+- [x] baseline: 436 tests pass
+- [x] commit 1: sheets_client / config 旧 EmailRecord 系を削除 + MasterRecord 系を追加
+- [x] commit 2: profile / discover で email_sheet_name → master_sheet_name にリネーム
+- [x] commit 3: main.py / batch_main.py で master_records を使う統合
+- [x] commit 4: テスト全面置き換え + README + lessons.md + YAML 雛形
+- [x] mypy エラー 0（既存の yaml stub error 1 件のみ・無関係）
+- [x] 全テスト pass（436 → 440 件）
+
+### 結果サマリ
+- テスト件数: 436 → 440 件（差分 +4）
+    - sheets_client: 16 件入替（旧 EmailRecord 系 16 件削除 → MasterRecord 系 16 件追加）
+    - main: 6 件 → 8 件（TestRunGmailDraftIntegration → TestRunMasterSheetIntegration）
+    - batch_main: 5 件 → 7 件（TestStep4GmailDraftIntegration → TestStep4MasterSheetIntegration）
+    - integration smoke: 2 件 → 2 件（TestGmailDraftIntegrationE2E → TestMasterSheetIntegrationE2E）
+- 変更ファイル: src/config.py, src/sheets_client.py, src/gmail_client.py,
+  src/profile.py, src/discover.py, src/main.py, src/batch_main.py,
+  profiles/jissen_2024_q1.yaml, README.md, tasks/lessons.md, tasks/todo.md
+- 4 つのコミットに分けてプッシュ
+
+## Phase 11: Gmail 下書きの本処理組み込み（2026-05-25, PR #35）
+
+### ゴール（参考: 後続 Phase 12 で参加者マスターに統合）
+
+## Phase 9: フォルダ自動検出システム（2026-05-17）
+
+### ゴール
+INPUT_ROOT 配下のサブフォルダを auto-discover し、出力フォルダ・シートタブ・
+管理番号 prefix を自動派生するアーキテクチャを追加する。
+Convention over Configuration を優先し、Secret/YAML 追加なしで新セミナーに対応する。
+
+### 設計コンセプト
+- 必要な Secret 3 つ: `DRIVE_INPUT_ROOT` / `DRIVE_OUTPUT_ROOT` / `SPREADSHEET_ID`
+- ユーザー作業: Drive サブフォルダ作成 + PDF アップロード + `target_folder` 名を入力
+- システム: フォルダ検索（表記揺れ吸収）→ 出力フォルダ自動作成 → シートタブ自動作成
+  → 管理番号 prefix を `<folder_name>-` で派生 → 既存パイプライン実行
+- 後方互換: `--profile` モードは完全維持
+
+### タスク
+
+- [x] baseline: 265 tests pass, mypy 0 errors
+- [x] `src/discover.py` 新規: 3 関数（list_input_subfolders / resolve_context / list_target_folder_names）
+- [x] `src/config.py` 修正: `DRIVE_INPUT_ROOT` `DRIVE_OUTPUT_ROOT` 読み込み追加
+- [x] `src/main.py` 修正: `--target-folder` 引数 / `__list__` モード / run() 分岐
+- [x] `src/batch_main.py` 修正: `--target-folder` 引数 / step1 / step4 への context 受け渡し
+- [x] `tests/test_discover.py` 新規: 上記 3 関数の単体テスト
+- [x] `tests/test_main.py` 拡張: --target-folder 関連テスト
+- [x] `tests/test_batch_main.py` 拡張: --target-folder 関連テスト
+- [x] `tests/test_integration_smoke.py` 拡張: target_folder E2E + profile リグレッション
+- [x] `.github/workflows/generate_comments.yml` 修正: target_folder input + 2 Secret env
+- [x] `docs/google_form_setup.md` 修正: 対象フォルダ名質問追加
+- [x] `README.md` 修正: フォルダ自動検出セクション
+- [x] `tasks/lessons.md` 修正: P-013 Convention over Configuration
+- [x] pytest 全件 pass / mypy 0 errors
+- [x] 論理単位でコミット → push → ドラフト PR 作成
+
+### 受け入れ条件
+- [x] `pytest tests/` 全件 pass（既存 265 + 新規）
+- [x] `mypy src/ --ignore-missing-imports` エラー 0
+- [x] `src/discover.py` 関数 3 つ実装
+- [x] `--target-folder` 引数が main.py / batch_main.py で動作
+- [x] `--target-folder __list__` で候補列挙
+- [x] 既存 `--profile` モードのリグレッションテスト追加
+- [x] workflow YAML に `target_folder` input + 2 Secret env 追加
+- [x] docs/google_form_setup.md に対象フォルダ名質問の追加手順
+- [x] README にフォルダ自動検出セクション追加
+- [x] tasks/lessons.md に P-013 追記
+- [x] ドラフト PR 作成完了
+
+---
+
 ## 実装フェーズ
 
 - [x] Phase 1: 基盤構築（ディレクトリ構成・requirements.txt・config.py・utils.py）

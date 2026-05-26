@@ -18,6 +18,7 @@ from src.config import (
     GOOGLE_OAUTH_TOKEN_JSON,
     GOOGLE_SCOPES,
 )
+from src.utils import mask_email
 
 logger = logging.getLogger("jissen_comment")
 
@@ -90,14 +91,18 @@ def create_draft(
     to_email: str,
     person_name: str,
     pdf_path: str | Path,
+    cc_email: str | None = None,
     max_retries: int = 1,
 ) -> str:
     """Gmail下書きを作成する。PDF添付付き。
 
     Args:
-        to_email: 送信先メールアドレス
+        to_email: 送信先メールアドレス（TO）
         person_name: 氏名（件名・本文に使用）
         pdf_path: 添付するPDFのパス
+        cc_email: CC のメールアドレス。``None`` または空文字列なら CC ヘッダー
+            を付けない。現在は CC を使っていない（参加者マスター統合後の運用は
+            TO のみ）。将来必要になったら呼び出し側で値を渡す。
         max_retries: リトライ回数
 
     Returns:
@@ -109,6 +114,8 @@ def create_draft(
     # メール構築
     message = MIMEMultipart()
     message["to"] = to_email
+    if cc_email:
+        message["cc"] = cc_email
     message["subject"] = SUBJECT_TEMPLATE.format(person_name=person_name)
 
     body = BODY_TEMPLATE.format(person_name=person_name)
@@ -137,8 +144,10 @@ def create_draft(
             ).execute()
 
             draft_id = draft["id"]
+            cc_log = f", CC={mask_email(cc_email)}" if cc_email else ""
             logger.info(
-                f"Gmail下書き作成: {person_name}様 → draft_id={draft_id}"
+                f"Gmail下書き作成: {person_name}様 "
+                f"(TO={mask_email(to_email)}{cc_log}) → draft_id={draft_id}"
             )
             return draft_id
 

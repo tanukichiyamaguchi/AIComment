@@ -1,0 +1,14 @@
+display_name: "じっせん君コメント（既存設定・後方互換）"
+document_type: jissen_practice_case
+period: "default"
+
+# Secret 名を文字列で指定（実行時に os.environ から取得）
+# 既存の DRIVE_FOLDER_ID / DRIVE_OUTPUT_FOLDER_ID をそのまま参照する。
+input_folder_id_secret: DRIVE_FOLDER_ID
+output_folder_id_secret: DRIVE_OUTPUT_FOLDER_ID
+
+# 既存の OUTPUT_SHEET_NAME と同一値（後方互換）
+output_sheet_name: "出力一覧"
+
+# プロンプトテンプレート識別子（既存挙動）
+prompt_template: jissen_practice_case

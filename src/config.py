@@ -36,6 +36,13 @@ SPREADSHEET_ID = _get_secret("SPREADSHEET_ID")
 GMAIL_TOKEN_JSON = _get_secret("GMAIL_TOKEN_JSON")
 GOOGLE_CREDENTIALS_JSON = _get_secret("GOOGLE_CREDENTIALS_JSON")
 
+# ── フォルダ自動検出モード用設定 ──
+# Convention over Configuration の方針で、Secret/YAML 追加なしで新セミナーに
+# 対応するための入出力 ROOT フォルダ ID。``--target-folder`` 指定時のみ参照する。
+# 既存の ``--profile`` モードでは未使用（後方互換）。
+DRIVE_INPUT_ROOT = _get_secret("DRIVE_INPUT_ROOT")
+DRIVE_OUTPUT_ROOT = _get_secret("DRIVE_OUTPUT_ROOT")
+
 # OAuthユーザートークン（Drive/Sheets/Gmail共通）。
 # サービスアカウントは My Drive 配下にファイルをアップロードできない（storageQuotaExceeded）
 # ため、Drive書き込み時はユーザー認可トークンを優先する。
@@ -48,8 +55,26 @@ GOOGLE_SCOPES = [
     "https://www.googleapis.com/auth/gmail.compose",
 ]
 
+# Google API の一過性エラー（503/429/5xx）に対する自動リトライ回数。
+# googleapiclient の ``HttpRequest.execute(num_retries=N)`` /
+# ``MediaIoBaseDownload.next_chunk(num_retries=N)`` に渡すと、5xx
+# （500/502/503/504）と 429/rate-limit エラーを指数バックオフ + ジッターで
+# 自動再試行する。指数バックオフは googleapiclient が担うため、こちらは
+# 回数のみ指定する。401/403/404 のような恒久エラーはリトライ対象外。
+GOOGLE_API_NUM_RETRIES = 5
+
 # ── 出力一覧シート設定 ──
 OUTPUT_SHEET_NAME = "出力一覧"
+
+# ── 参加者マスターシート設定 ──
+# 医院名標準化（フォルダ命名）と Gmail 下書きの TO を引くためのルックアップ表。
+# シートが無ければ初回実行時に自動作成し、ヘッダー（5 列）だけ書き込んだ空
+# シートになる。シート名はプロファイルでオーバーライド可能
+# （``ProfileConfig.master_sheet_name``）。
+# 5 列構造: A=管理番号 / B=医院名 / C=参加者名 / D=申し込み会場 / E=メールアドレス
+# 1 行 per 個人。同じ医院番号 (例 101) の複数行 (101-01, 101-02) は同じ医院名を
+# 重複記入する想定。
+MASTER_SHEET_NAME = "参加者マスター"
 
 # ── フォント設定 ──
 FONT_REGULAR = ASSETS_DIR / "NotoSansJP-Regular.ttf"
@@ -67,3 +92,17 @@ PDF_PAGE_SIZE = "A4"
 # ── ログ設定 ──
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
 LOG_FILE = LOGS_DIR / "jissen_comment.log"
+
+
+# ── プロファイル経由で設定を取得するヘルパー ──
+# 既存定数（``DRIVE_FOLDER_ID`` など）は維持しつつ、プロファイル制度を
+# 使うコードからは ``get_profile_config(name)`` 一本で必要な値を取れる。
+def get_profile_config(profile_name: str = "jissen_default"):
+    """プロファイル名から ``ProfileConfig`` を取得する薄いラッパー。
+
+    ``src.profile.load_profile`` への循環インポートを避けるため、関数内で
+    遅延 import している。既存コードを ``profile.load_profile`` 直呼び出し
+    から段階的に移行したい場合のエイリアスとして使う。
+    """
+    from src.profile import load_profile
+    return load_profile(profile_name)

@@ -14,3 +14,6 @@ google-auth-httplib2>=0.2.0
 
 # Font download
 requests>=2.31.0
+
+# Profile YAML loading
+PyYAML>=6.0

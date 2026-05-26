@@ -3,6 +3,10 @@
 クラウド環境（Codespaces / Cloud Shell）で実行する **手動URL貼付フロー**。
 ローカル前提の `flow.run_local_server` は使用しない（ヘッドレス環境で動かないため）。
 
+クラウド開発環境（GitHub Codespaces / Cloud Shell など）でも動作する手動URL貼付け方式。
+ローカル環境でブラウザの localhost コールバックを使えない場合のフォールバックとして、
+ユーザーがブラウザのURL欄から認証コードを手でコピペする形を取る。
+
 事前準備:
   1. GCPコンソールで OAuth クライアント ID（種類: デスクトップアプリ）を作成
   2. JSON をダウンロードし、Codespacesの `AIComment/client_secret.json` にアップロード
@@ -26,6 +30,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 from google_auth_oauthlib.flow import Flow
 
@@ -75,6 +80,14 @@ def main() -> None:
     print()
     redirected_url = input("リダイレクトURL: ").strip()
 
+    parsed = urlparse(redirected_url)
+    query = parse_qs(parsed.query)
+    if "code" not in query:
+        sys.exit(
+            "URL に認証コード（code=...）が含まれていません。"
+            "[3/3] のURL全体を貼り付けたか確認してください。"
+        )
+
     try:
         flow.fetch_token(authorization_response=redirected_url)
     except Exception as exc:
@@ -106,7 +119,6 @@ def main() -> None:
         "client_secret": creds.client_secret,
         "scopes": list(creds.scopes) if creds.scopes else SCOPES,
     }
-
     TOKEN_OUTPUT_PATH.write_text(json.dumps(token_data, ensure_ascii=False, indent=2))
 
     print()
