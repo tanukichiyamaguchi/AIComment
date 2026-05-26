@@ -101,7 +101,8 @@ def create_draft(
         person_name: 氏名（件名・本文に使用）
         pdf_path: 添付するPDFのパス
         cc_email: CC のメールアドレス。``None`` または空文字列なら CC ヘッダー
-            を付けない（個人メール宛のときに医院メールを CC する用途）
+            を付けない。現在は CC を使っていない（参加者マスター統合後の運用は
+            TO のみ）。将来必要になったら呼び出し側で値を渡す。
         max_retries: リトライ回数
 
     Returns:
