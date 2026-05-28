@@ -7,4 +7,10 @@ output_folder_id_secret: DRIVE_OUTPUT_JISSEN_2024_Q4
 
 output_sheet_name: "実践事例_2024Q4_出力一覧"
 
+# 参加者マスターシート名は省略 → config.MASTER_SHEET_NAME（"参加者マスター"）。
+# 本セミナーを稼働させる前に、独自タブ名を使いたければ
+# master_sheet_name: "実践事例_2024Q4_参加者マスター" を明示すること。
+# 省略のままでデフォルトタブ「参加者マスター」を使うと、別セミナー
+# （default / q2 / q3）と参加者リストを共有する状態になる（F-10）。
+
 prompt_template: jissen_practice_case

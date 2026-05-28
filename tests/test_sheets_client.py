@@ -1201,5 +1201,248 @@ class TestLookupEmailByClinicAndPerson(unittest.TestCase):
         )
 
 
+class TestFuzzyMatchShortNameGuard(unittest.TestCase):
+    """F-01 回帰防止: 1-2 文字 CJK 名は Levenshtein 距離 1 で他人を誤マッチ
+    するリスクが高いため、ファジー一致をスキップして完全一致のみ採用する。
+    """
+
+    def _short_name_records(self) -> list[sheets_client.MasterRecord]:
+        return [
+            sheets_client.MasterRecord(
+                management_number="101-01",
+                clinic_name="森林歯科",
+                participant_name="林",
+                venue="東京",
+                email="hayashi@example.com",
+            ),
+            sheets_client.MasterRecord(
+                management_number="101-02",
+                clinic_name="森林歯科",
+                participant_name="森",
+                venue="東京",
+                email="mori@example.com",
+            ),
+        ]
+
+    def test_one_char_target_does_not_fuzzy_match(self):
+        """AI 抽出 '木' に対し、距離 1 で '林' / '森' に当たるが
+        誤マッチ防止のためファジー一致を採用しない。空文字 + WARNING。"""
+        records = self._short_name_records()
+        with self.assertLogs("jissen_comment", level="WARNING") as cm:
+            email = sheets_client.lookup_email_by_clinic_and_person(
+                records, "101", "木"
+            )
+        self.assertEqual(email, "")
+        self.assertTrue(
+            any("短すぎてファジー一致をスキップ" in m for m in cm.output)
+        )
+
+    def test_two_char_target_does_not_fuzzy_match(self):
+        """正規化後 2 文字も短すぎる扱い（完全一致のみ）。"""
+        records = [
+            sheets_client.MasterRecord(
+                management_number="101-01",
+                clinic_name="森林歯科",
+                participant_name="山田",
+                venue="東京",
+                email="yamada@example.com",
+            ),
+        ]
+        with self.assertLogs("jissen_comment", level="WARNING"):
+            email = sheets_client.lookup_email_by_clinic_and_person(
+                records, "101", "山口"  # 距離 1 だが 2 文字なので不採用
+            )
+        self.assertEqual(email, "")
+
+    def test_three_char_target_still_fuzzy_matches(self):
+        """3 文字以上は従来通りファジー一致が効く（誤マッチ率が十分低い）。"""
+        records = [
+            sheets_client.MasterRecord(
+                management_number="101-01",
+                clinic_name="森林歯科",
+                participant_name="山田太郎",
+                venue="東京",
+                email="yamada@example.com",
+            ),
+        ]
+        email = sheets_client.lookup_email_by_clinic_and_person(
+            records, "101", "山田 太朗"  # 「郎」→「朗」距離 1
+        )
+        self.assertEqual(email, "yamada@example.com")
+
+    def test_exact_match_still_works_for_short_names(self):
+        """完全一致は短い名前でも有効（誤マッチでない）。"""
+        records = self._short_name_records()
+        email = sheets_client.lookup_email_by_clinic_and_person(
+            records, "101", "林"
+        )
+        self.assertEqual(email, "hayashi@example.com")
+
+
+class TestClinicNumberNormalization(unittest.TestCase):
+    """F-02 回帰防止: 医院番号のゼロパディング桁数違いを吸収する。
+    PDF 側 ``"00101"`` と マスター側 ``"101"`` を同一医院として扱う。
+    """
+
+    def test_normalize_clinic_number_strips_leading_zeros(self):
+        self.assertEqual(sheets_client._normalize_clinic_number("001"), "1")
+        self.assertEqual(sheets_client._normalize_clinic_number("00101"), "101")
+        self.assertEqual(sheets_client._normalize_clinic_number("101"), "101")
+        self.assertEqual(sheets_client._normalize_clinic_number(""), "")
+        # 全部ゼロ → "0"（lstrip 後の空文字を避ける）
+        self.assertEqual(sheets_client._normalize_clinic_number("000"), "0")
+
+    def test_lookup_clinic_name_matches_across_padding(self):
+        """マスターに '101-01' があり、PDF 側が '00101' でも医院名がヒットする。"""
+        records = [
+            sheets_client.MasterRecord(
+                management_number="101-01",
+                clinic_name="三浦歯科医院",
+                participant_name="山田太郎",
+                venue="東京",
+                email="yamada@example.com",
+            ),
+        ]
+        self.assertEqual(
+            sheets_client.lookup_clinic_name(records, "00101"),
+            "三浦歯科医院",
+        )
+        # 逆方向: マスター 5 桁、PDF 3 桁
+        records2 = [
+            sheets_client.MasterRecord(
+                management_number="00101-01",
+                clinic_name="三浦歯科医院",
+                participant_name="山田太郎",
+                venue="東京",
+                email="yamada@example.com",
+            ),
+        ]
+        self.assertEqual(
+            sheets_client.lookup_clinic_name(records2, "101"),
+            "三浦歯科医院",
+        )
+
+    def test_lookup_email_matches_across_padding(self):
+        """メール lookup も桁数違いを吸収する。"""
+        records = [
+            sheets_client.MasterRecord(
+                management_number="101-01",
+                clinic_name="三浦歯科医院",
+                participant_name="山田太郎",
+                venue="東京",
+                email="yamada@example.com",
+            ),
+        ]
+        email = sheets_client.lookup_email_by_clinic_and_person(
+            records, "00101", "山田太郎"
+        )
+        self.assertEqual(email, "yamada@example.com")
+
+
+class TestEnsureMasterSheetWarnsOnCreation(unittest.TestCase):
+    """F-05/F-11 回帰防止: マスタータブを **新規作成** した瞬間に
+    INFO ではなく WARNING を出して、運用者にデータ未投入を視認させる。
+    """
+
+    def test_returns_true_when_creating_new_tab(self):
+        """既存タブに含まれない名前を渡すと、addSheet が走り True を返す。"""
+        service = _build_service_with_sheets(existing_sheet_titles=[])
+        was_created = sheets_client._ensure_sheet_with_header(
+            service, "SHEET_ID", "参加者マスター", ["管理番号", "医院名"]
+        )
+        self.assertTrue(was_created)
+        service.spreadsheets.return_value.batchUpdate.assert_called_once()
+
+    def test_returns_false_when_reusing_existing_tab(self):
+        """既存タブを再利用するときは False を返し、addSheet は呼ばれない。"""
+        service = _build_service_with_sheets(
+            existing_sheet_titles=["参加者マスター"]
+        )
+        was_created = sheets_client._ensure_sheet_with_header(
+            service, "SHEET_ID", "参加者マスター", ["管理番号", "医院名"]
+        )
+        self.assertFalse(was_created)
+        service.spreadsheets.return_value.batchUpdate.assert_not_called()
+
+    def test_ensure_master_sheet_emits_warning_on_creation(self):
+        """マスタータブを新規作成したら WARNING を 1 件以上出す。"""
+        service = _build_service_with_sheets(existing_sheet_titles=[])
+        with self.assertLogs("jissen_comment", level="WARNING") as cm:
+            was_created = sheets_client._ensure_master_sheet(
+                service, "SHEET_ID", "参加者マスター"
+            )
+        self.assertTrue(was_created)
+        self.assertTrue(
+            any(
+                "参加者マスタータブ" in m and "新規作成" in m and "WARNING" in m
+                for m in cm.output
+            )
+        )
+
+    def test_ensure_master_sheet_no_warning_when_existing(self):
+        """既存タブ再利用なら WARNING を出さない（INFO のみ）。"""
+        service = _build_service_with_sheets(
+            existing_sheet_titles=["参加者マスター"]
+        )
+        # WARNING 以上のログが出ないことを assertNoLogs で確認（Python 3.10+）
+        # 互換のため try/except で吸収
+        try:
+            with self.assertNoLogs("jissen_comment", level="WARNING"):
+                was_created = sheets_client._ensure_master_sheet(
+                    service, "SHEET_ID", "参加者マスター"
+                )
+            self.assertFalse(was_created)
+        except AttributeError:
+            # Python 3.9 以下: assertNoLogs が無いので INFO ハンドラを直接見る
+            was_created = sheets_client._ensure_master_sheet(
+                service, "SHEET_ID", "参加者マスター"
+            )
+            self.assertFalse(was_created)
+
+
+class TestReadMasterRecordsEmptyWarning(unittest.TestCase):
+    """F-05/F-11 回帰防止: ``read_master_records`` が 0 件返すケースで、
+    タブ新規作成時 OR ヘッダーのみ既存タブ時に WARNING を出すこと。
+    """
+
+    @patch.object(sheets_client, "get_sheets_service")
+    @patch.object(sheets_client, "SPREADSHEET_ID", "SHEET_ID")
+    def test_warning_on_freshly_created_tab(self, mock_get_service):
+        """新規作成タブ → _ensure_master_sheet が WARNING を出す。"""
+        service = _build_service_with_sheets(existing_sheet_titles=[])
+        # values.get は完全空 → ``values`` キー無し
+        service.spreadsheets.return_value.values.return_value.get.return_value\
+            .execute.return_value = {}
+        mock_get_service.return_value = service
+        with self.assertLogs("jissen_comment", level="WARNING") as cm:
+            records = sheets_client.read_master_records(sheet_name="参加者マスター")
+        self.assertEqual(records, [])
+        self.assertTrue(
+            any("新規作成" in m for m in cm.output),
+            f"WARNING with 新規作成 not found in: {cm.output}",
+        )
+
+    @patch.object(sheets_client, "get_sheets_service")
+    @patch.object(sheets_client, "SPREADSHEET_ID", "SHEET_ID")
+    def test_warning_on_existing_empty_tab(self, mock_get_service):
+        """既存タブだがヘッダーのみ（0 件）→ WARNING を出す。"""
+        service = _build_service_with_sheets(
+            existing_sheet_titles=["参加者マスター"]
+        )
+        # values.get はヘッダー行のみ
+        service.spreadsheets.return_value.values.return_value.get.return_value\
+            .execute.return_value = {
+                "values": [["管理番号", "医院名", "参加者名", "申し込み会場", "メールアドレス"]]
+            }
+        mock_get_service.return_value = service
+        with self.assertLogs("jissen_comment", level="WARNING") as cm:
+            records = sheets_client.read_master_records(sheet_name="参加者マスター")
+        self.assertEqual(records, [])
+        self.assertTrue(
+            any("0 件" in m or "0件" in m for m in cm.output),
+            f"WARNING about 0 records not found in: {cm.output}",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

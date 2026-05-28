@@ -363,5 +363,42 @@ class TestServiceInjection(unittest.TestCase):
         mock_get.assert_not_called()
 
 
+class TestRunConfigFromDiscovered(unittest.TestCase):
+    """F-09 回帰防止: ``RunConfig.from_discovered`` は ``target_folder_name``
+    から ``master_sheet_name`` を派生させる（全セミナーで同じデフォルトタブを
+    共有すると別セミナーの参加者へ誤送信するリスクがあるため）。
+    """
+
+    def test_master_sheet_name_derived_from_target_folder(self):
+        ctx = discover.DiscoveredContext(
+            target_folder_name="テスト5",
+            input_folder_id="in_id",
+            output_folder_id="out_id",
+            output_sheet_name="テスト5",
+        )
+        cfg = discover.RunConfig.from_discovered(ctx)
+        self.assertEqual(cfg.master_sheet_name, "テスト5_参加者マスター")
+
+    def test_different_target_folders_get_different_master_tabs(self):
+        """別フォルダ → 別タブ。デフォルト共有による誤送信を防ぐ。"""
+        ctx_a = discover.DiscoveredContext(
+            target_folder_name="セミナーA",
+            input_folder_id="a_in",
+            output_folder_id="a_out",
+            output_sheet_name="セミナーA",
+        )
+        ctx_b = discover.DiscoveredContext(
+            target_folder_name="セミナーB",
+            input_folder_id="b_in",
+            output_folder_id="b_out",
+            output_sheet_name="セミナーB",
+        )
+        cfg_a = discover.RunConfig.from_discovered(ctx_a)
+        cfg_b = discover.RunConfig.from_discovered(ctx_b)
+        self.assertNotEqual(cfg_a.master_sheet_name, cfg_b.master_sheet_name)
+        self.assertEqual(cfg_a.master_sheet_name, "セミナーA_参加者マスター")
+        self.assertEqual(cfg_b.master_sheet_name, "セミナーB_参加者マスター")
+
+
 if __name__ == "__main__":
     unittest.main()

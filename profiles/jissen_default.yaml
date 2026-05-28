@@ -10,5 +10,10 @@ output_folder_id_secret: DRIVE_OUTPUT_FOLDER_ID
 # 既存の OUTPUT_SHEET_NAME と同一値（後方互換）
 output_sheet_name: "出力一覧"
 
+# 参加者マスターシート名は省略 → config.MASTER_SHEET_NAME（"参加者マスター"）
+# を使う運用。セミナーごとに同じタブの中身を差し替えるため、タブ名は固定。
+# Gmail 下書きの TO が空になる場合は「参加者マスター」タブに行が入っているか
+# を確認すること（タブが空だと全件宛先空でフォールバック下書きになる）。
+
 # プロンプトテンプレート識別子（既存挙動）
 prompt_template: jissen_practice_case
