@@ -320,6 +320,8 @@ def run(
                     clinic_name=clinic_name,
                     person_name=person_name,
                     file_name=output_filename,
+                    # マスター由来の確定医院名なら既存フォルダ名も同期させる
+                    clinic_name_authoritative=bool(clinic_name_from_master),
                 )
 
                 # 管理番号は処理対象選定時に抽出・検証済み（空でないことが保証される）。

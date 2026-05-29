@@ -345,6 +345,7 @@ def find_or_create_clinic_folder(
     clinic_name: str,
     parent_id: str,
     service: Any | None = None,
+    clinic_name_authoritative: bool = False,
 ) -> str:
     """医院フォルダを医院番号で識別して find_or_create する。
 
@@ -352,7 +353,9 @@ def find_or_create_clinic_folder(
     AI 抽出で揺れる（``三浦歯科医院`` / ``三浦歯科`` / ``医療法人三浦歯科``）
     ため、**識別は医院番号（フォルダ名の ``<医院番号>_`` プレフィックス）
     のみ** で行う。同じ医院番号のフォルダが既にあれば医院名部分が今回の抽出と
-    違っても再利用する（リネームしない）。
+    違っても再利用する（既定ではリネームしない）。ただし
+    ``clinic_name_authoritative=True``（参加者マスター由来の確定医院名）の
+    ときは、既存フォルダ名が確定名と異なれば確定名へリネームして反映する。
 
     P-009 の正規化（NFKC＋空白除去）は語そのものの違い（``三浦歯科医院`` と
     ``三浦歯科`` のように接尾語が違う）を吸収できないため、識別子（医院番号）
@@ -364,6 +367,9 @@ def find_or_create_clinic_folder(
         clinic_name: 医院名（AI 抽出値）。新規作成時のフォルダ名末尾に使う
         parent_id: 親フォルダ ID
         service: Drive API サービス（省略時は新規構築）
+        clinic_name_authoritative: ``clinic_name`` が参加者マスター由来の確定名
+            のとき ``True``。既存フォルダ名が確定名と異なる場合に確定名へ
+            リネームする。AI 抽出値のとき ``False``（既定）でリネームしない。
 
     Returns:
         医院フォルダの Drive ID
@@ -441,6 +447,34 @@ def find_or_create_clinic_folder(
                 f"重複 ID 一覧: {duplicate_ids}, "
                 f"選択 ID: {folder_id}（名前='{chosen['name']}'）"
             )
+
+        # clinic_name_authoritative（参加者マスター由来の確定医院名）なら、
+        # 既存フォルダ名が確定名と違うとき確定名へリネームして反映する。AI 抽出値
+        # （authoritative=False）はリネームしない（``三浦歯科`` ↔ ``三浦歯科医院``
+        # の往復 churn を防ぐ P-019 の意図を維持）。リネームはフォルダ ID・URL を
+        # 変えないため、医院フォルダ URL シートの既存リンクは保持される。
+        if clinic_name_authoritative and clinic_name:
+            desired_name = f"{clinic_number}_{clinic_name}"
+            if chosen["name"] != desired_name:
+                try:
+                    service.files().update(
+                        fileId=folder_id,
+                        body={"name": desired_name},
+                        fields="id",
+                        supportsAllDrives=True,
+                    ).execute(num_retries=GOOGLE_API_NUM_RETRIES)
+                    logger.info(
+                        f"Drive: 医院フォルダ名をマスター医院名に同期 "
+                        f"(医院番号={clinic_number}, "
+                        f"'{chosen['name']}' → '{desired_name}', ID: {folder_id})"
+                    )
+                except Exception as e:
+                    # リネーム失敗は再利用を妨げない（ID で続行、次回再試行）。
+                    logger.warning(
+                        f"Drive: 医院フォルダ名の同期に失敗 "
+                        f"(医院番号={clinic_number}, 目標名='{desired_name}', "
+                        f"ID: {folder_id}): {e}"
+                    )
         return folder_id
 
     # マッチ無し → 新規作成。フォルダ名は今回の AI 抽出値を使った
@@ -471,12 +505,14 @@ def upload_pdf_to_clinic_person(
     person_name: str,
     file_name: str | None = None,
     service: Any | None = None,
+    clinic_name_authoritative: bool = False,
 ) -> dict[str, str]:
     """医院/個人名 階層を作成（または再利用）し、その配下にPDFをアップロードする。
 
     医院フォルダの識別は **医院番号のみ** で行う（``find_or_create_clinic_folder``、
     P-019）。AI が同じ医院を違う医院名で抽出しても、同じ医院番号のフォルダが
-    既にあれば再利用し、医院名部分はリネームしない。
+    既にあれば再利用する。``clinic_name_authoritative=True``（参加者マスター由来
+    の確定名）のときのみ、既存フォルダ名を確定名へリネームして反映する。
 
     Args:
         file_path: アップロード元PDFパス
@@ -488,6 +524,9 @@ def upload_pdf_to_clinic_person(
         person_name: 個人名（サブフォルダ名になる）
         file_name: Drive上のファイル名（省略時はローカルファイル名を使用）
         service: 既存のDrive APIサービス（指定されない場合は新規構築）
+        clinic_name_authoritative: ``clinic_name`` が参加者マスター由来の確定名
+            のとき ``True``。既存医院フォルダ名が確定名と異なれば確定名へ
+            リネームする（``find_or_create_clinic_folder`` に委譲）。
 
     Returns:
         ``{"id": "<file_id>", "webViewLink": "<url>", "clinic_folder_id": "<id>"}``。
@@ -500,6 +539,7 @@ def upload_pdf_to_clinic_person(
         clinic_name=clinic_name,
         parent_id=output_root_folder_id,
         service=service,
+        clinic_name_authoritative=clinic_name_authoritative,
     )
     person_folder_id = find_or_create_folder(
         person_name, clinic_folder_id, service=service

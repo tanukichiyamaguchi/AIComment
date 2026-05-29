@@ -291,3 +291,37 @@ PR #37 マージ後、本番実行で「下書きは作られるが宛先が空�
 - [ ] AI 抽出した個人名（または 1 文字違い以内）がマスター C 列に存在すること
 - [ ] ヒットすればその E 列のメールが Gmail 下書きの TO に設定される
 - [ ] ヒットしなければ宛先空で下書きが作成され、ログに「マスター未ヒット」が出る
+
+## Phase 13: 既存医院フォルダをマスター医院名へ同期（2026-05-29）
+
+### ゴール
+「PDF ファイル名先頭の医院番号 → 参加者マスター照合 → 医院名をフォルダ名に反映」。
+新規フォルダは P-021 で既にマスター医院名を最優先使用済み。残る gap は
+**同じ医院番号の既存フォルダが P-019 仕様で再利用時にリネームされず旧名のまま**
+残る点。マスター由来の確定名のときだけ既存フォルダもリネームして反映する。
+
+### 設計
+- `find_or_create_clinic_folder` / `upload_pdf_to_clinic_person` に
+  `clinic_name_authoritative: bool = False` を追加。
+- 既存フォルダ再利用時、`authoritative=True` かつ既存名 ≠ `<医院番号>_<確定名>`
+  のときだけ `files().update` でリネーム。AI 抽出値（`False`）は従来通り非リネーム
+  （P-019 の churn 防止意図を維持）。
+- リネーム失敗は WARNING のみで続行（フォルダ ID で処理継続）。
+- フォルダ ID・URL 不変 → 医院フォルダ URL シートの既存リンクは保持。
+
+### タスク
+- [x] baseline: 全テストパス確認（507 件）
+- [x] drive_client: `clinic_name_authoritative` 追加 + リネームロジック + docstring 更新
+- [x] main.py: `clinic_name_authoritative=bool(clinic_name_from_master)` を渡す
+- [x] batch_main.py 本体: 同上
+- [x] batch_main.py 添付資料: `master_records` から確定判定を再導出して渡す
+- [x] tests/test_drive_client: rename 実行 / 一致時無動作 / 非確定時非リネーム / 失敗非致命 の 4 件追加
+- [x] pytest 全件パス（507 → 511 件）
+- [x] mypy `--ignore-missing-imports` Success（CI 同条件）
+- [x] tasks/lessons.md に追記（P-019 緩和の経緯）
+- [ ] commit + push（既存ブランチ claude/resume-oauth-setup-KHMv9 → PR #40）
+
+### Review（結果）
+- 新規フォルダ命名は無変更（既にマスター名）。既存フォルダのみ挙動追加。
+- P-019 の意図（AI 抽出名での往復 churn 防止）は `authoritative` ガードで維持。
+- 次回本番で WARNING 級の差分（旧名 → 確定名へ同期）のログが出るか観測予定。
