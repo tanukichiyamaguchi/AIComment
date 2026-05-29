@@ -419,6 +419,46 @@ def append_output_record(
     )
 
 
+def append_completion_marker(
+    spreadsheet_id: str | None = None,
+    sheet_name: str | None = None,
+    completed_at: str | None = None,
+    summary: str = "",
+) -> None:
+    """出力一覧シートの最終行に「完了」マーカー行を 1 行追加する。
+
+    全 PDF 処理が終わったことを運用者がシート上で一目で把握できるようにする
+    （ログを開かなくても完了が分かる）。出力一覧シートの末尾に
+    A 列に ``"完了"``、B 列に処理日時、C 列に件数サマリーを書く。
+
+    Args:
+        spreadsheet_id: スプレッドシートID（省略時は設定値）
+        sheet_name: シート名（省略時は ``OUTPUT_SHEET_NAME``）
+        completed_at: 完了日時文字列（省略時は現在時刻）
+        summary: 件数サマリー（例 ``"成功 42件 / エラー 0件"``）。空でもよい。
+    """
+    spreadsheet_id = spreadsheet_id or SPREADSHEET_ID
+    if not spreadsheet_id:
+        raise ValueError("SPREADSHEET_IDが設定されていません")
+    sheet_name = sheet_name or OUTPUT_SHEET_NAME
+    completed_at = completed_at or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    service = get_sheets_service()
+    _ensure_output_sheet(service, spreadsheet_id, sheet_name)
+
+    _throttle_sheets_write()
+    service.spreadsheets().values().append(
+        spreadsheetId=spreadsheet_id,
+        range=f"{sheet_name}!A:F",
+        valueInputOption="RAW",
+        insertDataOption="INSERT_ROWS",
+        body={"values": [["完了", completed_at, summary, "", "", ""]]},
+    ).execute(num_retries=GOOGLE_API_NUM_RETRIES)
+    logger.info(
+        f"Sheets: 完了マーカーを追記 ({sheet_name}, {completed_at}, {summary})"
+    )
+
+
 def get_recorded_clinic_numbers(
     spreadsheet_id: str | None = None,
     sheet_name: str | None = None,

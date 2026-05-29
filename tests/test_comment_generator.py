@@ -12,6 +12,7 @@ from src.comment_generator import (
     SYSTEM_PROMPT,
     _build_user_prompt,
     _parse_extraction,
+    _scrub_names_from_comment,
     create_batch_requests,
     generate_comment_with_metadata,
 )
@@ -204,6 +205,93 @@ class TestCreateBatchRequests(unittest.TestCase):
 
     def test_empty_input_returns_empty_list(self):
         self.assertEqual(create_batch_requests([]), [])
+
+
+class TestScrubNamesFromComment(unittest.TestCase):
+    """comment 本文から医院名・氏名・敬称を除去する保険ロジック。
+
+    プロンプトで禁止しているが AI が偶発混入させた場合に備え、抽出後の
+    sanitize を ``_parse_extraction`` の戻り値に必ず通す。
+    """
+
+    def test_removes_clinic_name_inline(self):
+        result = _scrub_names_from_comment(
+            comment="三浦歯科医院の取り組みは素晴らしい内容です。",
+            clinic_name="三浦歯科医院",
+            person_name="白川 蓮",
+        )
+        self.assertNotIn("三浦歯科医院", result)
+
+    def test_removes_person_name_with_honorific(self):
+        result = _scrub_names_from_comment(
+            comment="白川 蓮様、自費率向上の取り組みが見事でした。",
+            clinic_name="三浦歯科医院",
+            person_name="白川 蓮",
+        )
+        self.assertNotIn("白川 蓮", result)
+        self.assertNotIn("白川 蓮様", result)
+
+    def test_removes_sensei_honorific(self):
+        result = _scrub_names_from_comment(
+            comment="白川 蓮先生のアプローチが印象的でした。",
+            clinic_name="",
+            person_name="白川 蓮",
+        )
+        self.assertNotIn("白川 蓮", result)
+        self.assertNotIn("先生", result)
+
+    def test_does_not_alter_clean_comment(self):
+        original = "実践内容が素晴らしい構成で、特に集患の改善が明確に出ていました。"
+        result = _scrub_names_from_comment(
+            comment=original,
+            clinic_name="三浦歯科医院",
+            person_name="白川 蓮",
+        )
+        self.assertEqual(result, original)
+
+    def test_empty_comment_returns_empty(self):
+        self.assertEqual(
+            _scrub_names_from_comment("", "三浦歯科医院", "白川 蓮"), ""
+        )
+
+    def test_single_char_name_is_not_scrubbed(self):
+        """1 文字氏名は普通の語と衝突するため除去スキップ。"""
+        original = "森を歩くような落ち着いた進行でした。"
+        result = _scrub_names_from_comment(
+            comment=original, clinic_name="", person_name="森",
+        )
+        self.assertEqual(result, original)
+
+    def test_parse_extraction_strips_names(self):
+        """``_parse_extraction`` の戻り値の comment が sanitized 済みであること。"""
+        payload = json.dumps({
+            "clinic_name": "三浦歯科医院",
+            "person_name": "白川 蓮",
+            "sample_title": "AI活用",
+            "comment": "三浦歯科医院の白川 蓮様、素晴らしい取り組みでした。",
+        })
+        data = _parse_extraction(payload)
+        self.assertNotIn("三浦歯科医院", data["comment"])
+        self.assertNotIn("白川 蓮", data["comment"])
+        # clinic_name / person_name 自体はメタデータとして保持される
+        self.assertEqual(data["clinic_name"], "三浦歯科医院")
+        self.assertEqual(data["person_name"], "白川 蓮")
+
+
+class TestSystemPromptForbidsNames(unittest.TestCase):
+    """SYSTEM_PROMPT に「comment 内で医院名・氏名を使わない」明示が
+    含まれていることの回帰防止（プロンプト更新が事故で消えないように）。"""
+
+    def test_prompt_explicitly_forbids_clinic_name_in_comment(self):
+        self.assertIn("医院名", SYSTEM_PROMPT)
+        self.assertIn("禁止", SYSTEM_PROMPT)
+
+    def test_prompt_explicitly_forbids_honorific_address(self):
+        # 「○○様」「○○先生」を禁じる文言があること
+        self.assertTrue(
+            "様" in SYSTEM_PROMPT and "先生" in SYSTEM_PROMPT,
+            "プロンプトに敬称 (様/先生) 禁止の明示が必要",
+        )
 
 
 if __name__ == "__main__":

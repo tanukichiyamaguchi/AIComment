@@ -119,15 +119,9 @@ def create_comment_page(
     c.line(line_x_start, y, line_x_end, y)
     y -= 12 * mm
 
-    # ── 医院名 ──
-    c.setFont("NotoSansJP", NAME_FONT_SIZE)
-    c.setFillColor(HexColor("#333333"))
-    c.drawString(content_x, y, clinic_name)
-    y -= 8 * mm
-
-    # ── 氏名 + 様 ──
-    c.drawString(content_x, y, f"{person_name} 様")
-    y -= 15 * mm
+    # コメント本文へ。受領者の識別情報（医院名・氏名）はコメントページ上に
+    # 描画しない（個人情報をコメント上に残さない方針）。clinic_name /
+    # person_name は出力ファイル名・Drive フォルダ階層・出力一覧シートでのみ使う。
 
     # ── コメント本文（左揃え・折り返し） ──
     c.setFont("NotoSansJP", BODY_FONT_SIZE)
