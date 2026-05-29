@@ -203,19 +203,27 @@ def normalize_name_for_match(name: str) -> str:
     return re.sub(r"\s+", "", nfkc)
 
 
+# フォントダウンロードのリトライ設定（CI / 本番の一時的ネットワーク障害対策）。
+# assets/*.ttf は .gitignore のため fresh checkout（CI）では毎回ダウンロードが
+# 走る。GitHub raw の一時的な 5xx / タイムアウトでテストや本番が落ちないよう、
+# 指数バックオフでリトライする（GOOGLE_API_NUM_RETRIES と同じ思想、P-017）。
+_FONT_DOWNLOAD_MAX_ATTEMPTS = 4
+_FONT_DOWNLOAD_BACKOFF_BASE = 2.0
+
+
 def ensure_fonts() -> None:
-    """NotoSansJPフォントが存在しない場合、Google Fontsからダウンロードする。"""
+    """NotoSansJPフォントが存在しない場合、GitHub から自動ダウンロードする。
+
+    ``assets/*.ttf`` は .gitignore のため fresh checkout では存在せず、PDF 生成
+    時に都度ダウンロードする。一時的なネットワーク障害（GitHub raw の 5xx /
+    タイムアウト）で落ちないよう、指数バックオフで
+    ``_FONT_DOWNLOAD_MAX_ATTEMPTS`` 回までリトライする。全試行失敗で RuntimeError。
+    """
+    import time
+
     import requests
 
     ASSETS_DIR.mkdir(parents=True, exist_ok=True)
-
-    fonts = {
-        FONT_REGULAR: "NotoSansJP%5Bwght%5D.ttf",
-        FONT_BOLD: "NotoSansJP%5Bwght%5D.ttf",
-    }
-
-    # Google Fonts API からダウンロード
-    base_url = "https://fonts.google.com/download?family=Noto+Sans+JP"
 
     missing = [f for f in [FONT_REGULAR, FONT_BOLD] if not f.exists()]
     if not missing:
@@ -224,29 +232,39 @@ def ensure_fonts() -> None:
     logger = logging.getLogger("jissen_comment")
     logger.info("NotoSansJPフォントをダウンロード中...")
 
-    # GitHub の google/fonts リポジトリから直接ダウンロード
-    # Variable fontを取得して、Regular/Bold両方に使用
+    # GitHub の google/fonts リポジトリから Variable font を直接取得し、
+    # Regular/Bold 両方に同じファイルを使う（1 ファイルで全ウェイトを含む）。
     variable_font_url = (
         "https://github.com/google/fonts/raw/main/ofl/notosansjp/"
         "NotoSansJP%5Bwght%5D.ttf"
     )
 
-    try:
-        response = requests.get(variable_font_url, timeout=60)
-        response.raise_for_status()
-        font_data = response.content
+    last_err: Exception | None = None
+    for attempt in range(1, _FONT_DOWNLOAD_MAX_ATTEMPTS + 1):
+        try:
+            response = requests.get(variable_font_url, timeout=60)
+            response.raise_for_status()
+            font_data = response.content
+            for font_path in [FONT_REGULAR, FONT_BOLD]:
+                if not font_path.exists():
+                    font_path.write_bytes(font_data)
+                    logger.info(f"フォント保存: {font_path.name}")
+            logger.info("フォントのダウンロード完了")
+            return
+        except Exception as e:  # 一時障害含め全てリトライ対象（最後に送出）
+            last_err = e
+            if attempt < _FONT_DOWNLOAD_MAX_ATTEMPTS:
+                sleep_for = _FONT_DOWNLOAD_BACKOFF_BASE * (2 ** (attempt - 1))
+                logger.warning(
+                    f"フォントのダウンロード失敗 "
+                    f"(試行 {attempt}/{_FONT_DOWNLOAD_MAX_ATTEMPTS}, "
+                    f"{sleep_for:.0f}秒後に再試行): {e}"
+                )
+                time.sleep(sleep_for)
 
-        # Variable fontは1ファイルで全ウェイトを含むため、
-        # Regular/Bold両方に同じファイルを使用
-        for font_path in [FONT_REGULAR, FONT_BOLD]:
-            if not font_path.exists():
-                font_path.write_bytes(font_data)
-                logger.info(f"フォント保存: {font_path.name}")
-
-        logger.info("フォントのダウンロード完了")
-    except Exception as e:
-        logger.error(f"フォントのダウンロードに失敗: {e}")
-        raise RuntimeError(
-            f"NotoSansJPフォントのダウンロードに失敗しました。"
-            f"手動で {ASSETS_DIR} にフォントファイルを配置してください。"
-        ) from e
+    logger.error(f"フォントのダウンロードに失敗: {last_err}")
+    raise RuntimeError(
+        f"NotoSansJPフォントのダウンロードに失敗しました"
+        f"（{_FONT_DOWNLOAD_MAX_ATTEMPTS}回試行）。"
+        f"手動で {ASSETS_DIR} にフォントファイルを配置してください。"
+    ) from last_err
