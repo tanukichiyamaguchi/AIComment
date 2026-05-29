@@ -24,6 +24,13 @@ permissions:
   contents: read
   id-token: write  # Workload Identity 連携に必要
 
+# 同じプロファイル / target_folder への並行実行をシリアル化する（同時 2 実行で
+# 同一 PDF が重複処理 → Drive/Sheets/Gmail で重複作成 を防ぐ、P-023）。
+# 後発実行はキューに入り、先発実行が終わってから走る（cancel-in-progress: false）。
+concurrency:
+  group: generate-comments-${{ inputs.target_folder || inputs.profile || 'jissen_default' }}
+  cancel-in-progress: false
+
 jobs:
   generate:
     runs-on: ubuntu-latest

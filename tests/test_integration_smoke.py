@@ -836,28 +836,34 @@ class TestBatchE2E(unittest.TestCase):
     @patch("src.batch_main.comment_generator")
     @patch("src.batch_main.sheets_client")
     @patch("src.batch_main.drive_client")
-    def test_batch_pdf_text_dropped_in_step1_can_still_run_step4(
+    def test_batch_prep_persists_pdf_text_for_split_step_runs(
         self, mock_drive, mock_sheets, mock_gen, mock_reader,
         mock_creator, mock_merger, mock_fonts,
     ):
-        """Step1 の prep ファイルから pdf_text を削除しても、
-        Step4 は pdf_data_id 経由で再ダウンロードできる（Phase 6 残課題確認）。
+        """Step1 の prep ファイルに **pdf_text が含まれる**（CB-1 修正）。
+
+        旧仕様（pdf_text を捨てる）だと、別 GHA 実行から `--step submit`
+        を呼んだとき items から pdf_text が消えて Claude Batch API に
+        空 prompt を投げてしまう本番事故が起こる。CB-1 で pdf_text を
+        永続化するように修正したので、その回帰防止。
         """
         self._install_batch_mocks(
             mock_drive, mock_sheets, mock_gen, mock_reader,
             mock_creator, mock_merger, mock_fonts, pdf_count=2,
         )
-        # Step 1 実行 → prep_file に保存（pdf_text は含まれない設計）
+        # Step 1 実行 → prep_file に保存（pdf_text を含む新仕様）
         from src.profile import load_profile
         profile = load_profile("jissen_default")
         items = batch_main.step1_prepare(profile, test_count=0)
 
-        # prep_file の中身に pdf_text が無いことを確認
+        # prep_file の中身に **pdf_text が含まれる**ことを確認（CB-1）
         prep_data = json.loads((LOGS_DIR / "batch_prep.json").read_text())
+        self.assertGreater(len(prep_data), 0)
         for item in prep_data:
-            self.assertNotIn("pdf_text", item)
+            self.assertIn("pdf_text", item, "CB-1: pdf_text must persist")
             self.assertIn("pdf_data_id", item)
             self.assertIn("pdf_file_name", item)
+            self.assertTrue(item["pdf_text"], "pdf_text 非空")
 
         # Step4 で prep_file 経由（items=None で再読込）でも再ダウンロード可能
         results = {

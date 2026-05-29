@@ -129,6 +129,11 @@ class TestUploadPdf(unittest.TestCase):
 
     def test_uploads_with_returned_id_and_link(self):
         service = MagicMock()
+        # 重複アップロード防止のため upload_pdf は先に list を呼ぶ（P-023）。
+        # 未存在を表す empty を返す。
+        service.files.return_value.list.return_value.execute.return_value = {
+            "files": []
+        }
         service.files.return_value.create.return_value.execute.return_value = {
             "id": "uploaded_file_id",
             "webViewLink": "https://drive.google.com/file/d/uploaded_file_id/view",
@@ -155,6 +160,9 @@ class TestUploadPdf(unittest.TestCase):
 
     def test_uses_explicit_file_name_when_provided(self):
         service = MagicMock()
+        service.files.return_value.list.return_value.execute.return_value = {
+            "files": []
+        }
         service.files.return_value.create.return_value.execute.return_value = {
             "id": "id", "webViewLink": "url",
         }
@@ -180,6 +188,58 @@ class TestUploadPdf(unittest.TestCase):
                 folder_id="id",
                 service=MagicMock(),
             )
+
+    def test_skips_upload_when_same_name_file_exists(self):
+        """P-023: 同名ファイルがフォルダにあれば再アップロードしない。"""
+        service = MagicMock()
+        # list が既存ファイルを返す → upload_pdf は再アップロードせず既存を返す
+        service.files.return_value.list.return_value.execute.return_value = {
+            "files": [
+                {
+                    "id": "existing_file_id",
+                    "name": "sample.pdf",
+                    "webViewLink": "https://drive.google.com/file/d/existing_file_id/view",
+                }
+            ]
+        }
+
+        with TemporaryDirectory() as tmp:
+            pdf_path = Path(tmp) / "sample.pdf"
+            pdf_path.write_bytes(b"%PDF-1.4 fake")
+
+            result = drive_client.upload_pdf(
+                file_path=pdf_path,
+                folder_id="folder_id",
+                service=service,
+            )
+
+        # 既存ファイルの情報を返す
+        self.assertEqual(result["id"], "existing_file_id")
+        # create は呼ばれない（重複アップロード防止）
+        service.files.return_value.create.assert_not_called()
+
+    def test_picks_first_id_when_duplicates_already_exist(self):
+        """同名ファイルが複数存在しても決定論的に先頭 ID を選ぶ + WARNING。"""
+        service = MagicMock()
+        service.files.return_value.list.return_value.execute.return_value = {
+            "files": [
+                {"id": "id_z", "name": "x.pdf", "webViewLink": "u_z"},
+                {"id": "id_a", "name": "x.pdf", "webViewLink": "u_a"},
+                {"id": "id_m", "name": "x.pdf", "webViewLink": "u_m"},
+            ]
+        }
+        with TemporaryDirectory() as tmp:
+            pdf_path = Path(tmp) / "x.pdf"
+            pdf_path.write_bytes(b"%PDF")
+            with self.assertLogs("jissen_comment", level="WARNING"):
+                result = drive_client.upload_pdf(
+                    file_path=pdf_path,
+                    folder_id="folder_id",
+                    service=service,
+                )
+        # ID 昇順の先頭
+        self.assertEqual(result["id"], "id_a")
+        service.files.return_value.create.assert_not_called()
 
     def test_raises_on_empty_folder_id(self):
         with TemporaryDirectory() as tmp:
@@ -586,6 +646,9 @@ class TestSharedDriveSupport(unittest.TestCase):
 
     def test_upload_pdf_create_passes_shared_drive_flag(self):
         service = MagicMock()
+        service.files.return_value.list.return_value.execute.return_value = {
+            "files": []
+        }
         service.files.return_value.create.return_value.execute.return_value = {
             "id": "id", "webViewLink": "url",
         }

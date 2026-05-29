@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import logging.handlers
 import re
 import sys
 import unicodedata
@@ -10,12 +11,28 @@ import unicodedata
 from src.config import LOG_LEVEL, LOG_FILE, LOGS_DIR, ASSETS_DIR, FONT_REGULAR, FONT_BOLD
 
 
+# ログファイル肥大化対策（P-023）。1000 PDF 規模の連続実行で
+# logs/jissen_comment.log が GB 級まで膨らみ artifact upload と Codespaces
+# disk を圧迫する事故が発生したため、100MB × 5 世代でローテーションする。
+_LOG_MAX_BYTES = 100 * 1024 * 1024  # 100MB
+_LOG_BACKUP_COUNT = 5
+
+
 def setup_logging() -> logging.Logger:
-    """アプリケーション全体のロガーを設定する。"""
+    """アプリケーション全体のロガーを設定する。
+
+    既に初期化済みなら再設定せずに既存ロガーを返す（多重ハンドラ防止）。
+    ファイル出力は ``RotatingFileHandler`` で 100MB × 5 世代に制限する。
+    """
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
     logger = logging.getLogger("jissen_comment")
     logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+
+    # 二重初期化防止: ハンドラを既に持っている場合はそのまま返す。
+    # ``run()`` から多段で setup_logging() が呼ばれてもログが多重化しない。
+    if logger.handlers:
+        return logger
 
     formatter = logging.Formatter(
         "%(asctime)s [%(levelname)s] %(name)s - %(message)s",
@@ -27,8 +44,13 @@ def setup_logging() -> logging.Logger:
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
 
-    # ファイル出力
-    file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    # ファイル出力（ローテーション付き）
+    file_handler = logging.handlers.RotatingFileHandler(
+        LOG_FILE,
+        encoding="utf-8",
+        maxBytes=_LOG_MAX_BYTES,
+        backupCount=_LOG_BACKUP_COUNT,
+    )
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
 

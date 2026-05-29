@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import collections
 import json
 import logging
 import re
+import threading
+import time
 import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
@@ -22,6 +25,43 @@ from src.config import (
 )
 
 logger = logging.getLogger("jissen_comment")
+
+
+# Sheets API write throttle（P-023）。
+# Google Sheets API は **1 ユーザーあたり 60 write requests/min** が
+# ハード上限。1000 PDF 規模の連続実行で append_output_record / append_clinic_*
+# が短時間に集中して 429 quota_exceeded を踏むと、batch_main の Step4 が
+# 途中失敗 → 半端に処理済み行が残るリスクがある。安全マージンを取って
+# 50 writes / 60 sec に抑える（理論最大の 83%、本番運用で観測した quota も
+# このあたりが安定する）。
+_SHEETS_MAX_WRITES_PER_60S = 50
+_SHEETS_WRITE_TIMES: collections.deque[float] = collections.deque()
+_SHEETS_WRITE_LOCK = threading.Lock()
+
+
+def _throttle_sheets_write() -> None:
+    """Sheets write 直前に呼び、過去 60 秒の write 数が閾値超なら sleep する。
+
+    Quota 超過 (429) を能動的に防ぐ。GOOGLE_API_NUM_RETRIES のリトライは
+    一過性エラー対策であり、quota の自衛策ではないため別途必要（P-017 補強）。
+    """
+    with _SHEETS_WRITE_LOCK:
+        now = time.monotonic()
+        # 60 秒経過した古い記録を捨てる
+        while _SHEETS_WRITE_TIMES and now - _SHEETS_WRITE_TIMES[0] >= 60:
+            _SHEETS_WRITE_TIMES.popleft()
+        if len(_SHEETS_WRITE_TIMES) >= _SHEETS_MAX_WRITES_PER_60S:
+            sleep_for = 60.0 - (now - _SHEETS_WRITE_TIMES[0]) + 0.5
+            if sleep_for > 0:
+                logger.info(
+                    f"Sheets quota throttle: {sleep_for:.1f}秒 sleep "
+                    f"(直近60秒 {len(_SHEETS_WRITE_TIMES)} writes)"
+                )
+                time.sleep(sleep_for)
+                # sleep 後は最古を 1 つ捨てる
+                if _SHEETS_WRITE_TIMES:
+                    _SHEETS_WRITE_TIMES.popleft()
+        _SHEETS_WRITE_TIMES.append(time.monotonic())
 
 
 @dataclass
@@ -351,6 +391,7 @@ def append_output_record(
     service = get_sheets_service()
     _ensure_output_sheet(service, spreadsheet_id, sheet_name)
 
+    _throttle_sheets_write()
     service.spreadsheets().values().append(
         spreadsheetId=spreadsheet_id,
         range=f"{sheet_name}!A:F",
@@ -462,6 +503,7 @@ def append_clinic_folder_record(
     service = get_sheets_service()
     _ensure_clinic_sheet(service, spreadsheet_id, sheet_name)
 
+    _throttle_sheets_write()
     service.spreadsheets().values().append(
         spreadsheetId=spreadsheet_id,
         range=f"{sheet_name}!A:C",

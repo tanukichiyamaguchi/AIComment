@@ -1263,5 +1263,49 @@ class TestCreateGroupedDraftsForBatch(unittest.TestCase):
         self.assertEqual(call.kwargs["pdf_paths"], ["/tmp/a.pdf"])
 
 
+class TestBatchStateFilesPersistence(unittest.TestCase):
+    """CB-1 / CB-2 / P-023 回帰防止: state ファイル永続化と独立 step 実行。"""
+
+    def test_atomic_write_json_replaces_existing(self):
+        """atomic write は途中失敗で半端なファイルを残さない。"""
+        from pathlib import Path as _P
+        import tempfile as _tf
+        with _tf.TemporaryDirectory() as tmp:
+            target = _P(tmp) / "test.json"
+            target.write_text("old")
+            batch_main._atomic_write_json(target, {"a": 1, "b": 2})
+            import json as _json
+            self.assertEqual(_json.loads(target.read_text()), {"a": 1, "b": 2})
+            # tmp ファイルは残らない
+            self.assertFalse(target.with_suffix(".json.tmp").exists())
+
+    @patch.object(batch_main, "LOGS_DIR")
+    def test_load_items_raises_when_prep_missing(self, mock_logs_dir):
+        """batch_prep.json が無いときに FileNotFoundError を上げる。"""
+        from pathlib import Path as _P
+        import tempfile as _tf
+        with _tf.TemporaryDirectory() as tmp:
+            mock_logs_dir.__truediv__ = lambda self_, x: _P(tmp) / x
+            mock_logs_dir.mkdir = MagicMock()
+            with self.assertRaises(FileNotFoundError):
+                batch_main._load_items_from_disk()
+
+    def test_results_roundtrip(self):
+        """results を atomic 保存して読み戻せる。"""
+        from pathlib import Path as _P
+        import tempfile as _tf
+        with _tf.TemporaryDirectory() as tmp:
+            with patch.object(batch_main, "LOGS_DIR", _P(tmp)):
+                results = {
+                    "item_0001": {
+                        "clinic_name": "X歯科", "person_name": "山田",
+                        "sample_title": "事例1", "comment": "A" * 100,
+                    },
+                }
+                batch_main._save_results_to_disk(results)
+                loaded = batch_main._load_results_from_disk()
+                self.assertEqual(loaded, results)
+
+
 if __name__ == "__main__":
     unittest.main()
