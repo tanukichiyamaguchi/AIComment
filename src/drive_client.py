@@ -240,6 +240,44 @@ def find_or_create_folder(
     return new_id
 
 
+def _find_file_in_folder(
+    file_name: str,
+    folder_id: str,
+    service: Any,
+) -> dict[str, str] | None:
+    """指定フォルダ内に同名のファイルが既に存在するか調べる。
+
+    1000 PDF 規模の再実行で同じファイル名が **重複アップロード** されるのを
+    防ぐ（P-023）。同名・同所のファイル ID と webViewLink を返す。存在しない
+    場合は None。複数該当（過去の重複の名残）の場合は決定論的に ID 昇順の
+    最初を採用する。
+    """
+    safe_name = file_name.replace("'", "\\'")
+    query = (
+        f"name = '{safe_name}' "
+        f"and '{folder_id}' in parents "
+        f"and mimeType = 'application/pdf' "
+        f"and trashed = false"
+    )
+    response = service.files().list(
+        q=query,
+        fields="files(id, name, webViewLink)",
+        pageSize=10,
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True,
+    ).execute(num_retries=GOOGLE_API_NUM_RETRIES)
+    files = response.get("files", [])
+    if not files:
+        return None
+    if len(files) > 1:
+        logger.warning(
+            f"Drive: 同名ファイルが {len(files)} 件存在（重複の名残）: "
+            f"{file_name}, IDs={sorted(f['id'] for f in files)} → 先頭採用"
+        )
+    chosen = sorted(files, key=lambda f: f["id"])[0]
+    return {"id": chosen["id"], "webViewLink": chosen.get("webViewLink", "")}
+
+
 def upload_pdf(
     file_path: str | Path,
     folder_id: str,
@@ -247,6 +285,11 @@ def upload_pdf(
     service: Any | None = None,
 ) -> dict[str, str]:
     """PDFをDriveにアップロードし、ファイルIDと閲覧URLを返す。共有ドライブ対応。
+
+    冪等性: 同名ファイルがすでにアップロード先フォルダに存在する場合は
+    **再アップロードせず** 既存のファイル ID / URL を返す（P-023）。
+    Step4 が途中クラッシュして再実行した際に Drive 側でファイルが重複する
+    （Drive は同名・同所のファイル重複を許容する）のを防ぐ。
 
     Args:
         file_path: アップロード元のローカルPDFパス
@@ -264,9 +307,19 @@ def upload_pdf(
         raise ValueError("folder_id が空です")
 
     service = service or get_drive_service()
+    upload_name = file_name or file_path.name
+
+    # 重複アップロード防止（P-023）。同名ファイルが既存なら再アップロードしない。
+    existing = _find_file_in_folder(upload_name, folder_id, service)
+    if existing is not None:
+        logger.info(
+            f"Drive: 同名ファイル既存のためアップロードをスキップ "
+            f"({upload_name}, ID: {existing['id']})"
+        )
+        return existing
 
     metadata = {
-        "name": file_name or file_path.name,
+        "name": upload_name,
         "parents": [folder_id],
     }
 

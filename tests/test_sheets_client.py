@@ -1400,6 +1400,46 @@ class TestEnsureMasterSheetWarnsOnCreation(unittest.TestCase):
             self.assertFalse(was_created)
 
 
+class TestSheetsWriteThrottle(unittest.TestCase):
+    """P-023: Sheets API rate limit (60/min) を能動的に抑える throttle ヘルパー。"""
+
+    def setUp(self):
+        # 各テスト前にグローバルキューをクリア
+        sheets_client._SHEETS_WRITE_TIMES.clear()
+
+    def test_under_threshold_does_not_sleep(self):
+        """閾値未満なら sleep しない。"""
+        with patch("src.sheets_client.time.sleep") as mock_sleep:
+            for _ in range(10):
+                sheets_client._throttle_sheets_write()
+        mock_sleep.assert_not_called()
+
+    def test_above_threshold_sleeps(self):
+        """閾値（50）に達したら次の write は sleep する。"""
+        # 直近 50 件の write を直前タイムスタンプで埋める
+        import time as _time
+        now = _time.monotonic()
+        for _ in range(sheets_client._SHEETS_MAX_WRITES_PER_60S):
+            sheets_client._SHEETS_WRITE_TIMES.append(now)
+        with patch("src.sheets_client.time.sleep") as mock_sleep:
+            sheets_client._throttle_sheets_write()
+        mock_sleep.assert_called_once()
+        # sleep 引数は正の数（60 - 経過時間 + 0.5）
+        sleep_for = mock_sleep.call_args.args[0]
+        self.assertGreater(sleep_for, 0)
+
+    def test_old_writes_expire(self):
+        """60 秒以上前の write はキューから除去される。"""
+        # 100 秒前の write を 100 件入れても、throttle 後は空になる
+        for _ in range(100):
+            sheets_client._SHEETS_WRITE_TIMES.append(0.0)  # very old
+        with patch("src.sheets_client.time.sleep") as mock_sleep:
+            sheets_client._throttle_sheets_write()
+        # 古い記録は全部捨てられ、新しい 1 件だけ残る
+        self.assertEqual(len(sheets_client._SHEETS_WRITE_TIMES), 1)
+        mock_sleep.assert_not_called()
+
+
 class TestReadMasterRecordsEmptyWarning(unittest.TestCase):
     """F-05/F-11 回帰防止: ``read_master_records`` が 0 件返すケースで、
     タブ新規作成時 OR ヘッダーのみ既存タブ時に WARNING を出すこと。

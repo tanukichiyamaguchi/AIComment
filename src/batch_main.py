@@ -47,6 +47,50 @@ from src.sheets_client import MasterRecord
 # 受け渡すための JSON ファイル。``batch_prep.json``（メイン PDF の準備データ）
 # とは別ファイルにして、既存の prep 形式を壊さずに passthrough 情報を運ぶ。
 _BATCH_ATTACHMENTS_FILE = "batch_attachments.json"
+_BATCH_RESULTS_FILE = "batch_results.json"
+
+
+def _atomic_write_json(target: Path, payload: Any) -> None:
+    """JSON を atomic に書き出す（write → fsync → rename）。
+
+    途中クラッシュ時に半端な内容のファイルが残るのを防ぐ（P-023）。
+    1000 PDF 規模の連続実行で batch_prep.json が読み取り不可能な状態で
+    残ると Step2/Step4 が立ち上がれなくなる事故への対策。
+    """
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_suffix(target.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
+    tmp.replace(target)
+
+
+def _load_items_from_disk() -> list[dict]:
+    """``batch_prep.json`` を読み込んで items を復元する（CB-1 / CB-2）。
+
+    別 GHA 実行から ``--step submit`` / ``--step pdfs`` で再開する際、
+    in-memory の items が無いケースでこの関数で永続化済みの items を
+    ロードする。``pdf_text`` が含まれている前提（CB-1）。
+    """
+    prep_file = LOGS_DIR / "batch_prep.json"
+    if not prep_file.exists():
+        raise FileNotFoundError(
+            f"{prep_file} がありません。--step prepare を先に実行してください"
+        )
+    return json.loads(prep_file.read_text())
+
+
+def _save_results_to_disk(results: dict[str, dict[str, str]]) -> None:
+    """``step3`` の結果を JSON に永続化する（CB-2）。"""
+    _atomic_write_json(LOGS_DIR / _BATCH_RESULTS_FILE, results)
+
+
+def _load_results_from_disk() -> dict[str, dict[str, str]]:
+    """``batch_results.json`` から step3 の結果をロードする（CB-2）。"""
+    results_file = LOGS_DIR / _BATCH_RESULTS_FILE
+    if not results_file.exists():
+        raise FileNotFoundError(
+            f"{results_file} がありません。--step results を先に実行してください"
+        )
+    return json.loads(results_file.read_text())
 
 
 def step1_prepare(
@@ -108,6 +152,7 @@ def step1_prepare(
     skip_no_number = 0
     skip_processed = 0
     targets: list[dict] = []
+    skipped_records: list[dict] = []  # M-2: manifest 出力用
     for pdf_file in main_files:
         file_name = pdf_file["name"]
         mgmt_num = extract_management_number(file_name)
@@ -117,10 +162,19 @@ def step1_prepare(
                 f"（先頭が NNN-NN-N 形式でない / 重複検知不可）: {file_name}"
             )
             skip_no_number += 1
+            skipped_records.append({
+                "file_id": pdf_file["id"], "file_name": file_name,
+                "reason": "no_management_number",
+            })
             continue
         if mgmt_num in processed:
             logger.info(f"処理済みのためスキップ: {mgmt_num} ({file_name})")
             skip_processed += 1
+            skipped_records.append({
+                "file_id": pdf_file["id"], "file_name": file_name,
+                "reason": "already_processed",
+                "management_number": mgmt_num,
+            })
             continue
         targets.append(pdf_file)
 
@@ -158,6 +212,8 @@ def step1_prepare(
         })
 
     items = []
+    skip_extract_fail = 0  # M-2: テキスト抽出失敗を可視化
+    skip_download_error = 0
     for i, pdf_file in enumerate(targets, start=1):
         file_id = pdf_file["id"]
         file_name = pdf_file["name"]
@@ -168,9 +224,20 @@ def step1_prepare(
             pdf_text = pdf_reader.extract_text(pdf_data)
             if not pdf_text:
                 logger.warning(f"テキスト抽出失敗（空テキスト）: {file_name}")
+                skip_extract_fail += 1
+                skipped_records.append({
+                    "file_id": file_id, "file_name": file_name,
+                    "reason": "empty_text_extraction",
+                })
                 continue
         except Exception as e:
             logger.warning(f"PDF処理失敗: {file_name} - {e}")
+            skip_download_error += 1
+            skipped_records.append({
+                "file_id": file_id, "file_name": file_name,
+                "reason": "download_or_parse_error",
+                "error": str(e),
+            })
             continue
 
         items.append({
@@ -182,24 +249,31 @@ def step1_prepare(
 
     logger.info(
         f"Step 1完了: メイン {len(items)}件が処理可能 / "
-        f"添付資料 {len(attachment_records)}件をパススルー予約"
+        f"添付資料 {len(attachment_records)}件をパススルー予約 / "
+        f"スキップ内訳 (管理番号なし {skip_no_number}, 処理済み {skip_processed}, "
+        f"抽出失敗 {skip_extract_fail}, 取得エラー {skip_download_error})"
     )
 
     # 準備データをJSONに保存（Step 4でも使用）
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
     prep_file = LOGS_DIR / "batch_prep.json"
-    # pdf_textは大きいので保存しない（Step2用にはバッチリクエスト作成時に使う）
-    save_items = [{k: v for k, v in item.items() if k != "pdf_text"} for item in items]
-    prep_file.write_text(json.dumps(save_items, ensure_ascii=False, indent=2))
-    logger.info(f"準備データ保存: {prep_file}")
+    # CB-1 対策: pdf_text を **保存する**。これがないと step=submit を別 GHA
+    # 実行で行うとき Batch API に空 prompt を投げてしまう（過去バグ）。
+    # 1000 PDF × 30KB ≒ 30MB。許容範囲。
+    _atomic_write_json(prep_file, items)
+    logger.info(f"準備データ保存: {prep_file} ({len(items)} items, pdf_text 含む)")
 
     # 添付資料の情報を別ファイルに保存（既存の prep 形式を壊さない）。
     # Step4 がこのファイルを読み、メインと同じフォルダへコピーする。
     attachments_file = LOGS_DIR / _BATCH_ATTACHMENTS_FILE
-    attachments_file.write_text(
-        json.dumps(attachment_records, ensure_ascii=False, indent=2)
-    )
+    _atomic_write_json(attachments_file, attachment_records)
     logger.info(f"添付資料データ保存: {attachments_file}")
+
+    # M-2: スキップされた PDF の manifest を別ファイルに出力。1000 PDF 規模で
+    # 何件がどの理由で消えたかを後追いできるようにする。
+    skips_file = LOGS_DIR / "batch_step1_skips.json"
+    _atomic_write_json(skips_file, skipped_records)
+    logger.info(f"スキップ記録: {skips_file} ({len(skipped_records)} 件)")
 
     return items
 
@@ -264,6 +338,9 @@ def step3_wait_and_get_results(
         f"Step 3完了: {len(results)}件成功"
         + (f", {len(failed_ids)}件失敗 ({', '.join(failed_ids)})" if failed_ids else "")
     )
+    # CB-2: step4 を別 GHA 実行から呼ぶケースに備えて結果を永続化する。
+    _save_results_to_disk(results)
+    logger.info(f"バッチ結果保存: {LOGS_DIR / _BATCH_RESULTS_FILE}")
     return results
 
 
@@ -294,10 +371,24 @@ def step4_generate_pdfs(
     ensure_fonts()
 
     if items is None:
-        prep_file = LOGS_DIR / "batch_prep.json"
-        items = json.loads(prep_file.read_text())
+        items = _load_items_from_disk()
 
-    stats = {"success": 0, "error": 0, "missing": 0}
+    # CB-3: Step4 開始時に **再度** 処理済み管理番号をスナップショットする。
+    # Step1 のスナップショット (`processed`) は items の決定に使ったが、
+    # Step4 が途中クラッシュして再実行されたとき、前回 Step4 で書き込んだ行が
+    # 加わって `processed` セットが拡大している可能性がある。Step1 を再実行
+    # しない経路（--step pdfs 単独）でも、ここで再取得することで Drive/Sheets
+    # の重複書き込みを防ぐ（P-023）。
+    step4_processed = sheets_client.get_processed_management_numbers(
+        sheet_name=profile.output_sheet_name,
+    )
+    if step4_processed:
+        logger.info(
+            f"Step4 開始時の処理済みスナップショット: "
+            f"{len(step4_processed)} 件（重複処理を防ぐため）"
+        )
+
+    stats = {"success": 0, "error": 0, "missing": 0, "skip_already_processed": 0}
 
     # 添付資料パススルー用の対応表。メイン PDF の処理ループで構築し、
     # ループ後に添付資料をこの表で引いて同じ出力フォルダへコピーする。
@@ -382,6 +473,21 @@ def step4_generate_pdfs(
                 f"管理番号をファイル名から抽出できません"
                 f"（先頭が NNN-NN-N 形式でない）: {pdf_file_name}"
             )
+
+        # CB-3: Step4 開始時のスナップショットに mgmt_num が含まれていれば
+        # 前回 Step4 で処理済み（Drive アップロード + Sheets 追記 + 下書き想定）。
+        # 再処理すると Drive / Sheets / Gmail で重複が出るためスキップ。
+        # case_map（添付資料パススルー）の構築のため、メイン PDF の処理を
+        # スキップしても管理番号 → (医院番号, 医院名, 個人名) のマッピングは
+        # 残す必要があるが、Step4 単独再実行で添付資料の glue が無くなるのは
+        # 仕様上許容（添付資料は同じ Step4 内のメイン処理に依存する）。
+        if mgmt_num and mgmt_num in step4_processed:
+            logger.info(
+                f"Step4 スキップ（処理済み再実行検知）: {mgmt_num} "
+                f"({pdf_file_name})"
+            )
+            stats["skip_already_processed"] += 1
+            continue
 
         # 医院名は参加者マスターから引いた標準表記を最優先（表記統一 +
         # 「開業準備中」等の固定文字列対応）。未登録なら AI 抽出値で代用
@@ -765,8 +871,11 @@ def run(
         items = step1_prepare(cfg, test_count=test_count)
 
     if step in ("all", "submit"):
+        # CB-2: step=submit を別 GHA 実行から呼ぶケース。in-memory items が
+        # 無ければ batch_prep.json から復元する（CB-1 で pdf_text 込みで保存）。
         if items is None:
-            raise RuntimeError("submit単独実行にはprepareが必要です")
+            items = _load_items_from_disk()
+            logger.info(f"items を batch_prep.json からロード ({len(items)}件)")
         if not items:
             logger.info("処理対象が0件のため、バッチ送信をスキップします")
         else:
@@ -779,8 +888,15 @@ def run(
         results = step3_wait_and_get_results(batch_id)
 
     if step in ("all", "pdfs"):
+        # CB-2: step=pdfs を別 GHA 実行から呼ぶケース。in-memory results /
+        # items が無ければ disk から復元する（step3 が batch_results.json を
+        # 永続化、step1 が batch_prep.json を永続化）。
         if results is None:
-            raise RuntimeError("results が未取得です。step=results を先に実行してください")
+            results = _load_results_from_disk()
+            logger.info(f"results を batch_results.json からロード ({len(results)}件)")
+        if items is None:
+            items = _load_items_from_disk()
+            logger.info(f"items を batch_prep.json からロード ({len(items)}件)")
         step4_generate_pdfs(cfg, results, items=items)
 
     logger.info("=== Batchモード処理完了 ===")
