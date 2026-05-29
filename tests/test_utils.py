@@ -1,7 +1,11 @@
 """utils モジュールのテスト。"""
 
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import MagicMock, patch
 
+from src import utils as utils_mod
 from src.utils import (
     extract_clinic_number,
     extract_management_number,
@@ -338,6 +342,74 @@ class TestIsAttachmentFilename(unittest.TestCase):
         int ``12345`` は ``"12345"`` となり、マーカーを含まないため False。
         """
         self.assertFalse(is_attachment_filename(12345))  # type: ignore[arg-type]
+
+
+class TestEnsureFontsRetry(unittest.TestCase):
+    """``ensure_fonts`` のリトライ挙動のテスト（CI のフォントダウンロード flaky 対策）。
+
+    ``assets/*.ttf`` は .gitignore のため fresh checkout（CI）では存在せず、PDF
+    テストが実ネットワークダウンロードに依存して一時障害で落ちていた。指数
+    バックオフのリトライで一時失敗を吸収する。
+    """
+
+    def test_retries_then_succeeds(self):
+        """途中まで失敗しても、リトライ上限内で成功すればダウンロードできる。"""
+        with tempfile.TemporaryDirectory() as td:
+            reg = Path(td) / "reg.ttf"
+            bold = Path(td) / "bold.ttf"
+            resp_ok = MagicMock()
+            resp_ok.content = b"FONTDATA"
+            resp_ok.raise_for_status.return_value = None
+            # 2 回失敗 → 3 回目成功
+            outcomes = [ConnectionError("boom"), TimeoutError("slow"), resp_ok]
+
+            def fake_get(url, timeout=None):
+                result = outcomes.pop(0)
+                if isinstance(result, Exception):
+                    raise result
+                return result
+
+            with patch.object(utils_mod, "FONT_REGULAR", reg), \
+                    patch.object(utils_mod, "FONT_BOLD", bold), \
+                    patch("requests.get", side_effect=fake_get) as mock_get, \
+                    patch("time.sleep") as mock_sleep:
+                utils_mod.ensure_fonts()
+
+            self.assertTrue(reg.exists())
+            self.assertTrue(bold.exists())
+            self.assertEqual(reg.read_bytes(), b"FONTDATA")
+            self.assertEqual(mock_get.call_count, 3)
+            # 失敗 2 回 → リトライ前 sleep が 2 回
+            self.assertEqual(mock_sleep.call_count, 2)
+
+    def test_raises_runtime_error_after_all_attempts_fail(self):
+        """全試行が失敗したら RuntimeError を送出し、ファイルは作らない。"""
+        with tempfile.TemporaryDirectory() as td:
+            reg = Path(td) / "reg.ttf"
+            bold = Path(td) / "bold.ttf"
+            with patch.object(utils_mod, "FONT_REGULAR", reg), \
+                    patch.object(utils_mod, "FONT_BOLD", bold), \
+                    patch("requests.get", side_effect=ConnectionError("down")) as mock_get, \
+                    patch("time.sleep"):
+                with self.assertRaises(RuntimeError):
+                    utils_mod.ensure_fonts()
+            self.assertFalse(reg.exists())
+            self.assertEqual(
+                mock_get.call_count, utils_mod._FONT_DOWNLOAD_MAX_ATTEMPTS
+            )
+
+    def test_no_download_when_fonts_already_present(self):
+        """フォントが既に存在すれば早期 return し、ネットワークを叩かない。"""
+        with tempfile.TemporaryDirectory() as td:
+            reg = Path(td) / "reg.ttf"
+            bold = Path(td) / "bold.ttf"
+            reg.write_bytes(b"existing")
+            bold.write_bytes(b"existing")
+            with patch.object(utils_mod, "FONT_REGULAR", reg), \
+                    patch.object(utils_mod, "FONT_BOLD", bold), \
+                    patch("requests.get") as mock_get:
+                utils_mod.ensure_fonts()
+            mock_get.assert_not_called()
 
 
 if __name__ == "__main__":

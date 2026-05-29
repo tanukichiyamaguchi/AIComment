@@ -67,9 +67,11 @@ class RunConfig:
     インターフェースだけに依存することで、分岐コードを最小化する。
 
     ``master_sheet_name`` は参加者マスターシート名（医院名標準化 + Gmail
-    下書きの TO ルックアップ用）。自動検出モードでは Profile 由来ではないため、
-    ``target_folder_name`` から「``<フォルダ名>_参加者マスター``」を派生させる
-    （セミナーごとに別タブを使う運用、F-09 修正）。
+    下書きの TO ルックアップ用）。自動検出モードでも共有の既定タブ
+    ``参加者マスター``（``MASTER_SHEET_NAME``）を読む。運用者が 1 枚の
+    ``参加者マスター`` を実行ごとに対象セミナーの内容へ差し替える運用に合わせる
+    （F-09 の ``<フォルダ名>_参加者マスター`` 派生は廃止。経緯は lessons.md
+    2026-05-29 エントリ参照）。
     """
     display_name: str
     input_folder_id: str
@@ -92,16 +94,19 @@ class RunConfig:
 
     @classmethod
     def from_discovered(cls, ctx: DiscoveredContext) -> "RunConfig":
-        # セミナー（target_folder）ごとに専用の参加者マスタータブを使う。
-        # 全セミナーで同じ既定タブ ``参加者マスター`` を共有すると、
-        # 別セミナーの参加者へ誤送信するリスクがあるため
-        # ``<フォルダ名>_参加者マスター`` を採用する（F-09 修正）。
+        # 自動検出モードでも共有の既定タブ ``参加者マスター`` を読む。
+        # ユーザーは 1 枚の ``参加者マスター`` を実行ごとに対象セミナーの内容へ
+        # 差し替える運用のため（F-09 の per-folder タブ派生 ``<フォルダ名>_参加者
+        # マスター`` は廃止。空タブを読んで医院名が引けずフォルダ名が
+        # AI 抽出名になる事故を解消する）。
+        # 前提: 実行前にこのタブが対象セミナーのデータになっていること
+        # （医院名・Gmail 下書き宛先の両方をここから引くため）。
         return cls(
             display_name=f"自動検出: {ctx.target_folder_name}",
             input_folder_id=ctx.input_folder_id,
             output_folder_id=ctx.output_folder_id,
             output_sheet_name=ctx.output_sheet_name,
-            master_sheet_name=f"{ctx.target_folder_name}_参加者マスター",
+            master_sheet_name=MASTER_SHEET_NAME,
         )
 
 
