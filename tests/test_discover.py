@@ -364,12 +364,15 @@ class TestServiceInjection(unittest.TestCase):
 
 
 class TestRunConfigFromDiscovered(unittest.TestCase):
-    """F-09 回帰防止: ``RunConfig.from_discovered`` は ``target_folder_name``
-    から ``master_sheet_name`` を派生させる（全セミナーで同じデフォルトタブを
-    共有すると別セミナーの参加者へ誤送信するリスクがあるため）。
+    """自動検出モードは共有の既定タブ ``参加者マスター`` を読む。
+
+    ユーザーは 1 枚の ``参加者マスター`` を実行ごとに対象セミナーの内容へ
+    差し替える運用のため、F-09 の ``<フォルダ名>_参加者マスター`` 派生は廃止
+    （空の per-folder タブを読んで医院名が引けずフォルダ名が AI 抽出名になる
+    事故を解消。経緯は lessons.md 2026-05-29 エントリ）。
     """
 
-    def test_master_sheet_name_derived_from_target_folder(self):
+    def test_master_sheet_name_uses_shared_default(self):
         ctx = discover.DiscoveredContext(
             target_folder_name="テスト5",
             input_folder_id="in_id",
@@ -377,10 +380,12 @@ class TestRunConfigFromDiscovered(unittest.TestCase):
             output_sheet_name="テスト5",
         )
         cfg = discover.RunConfig.from_discovered(ctx)
-        self.assertEqual(cfg.master_sheet_name, "テスト5_参加者マスター")
+        # 共有の既定タブを使う（フォルダ名派生にしない＝旧 F-09 挙動の回帰防止）
+        self.assertEqual(cfg.master_sheet_name, discover.MASTER_SHEET_NAME)
+        self.assertNotIn("テスト5", cfg.master_sheet_name)
 
-    def test_different_target_folders_get_different_master_tabs(self):
-        """別フォルダ → 別タブ。デフォルト共有による誤送信を防ぐ。"""
+    def test_different_target_folders_share_same_master_tab(self):
+        """別フォルダでも同じ共有タブ ``参加者マスター`` を読む。"""
         ctx_a = discover.DiscoveredContext(
             target_folder_name="セミナーA",
             input_folder_id="a_in",
@@ -395,9 +400,9 @@ class TestRunConfigFromDiscovered(unittest.TestCase):
         )
         cfg_a = discover.RunConfig.from_discovered(ctx_a)
         cfg_b = discover.RunConfig.from_discovered(ctx_b)
-        self.assertNotEqual(cfg_a.master_sheet_name, cfg_b.master_sheet_name)
-        self.assertEqual(cfg_a.master_sheet_name, "セミナーA_参加者マスター")
-        self.assertEqual(cfg_b.master_sheet_name, "セミナーB_参加者マスター")
+        self.assertEqual(cfg_a.master_sheet_name, discover.MASTER_SHEET_NAME)
+        self.assertEqual(cfg_b.master_sheet_name, discover.MASTER_SHEET_NAME)
+        self.assertEqual(cfg_a.master_sheet_name, cfg_b.master_sheet_name)
 
 
 if __name__ == "__main__":
