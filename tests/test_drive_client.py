@@ -277,6 +277,98 @@ class TestFindOrCreateClinicFolder(unittest.TestCase):
         service.files.return_value.create.assert_not_called()
         service.files.return_value.update.assert_not_called()
 
+    def test_renames_existing_folder_to_authoritative_master_name(self):
+        """``clinic_name_authoritative=True`` で既存フォルダ名が確定名と違う
+        場合、確定名（``<医院番号>_<マスター医院名>``）へリネームする。
+        フォルダ ID（= URL）は変わらないので既存リンクは保持される。"""
+        service = MagicMock()
+        service.files.return_value.list.return_value.execute.return_value = {
+            # マスター登録前に AI 抽出名で作られた古いフォルダ
+            "files": [{"id": "existing_001", "name": "001_三浦歯科"}]
+        }
+        service.files.return_value.update.return_value.execute.return_value = {
+            "id": "existing_001"
+        }
+
+        result = drive_client.find_or_create_clinic_folder(
+            clinic_number="001",
+            clinic_name="三浦歯科医院",  # マスター由来の確定名
+            parent_id="parent_id",
+            service=service,
+            clinic_name_authoritative=True,
+        )
+
+        # 既存フォルダを再利用しつつ、確定名へリネーム（新規作成はしない）
+        self.assertEqual(result, "existing_001")
+        service.files.return_value.create.assert_not_called()
+        update_kwargs = service.files.return_value.update.call_args.kwargs
+        self.assertEqual(update_kwargs["fileId"], "existing_001")
+        self.assertEqual(update_kwargs["body"]["name"], "001_三浦歯科医院")
+
+    def test_no_rename_when_authoritative_name_already_matches(self):
+        """確定名と既存フォルダ名が一致していれば、無駄な update を呼ばない。"""
+        service = MagicMock()
+        service.files.return_value.list.return_value.execute.return_value = {
+            "files": [{"id": "existing_001", "name": "001_三浦歯科医院"}]
+        }
+
+        result = drive_client.find_or_create_clinic_folder(
+            clinic_number="001",
+            clinic_name="三浦歯科医院",
+            parent_id="parent_id",
+            service=service,
+            clinic_name_authoritative=True,
+        )
+
+        self.assertEqual(result, "existing_001")
+        service.files.return_value.create.assert_not_called()
+        service.files.return_value.update.assert_not_called()
+
+    def test_no_rename_when_name_differs_but_not_authoritative(self):
+        """AI 抽出値（``authoritative=False``）では既存フォルダをリネームしない
+        （``三浦歯科`` ↔ ``三浦歯科医院`` の往復 churn を防ぐ P-019 を維持）。"""
+        service = MagicMock()
+        service.files.return_value.list.return_value.execute.return_value = {
+            "files": [{"id": "existing_001", "name": "001_三浦歯科医院"}]
+        }
+
+        result = drive_client.find_or_create_clinic_folder(
+            clinic_number="001",
+            clinic_name="三浦歯科",  # AI 抽出値（確定名ではない）
+            parent_id="parent_id",
+            service=service,
+            clinic_name_authoritative=False,
+        )
+
+        self.assertEqual(result, "existing_001")
+        service.files.return_value.create.assert_not_called()
+        service.files.return_value.update.assert_not_called()
+
+    def test_rename_failure_is_non_fatal(self):
+        """リネーム API が失敗しても、フォルダ ID を返して処理を続行する
+        （1000 件規模で 1 件のリネーム失敗が全体を止めないため）。"""
+        service = MagicMock()
+        service.files.return_value.list.return_value.execute.return_value = {
+            "files": [{"id": "existing_001", "name": "001_旧名"}]
+        }
+        service.files.return_value.update.return_value.execute.side_effect = (
+            Exception("Drive update failed")
+        )
+
+        with self.assertLogs("jissen_comment", level="WARNING") as log_ctx:
+            result = drive_client.find_or_create_clinic_folder(
+                clinic_number="001",
+                clinic_name="新名",
+                parent_id="parent_id",
+                service=service,
+                clinic_name_authoritative=True,
+            )
+
+        # リネーム失敗でもフォルダ ID は返る
+        self.assertEqual(result, "existing_001")
+        joined = "\n".join(log_ctx.output)
+        self.assertIn("同期に失敗", joined)
+
     def test_creates_new_folder_when_no_match(self):
         """医院番号でマッチするフォルダが無ければ
         ``<医院番号>_<医院名>`` で新規作成する。"""

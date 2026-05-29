@@ -544,6 +544,8 @@ def step4_generate_pdfs(
                     clinic_name=clinic_name,
                     person_name=person_name,
                     file_name=output_filename,
+                    # マスター由来の確定医院名なら既存フォルダ名も同期させる
+                    clinic_name_authoritative=bool(clinic_name_from_master),
                 )
 
                 sheets_client.append_output_record(
@@ -774,6 +776,12 @@ def _process_attachments(
         # ``find_or_create_clinic_folder`` 経由でメインと同じ医院フォルダへ
         # コピーされる。
         clinic_number, clinic_name, person_name = case
+        # 添付資料も同じ医院フォルダへ入る。医院名がマスター由来（確定名）なら
+        # 既存フォルダ名を確定名へ同期する。メイン PDF 処理で同期済みでも、
+        # Step4 単独再実行等の順序差異に備えてここでも再判定する。
+        clinic_name_authoritative = bool(
+            sheets_client.lookup_clinic_name(master_records, clinic_number)
+        )
         try:
             # 元 PDF のバイト列をそのまま再アップロード（マージ・コメント
             # ページ生成はしない）。出力ファイル名は元のまま。session_outputs_dir
@@ -790,6 +798,7 @@ def _process_attachments(
                 clinic_name=clinic_name,
                 person_name=person_name,
                 file_name=file_name,
+                clinic_name_authoritative=clinic_name_authoritative,
             )
 
             sheets_client.append_output_record(
