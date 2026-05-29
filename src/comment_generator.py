@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from typing import Any
 
@@ -149,7 +150,15 @@ SYSTEM_PROMPT = """\
 - `clinic_name` : PDF本文（タイトル・冒頭・最終ページなど）に明記されている歯科医院名（最も完全な表記を選ぶ）。判別不能なら空文字列。
 - `person_name` : 報告者の氏名（「報告者」「氏名」「Dr」などのラベル付近）。役職や肩書きは含めない。判別不能なら空文字列。
 - `sample_title` : この実践事例のタイトル / テーマ（「タイトル」「テーマ」「取り組み名」「冒頭の見出し」など）。判別不能なら空文字列。
-- `comment` : 報告者一人ひとりに向けた手書き調コメント本文（200〜350文字）。タイトルや宛名は不要。コメント文のみ。"""
+- `comment` : 報告者一人ひとりに向けた手書き調コメント本文（200〜350文字）。タイトルや宛名は不要。コメント文のみ。
+
+【comment フィールドの絶対禁止事項】
+- 医院名（「○○歯科」「○○クリニック」「○○医院」など、抽出された clinic_name に相当する固有名詞）を本文中に一切含めない。
+- 報告者氏名（姓・名・フルネーム、抽出された person_name に相当する固有名詞）を本文中に一切含めない。
+- 「○○様」「○○先生」「○○院長」など、氏名付きの呼びかけ・敬称をしない（氏名を伴わない「先生」「皆様」も使わない）。
+- 「貴院」「御院」「貴クリニック」など医院を直接指す代名詞は使わない。
+- 冒頭・末尾の宛名行（「○○歯科医院 ○○様」等）は一切付けない。
+コメントは個人名・医院名に依存しない、内容そのものに向けた感想・提案として書いてください。"""
 
 
 def _build_user_prompt(pdf_text: str, pdf_filename: str = "") -> str:
@@ -196,6 +205,9 @@ EXTRACTION_SCHEMA: dict[str, Any] = {
             "type": "string",
             "description": (
                 "報告者一人ひとりに向けた手書き調コメント本文（200〜350文字）。"
+                "医院名（clinic_name に相当する固有名詞）と報告者氏名"
+                "（person_name に相当する固有名詞）は本文中に一切含めない。"
+                "「○○様」「○○先生」「貴院」等の宛名・呼びかけ・敬称も使わない。"
             ),
         },
     },
@@ -241,7 +253,48 @@ def _parse_extraction(text: str) -> dict[str, str]:
         ) from e
     if not isinstance(data, dict):
         raise ValueError(f"Claude応答がオブジェクトではありません: {text[:200]}")
-    return {field: str(data.get(field, "") or "").strip() for field in _EXTRACTED_FIELDS}
+    extracted = {field: str(data.get(field, "") or "").strip() for field in _EXTRACTED_FIELDS}
+    extracted["comment"] = _scrub_names_from_comment(
+        comment=extracted["comment"],
+        clinic_name=extracted["clinic_name"],
+        person_name=extracted["person_name"],
+    )
+    return extracted
+
+
+# 敬称（呼びかけ）のサフィックス。氏名・医院名と組み合わさったときに丸ごと除去する。
+_HONORIFIC_SUFFIXES = ("様", "さん", "さま", "先生", "院長", "ドクター", "Dr.", "Dr")
+# 名前トークンの最小長（短いと普通の語と衝突しやすいので除去スキップ）。
+_NAME_SCRUB_MIN_LEN = 2
+
+
+def _scrub_names_from_comment(
+    comment: str,
+    clinic_name: str,
+    person_name: str,
+) -> str:
+    """コメント本文から医院名・報告者氏名と関連する敬称を除去する。
+
+    プロンプトで禁止しているが、AI が偶発的に混入させた場合の保険として、
+    抽出後にプログラム的に取り除く。clinic_name / person_name そのものと、
+    それらに敬称が付いた「氏名+様」「氏名+先生」「医院名+様」等を消す。
+    名前トークンが極端に短い（1文字）場合は普通の語と衝突するため除去しない。
+
+    削除後に残る不要な空白・連続スペース・先頭末尾の改行をならして返す。
+    """
+    if not comment:
+        return comment
+    result = comment
+    names = [n for n in (clinic_name, person_name) if n and len(n) >= _NAME_SCRUB_MIN_LEN]
+    # 長い名前から先に消す（短い別名が長い名前の一部を切り崩さないように）。
+    for name in sorted(set(names), key=len, reverse=True):
+        for suffix in _HONORIFIC_SUFFIXES:
+            result = result.replace(f"{name}{suffix}", "")
+        result = result.replace(name, "")
+    # 連続スペースを 1 つに、前後の空白・空行をならす。
+    result = re.sub(r"[ \t　]+", " ", result)
+    result = re.sub(r"\n{3,}", "\n\n", result)
+    return result.strip()
 
 
 def generate_comment_with_metadata(

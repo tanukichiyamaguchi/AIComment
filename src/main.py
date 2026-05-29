@@ -471,6 +471,21 @@ def run(
         f"エラー: {stats['error']}件"
     )
 
+    # 出力一覧シートの最終行に「完了」マーカーを 1 行追加（運用者がシート上で
+    # 一目で完了を把握できるように）。書き込み自体は fail-soft（ログ・本処理は
+    # 既に終わっているため、マーカー失敗で例外を上げない）。
+    try:
+        sheets_client.append_completion_marker(
+            sheet_name=cfg.output_sheet_name,
+            summary=(
+                f"成功 {stats['success']}件 / "
+                f"エラー {stats['error']}件 / "
+                f"スキップ {stats['skip'] + stats['skip_no_number'] + stats['skip_processed'] + stats['skip_attachment_orphan']}件"
+            ),
+        )
+    except Exception as e:
+        logger.warning(f"完了マーカーの追記に失敗（処理自体は完了済み）: {e}")
+
 
 def _create_grouped_drafts_for_run(
     draft_items: list[dict[str, Any]],

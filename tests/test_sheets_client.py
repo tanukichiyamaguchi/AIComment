@@ -1484,5 +1484,56 @@ class TestReadMasterRecordsEmptyWarning(unittest.TestCase):
         )
 
 
+class TestAppendCompletionMarker(unittest.TestCase):
+    """``append_completion_marker`` は出力一覧シート末尾に「完了」行を 1 行追加する。"""
+
+    @patch("src.sheets_client.get_sheets_service")
+    def test_appends_completion_row_with_summary(self, mock_get_service):
+        service = _build_service_with_sheets(["出力一覧"])
+        service.spreadsheets.return_value.values.return_value.get.return_value.execute.return_value = {
+            "values": [["管理番号"]]  # ヘッダーあり
+        }
+        mock_get_service.return_value = service
+
+        sheets_client.append_completion_marker(
+            spreadsheet_id="sid",
+            sheet_name="出力一覧",
+            completed_at="2026-05-29 04:30:00",
+            summary="成功 42件 / エラー 0件",
+        )
+
+        append_call = service.spreadsheets.return_value.values.return_value.append.call_args
+        self.assertIn("出力一覧!A:F", append_call.kwargs["range"])
+        row = append_call.kwargs["body"]["values"][0]
+        # 1 列目は「完了」、2 列目は日時、3 列目はサマリー、残りは空
+        self.assertEqual(row[0], "完了")
+        self.assertEqual(row[1], "2026-05-29 04:30:00")
+        self.assertEqual(row[2], "成功 42件 / エラー 0件")
+        self.assertEqual(row[3:], ["", "", ""])
+
+    @patch("src.sheets_client.get_sheets_service")
+    def test_passes_num_retries(self, mock_get_service):
+        service = _build_service_with_sheets(["出力一覧"])
+        service.spreadsheets.return_value.values.return_value.get.return_value.execute.return_value = {
+            "values": [["管理番号"]]
+        }
+        mock_get_service.return_value = service
+
+        sheets_client.append_completion_marker(
+            spreadsheet_id="sid",
+            sheet_name="出力一覧",
+            completed_at="2026-05-29 04:30:00",
+        )
+
+        append_call = service.spreadsheets.return_value.values.return_value.append.return_value.execute.call_args
+        self.assertEqual(append_call.kwargs["num_retries"], 5)
+
+    @patch("src.sheets_client.get_sheets_service")
+    def test_raises_when_spreadsheet_id_missing(self, mock_get_service):
+        with patch("src.sheets_client.SPREADSHEET_ID", ""):
+            with self.assertRaises(ValueError):
+                sheets_client.append_completion_marker(sheet_name="出力一覧")
+
+
 if __name__ == "__main__":
     unittest.main()

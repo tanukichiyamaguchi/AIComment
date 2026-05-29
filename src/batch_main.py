@@ -617,6 +617,21 @@ def step4_generate_pdfs(
         f"未取得 {stats['missing']}/{total}件"
     )
 
+    # 出力一覧シートの最終行に「完了」マーカーを 1 行追加（運用者がシート上で
+    # 一目で完了を把握できるように）。書き込み自体は fail-soft（Step4 本体は
+    # 既に終わっているため、マーカー失敗で例外を上げない）。
+    try:
+        sheets_client.append_completion_marker(
+            sheet_name=profile.output_sheet_name,
+            summary=(
+                f"成功 {stats['success']}件 / "
+                f"エラー {stats['error']}件 / "
+                f"未取得 {stats['missing']}件"
+            ),
+        )
+    except Exception as e:
+        logger.warning(f"完了マーカーの追記に失敗（処理自体は完了済み）: {e}")
+
 
 def _collect_draft_item_batch(
     draft_items: list[dict[str, Any]],

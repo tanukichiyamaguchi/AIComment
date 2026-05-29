@@ -4,6 +4,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import pdfplumber
+
 from src.pdf_creator import create_comment_page
 from src.utils import ensure_fonts
 
@@ -118,6 +120,35 @@ class TestPdfCreator(unittest.TestCase):
                 output_path=output,
             )
             self.assertTrue(result.exists())
+
+    def test_clinic_name_and_person_name_not_rendered_on_page(self):
+        """生成PDFに医院名・氏名・敬称が描画されていないことの回帰防止。
+
+        個人情報をコメントページ本体に残さない方針。clinic_name / person_name
+        は引数として受け取るが（ファイル名・Drive フォルダ階層では使う）、
+        ページ上には出力しない。
+        """
+        comment = (
+            "実践内容は非常に明快で、目標と行動と成果が一直線でした。"
+            "教育の仕組み化も具体的で、再現性が高い良い取り組みだと感じます。"
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "test_no_names.pdf"
+            create_comment_page(
+                comment=comment,
+                clinic_name="三浦歯科医院",
+                person_name="白川 蓮",
+                output_path=output,
+            )
+            with pdfplumber.open(output) as pdf:
+                page_text = "".join(p.extract_text() or "" for p in pdf.pages)
+        # 描画されているべきもの: タイトル + 本文
+        self.assertIn("じっせん君", page_text)
+        # 描画されてはいけないもの: 医院名 / 氏名 / 「○○ 様」
+        self.assertNotIn("三浦歯科医院", page_text)
+        self.assertNotIn("白川 蓮", page_text)
+        self.assertNotIn("白川", page_text)
+        self.assertNotIn("様", page_text)
 
 
 if __name__ == "__main__":
