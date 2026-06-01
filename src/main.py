@@ -32,7 +32,7 @@ from src.utils import (
     extract_management_number,
     is_attachment_filename,
 )
-from src import discover, drive_client, gmail_client, sheets_client
+from src import config, discover, drive_client, gmail_client, sheets_client
 from src import pdf_reader, comment_generator, pdf_creator, pdf_merger
 from src.sheets_client import MasterRecord
 
@@ -455,6 +455,8 @@ def run(
     # グルーピングし、グループごとに 1 通の Gmail 下書きを作成する。同じ
     # 個人の複数 PDF が 1 通の下書きに集約される（複数添付）。メールが
     # 空の項目は集約せず、PDF ごとに宛先空の下書きを作る（手動補完前提）。
+    # Gmail 下書きの ON/OFF 判定は ``_create_grouped_drafts_for_run`` 内で行う
+    # （ENABLE_GMAIL_DRAFTS=false ならスキップ）。一時ファイル削除は必ず行う。
     try:
         _create_grouped_drafts_for_run(draft_items, gmail_client)
     finally:
@@ -500,8 +502,16 @@ def _create_grouped_drafts_for_run(
 
     例外は警告ログを出して握りつぶし、他グループの下書き作成は続行する
     （fail-soft、Gmail API の一過性エラーで全滅しないよう）。
+
+    ``config.ENABLE_GMAIL_DRAFTS=false`` のときは下書きを 1 通も作らずに戻る。
     """
     logger = setup_logging()
+    if not config.ENABLE_GMAIL_DRAFTS:
+        logger.info(
+            f"Gmail下書きはOFF（ENABLE_GMAIL_DRAFTS=false）のため作成をスキップ"
+            f"（蓄積 {len(draft_items)}件は破棄）"
+        )
+        return
     if not draft_items:
         return
 

@@ -1307,5 +1307,31 @@ class TestBatchStateFilesPersistence(unittest.TestCase):
                 self.assertEqual(loaded, results)
 
 
+class TestBatchGmailDraftsToggle(unittest.TestCase):
+    """ENABLE_GMAIL_DRAFTS による下書き作成 ON/OFF（Batchモード）。"""
+
+    @staticmethod
+    def _item():
+        return {
+            "email": "a@example.com",
+            "person_name": "田中太郎",
+            "pdf_path": "/tmp/x.pdf",
+        }
+
+    @patch("src.batch_main.gmail_client")
+    @patch("src.config.ENABLE_GMAIL_DRAFTS", False)
+    def test_drafts_skipped_when_disabled(self, mock_gmail):
+        """OFF のとき create_draft は一度も呼ばれない。"""
+        batch_main._create_grouped_drafts_for_batch([self._item()])
+        mock_gmail.create_draft.assert_not_called()
+
+    @patch("src.batch_main.gmail_client")
+    @patch("src.config.ENABLE_GMAIL_DRAFTS", True)
+    def test_drafts_created_when_enabled(self, mock_gmail):
+        """ON のとき従来どおり create_draft が呼ばれる。"""
+        batch_main._create_grouped_drafts_for_batch([self._item()])
+        mock_gmail.create_draft.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()

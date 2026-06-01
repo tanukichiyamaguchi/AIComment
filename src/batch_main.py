@@ -36,7 +36,7 @@ from src.utils import (
     is_attachment_filename,
 )
 from src.config import LOGS_DIR
-from src import discover, drive_client, gmail_client, sheets_client
+from src import config, discover, drive_client, gmail_client, sheets_client
 from src import pdf_reader, comment_generator, pdf_creator, pdf_merger
 from src.discover import RunConfig
 from src.profile import ProfileConfig
@@ -604,7 +604,8 @@ def step4_generate_pdfs(
 
     # ── 集約下書き作成 ──
     # メイン + 添付資料経路で蓄積した draft_items をメールアドレスでグルーピング
-    # し、グループごとに 1 通の Gmail 下書きを作成する。
+    # し、グループごとに 1 通の Gmail 下書きを作成する。Gmail 下書きの ON/OFF
+    # 判定は ``_create_grouped_drafts_for_batch`` 内で行う。一時ファイル削除は必ず行う。
     try:
         _create_grouped_drafts_for_batch(draft_items)
     finally:
@@ -675,8 +676,16 @@ def _create_grouped_drafts_for_batch(
     通常モード (``main._create_grouped_drafts_for_run``) と同じロジック:
     メールアドレスごとに 1 通の下書きにまとめ、空メールは PDF ごとに個別の
     宛先空下書きを作る。例外は警告ログを出して握りつぶす（fail-soft）。
+
+    ``config.ENABLE_GMAIL_DRAFTS=false`` のときは下書きを 1 通も作らずに戻る。
     """
     logger = setup_logging()
+    if not config.ENABLE_GMAIL_DRAFTS:
+        logger.info(
+            f"Gmail下書きはOFF（ENABLE_GMAIL_DRAFTS=false）のため作成をスキップ"
+            f"（蓄積 {len(draft_items)}件は破棄）"
+        )
+        return
     if not draft_items:
         return
 
