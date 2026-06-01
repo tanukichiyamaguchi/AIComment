@@ -9,8 +9,11 @@ from anthropic.types import TextBlock
 
 from src.comment_generator import (
     EXTRACTION_SCHEMA,
+    LIG_REPORT_SYSTEM_PROMPT,
+    PARTNER_SYSTEM_PROMPT,
     READING_SYSTEM_PROMPT,
     SYSTEM_PROMPT,
+    TEAM_MTG_SYSTEM_PROMPT,
     _build_extraction_request_params,
     _build_user_prompt,
     _parse_extraction,
@@ -373,20 +376,31 @@ class TestGetSystemPrompt(unittest.TestCase):
     def test_reading_returns_reading_prompt(self):
         self.assertEqual(get_system_prompt("読書"), READING_SYSTEM_PROMPT)
 
+    def test_lig_partner_teammtg_return_dedicated_prompts(self):
+        """LIGレポート / パートナー / チームMTG は専用プロンプトを返す。"""
+        self.assertEqual(get_system_prompt("LIGレポート"), LIG_REPORT_SYSTEM_PROMPT)
+        self.assertEqual(get_system_prompt("パートナー"), PARTNER_SYSTEM_PROMPT)
+        self.assertEqual(get_system_prompt("チームMTG"), TEAM_MTG_SYSTEM_PROMPT)
+
     def test_unknown_theme_falls_back_to_default(self):
         self.assertEqual(get_system_prompt(""), SYSTEM_PROMPT)
         self.assertEqual(get_system_prompt("unknown"), SYSTEM_PROMPT)
 
-    def test_themes_without_dedicated_prompt_fall_back_to_default(self):
-        """LIGレポート / パートナー / チームMTG / チーム実践 はプロンプト未提供のため
-        現状は既存プロンプト（SYSTEM_PROMPT）が使われる（追加時はこのテストが落ちる）。
-        """
-        for theme in ("LIGレポート", "パートナー", "チームMTG", "チーム実践"):
-            self.assertEqual(
-                get_system_prompt(theme),
-                SYSTEM_PROMPT,
-                f"テーマ '{theme}' は未提供のため既存プロンプトに fallback すべき",
-            )
+    def test_team_jissen_still_falls_back_until_provided(self):
+        """チーム実践 はプロンプト未提供のため既存プロンプトに fallback
+        （提供時はこのテストを更新する）。"""
+        self.assertEqual(get_system_prompt("チーム実践"), SYSTEM_PROMPT)
+
+    def test_dedicated_prompts_are_distinct(self):
+        """4テーマの専用プロンプトと既存プロンプトが互いに別物であること。"""
+        prompts = {
+            READING_SYSTEM_PROMPT,
+            LIG_REPORT_SYSTEM_PROMPT,
+            PARTNER_SYSTEM_PROMPT,
+            TEAM_MTG_SYSTEM_PROMPT,
+            SYSTEM_PROMPT,
+        }
+        self.assertEqual(len(prompts), 5, "プロンプトに重複がある")
 
 
 class TestReadingSystemPrompt(unittest.TestCase):
@@ -405,6 +419,51 @@ class TestReadingSystemPrompt(unittest.TestCase):
 
     def test_forbids_proposer_name(self):
         self.assertIn("提出者の名前", READING_SYSTEM_PROMPT)
+
+
+class TestPracticePraisePrompts(unittest.TestCase):
+    """LIGレポート / パートナー / チームMTG 共通の称賛＋改善提案プロンプトの
+    必須要素（ユーザー指示）が含まれていることの回帰防止。"""
+
+    PROMPTS = None  # set in setUp
+
+    def setUp(self):
+        self.prompts = {
+            "LIGレポート": LIG_REPORT_SYSTEM_PROMPT,
+            "パートナー": PARTNER_SYSTEM_PROMPT,
+            "チームMTG": TEAM_MTG_SYSTEM_PROMPT,
+        }
+
+    def test_char_count_100_to_200(self):
+        for name, p in self.prompts.items():
+            self.assertIn("100", p, name)
+            self.assertIn("200", p, name)
+
+    def test_forbids_asterisk(self):
+        for name, p in self.prompts.items():
+            self.assertIn("アスタリスク", p, name)
+
+    def test_uses_exclamation_emphasis_rule(self):
+        for name, p in self.prompts.items():
+            self.assertIn("!", p, name)
+
+    def test_spoken_style_closing_rule(self):
+        for name, p in self.prompts.items():
+            self.assertIn("ですね", p, name)
+
+    def test_forbids_desuyo_closing(self):
+        for name, p in self.prompts.items():
+            self.assertIn("ですよ", p, name)  # 「ですよ」を使わない、という言及
+
+    def test_each_has_theme_specific_example(self):
+        self.assertIn("LIGレポート", LIG_REPORT_SYSTEM_PROMPT)
+        self.assertIn("パートナー", PARTNER_SYSTEM_PROMPT)
+        self.assertIn("チームMTG", TEAM_MTG_SYSTEM_PROMPT)
+
+    def test_dropped_reading_leftover_no_book_reference(self):
+        """読書プロンプトの転記（書籍名）を引きずっていないこと。"""
+        for name, p in self.prompts.items():
+            self.assertNotIn("書籍名", p, f"{name} に読書用の『書籍名』が混入している")
 
 
 class TestExtractionRequestParamsUsesProvidedPrompt(unittest.TestCase):
@@ -435,24 +494,27 @@ class TestCreateBatchRequestsPicksThemePerItem(unittest.TestCase):
             },
             {
                 "custom_id": "item_0002",
-                "pdf_file_name": "101-01-08-0【B1】チーム実践_x.pdf",
+                "pdf_file_name": "101-13【B1】LIGレポート _x.pdf",
                 "pdf_text": "...",
             },
             {
                 "custom_id": "item_0003",
+                "pdf_file_name": "101-01-08-0【B1】チーム実践_x.pdf",  # 未提供→既存
+                "pdf_text": "...",
+            },
+            {
+                "custom_id": "item_0004",
                 "pdf_file_name": "ただの実践事例.pdf",  # 該当なし → 既存
                 "pdf_text": "...",
             },
         ]
         reqs = create_batch_requests(items)
-        self.assertEqual(len(reqs), 3)
+        self.assertEqual(len(reqs), 4)
         sys_texts = [r["params"]["system"][0]["text"] for r in reqs]
-        # 1件目は読書プロンプト
-        self.assertEqual(sys_texts[0], READING_SYSTEM_PROMPT)
-        # 2件目はプロンプト未提供 → 既存プロンプトに fallback
-        self.assertEqual(sys_texts[1], SYSTEM_PROMPT)
-        # 3件目はテーマなし → 既存プロンプト
-        self.assertEqual(sys_texts[2], SYSTEM_PROMPT)
+        self.assertEqual(sys_texts[0], READING_SYSTEM_PROMPT)       # 読書
+        self.assertEqual(sys_texts[1], LIG_REPORT_SYSTEM_PROMPT)    # LIGレポート
+        self.assertEqual(sys_texts[2], SYSTEM_PROMPT)               # チーム実践（未提供）
+        self.assertEqual(sys_texts[3], SYSTEM_PROMPT)               # テーマなし
 
 
 if __name__ == "__main__":
