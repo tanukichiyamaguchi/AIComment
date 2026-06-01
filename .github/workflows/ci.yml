@@ -23,6 +23,18 @@ jobs:
       - name: 依存関係のインストール
         run: pip install -r requirements.txt -r requirements-dev.txt
 
+      # assets/*.ttf は .gitignore のため fresh checkout には存在せず、
+      # test_pdf_creator の ensure_fonts() が毎回 GitHub から 19MB の
+      # NotoSansJP を取得する。この取得が raw.githubusercontent への一過性
+      # ネットワーク障害で落ちると Python テストが flaky に失敗するため、
+      # ダウンロード済みフォントをキャッシュして再取得を避ける（cache hit 時は
+      # ネットワーク不要 → 安定 + 高速）。フォント URL が変わったら key を上げる。
+      - name: フォントキャッシュ（NotoSansJP）
+        uses: actions/cache@v4
+        with:
+          path: assets/*.ttf
+          key: notosansjp-fonts-v1
+
       - name: テスト実行
         run: python -m pytest tests/ -v
 
