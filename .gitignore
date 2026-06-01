@@ -6,7 +6,8 @@ dist/
 __pycache__/
 *.pyc
 *.pyo
-assets/NotoSansJP-Regular.ttf
+# NotoSansJP-Regular.ttf はリポジトリにコミットする（実行時DLをなくし CI/本番を安定化）。
+# Bold は同一の variable font なので ensure_fonts() がローカルで複製生成する（DL不要）→ 引き続き無視。
 assets/NotoSansJP-Bold.ttf
 logs/
 *.egg-info/

@@ -230,6 +230,19 @@ def ensure_fonts() -> None:
         return
 
     logger = logging.getLogger("jissen_comment")
+
+    # NotoSansJP-Regular.ttf はリポジトリにコミット済み。Regular/Bold は同一の
+    # variable font なので、ローカルに片方があれば不足分はその実体を複製して
+    # 作る（ネットワーク不要）。これで CI / 本番とも実行時ダウンロードに依存せず
+    # 安定する。両方とも無い場合のみ、従来どおり GitHub からダウンロードする。
+    source = next((f for f in (FONT_REGULAR, FONT_BOLD) if f.exists()), None)
+    if source is not None:
+        data = source.read_bytes()
+        for font_path in missing:
+            font_path.write_bytes(data)
+            logger.info(f"フォントをローカル複製で生成: {font_path.name}（DL不要）")
+        return
+
     logger.info("NotoSansJPフォントをダウンロード中...")
 
     # GitHub の google/fonts リポジトリから Variable font を直接取得し、
