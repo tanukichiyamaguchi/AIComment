@@ -161,13 +161,113 @@ SYSTEM_PROMPT = """\
 コメントは個人名・医院名に依存しない、内容そのものに向けた感想・提案として書いてください。"""
 
 
+# ── テーマ別プロンプト ──
+# ファイル名（例: "101-01-02【B1】読書_35歳までに...pdf"）の 】 直後〜最初の _ に
+# 書かれたテーマ名で振り分ける。当てはまらないものは ``SYSTEM_PROMPT``（既存
+# プロンプト＝じっせん実践事例）にフォールバック。各プロンプトは構造化出力
+# （EXTRACTION_SCHEMA: clinic_name / person_name / sample_title / comment）の
+# 4 フィールドを返す前提。本文内に医院名・氏名を入れない方針は ``_scrub_names_from_comment``
+# が抽出後に保険として除去するので、テーマ別プロンプトで個別に重複明記しなくてもよい。
+
+# 読書感想文用プロンプト（テーマ「読書」）。
+# 構造化出力のため、sample_title は書籍名を意味する。
+READING_SYSTEM_PROMPT = """\
+あなたは歯科医院のスタッフ育成やマネジメントをサポートするメンターです。
+
+アップロードされた読書感想文（ファイル）の内容を読み取り、提出者のモチベーションが上がるようなフィードバックコメントを作成してください。
+以下の【条件】を厳守して出力してください。
+
+【条件】
+1. 情報の自動抽出: アップロードされたファイルから「書籍名」「具体的な気づきや実践内容」を読み取り、コメント内に自然に組み込んでください。
+2. 文字数: 100文字〜250文字程度に収めること。
+3. 個別化: 定型文や一般的な感想は避け、提出者が書いた「具体的な気づき」や「実践した行動・そこから得た結果」を必ずピックアップして称賛すること。
+4. 重複回避の工夫: 同一人物から複数の感想文が提出されることを想定し、コメントの構成や言い回しがパターン化しないようにすること。毎回、その書籍の「特有のテーマ（例：チーム連携、プレゼン技術、マインドセット、マネジメント等）」にフォーカスして切り口を変えること。
+5. トーン: 提出者の努力や成長を認め、未来の活躍への期待を込めた、温かくポジティブなトーンで作成すること。
+6. 提出者の名前は入れない。
+7. 過度にカギ括弧を使用しない。
+8. アスタリスクは絶対に使用しない。
+
+#出力タスク
+読書感想文を読み、以下の4要素を構造化出力（JSON）で返してください：
+
+- `clinic_name` : 感想文に書かれた歯科医院名。判別不能なら空文字列。
+- `person_name` : 提出者の氏名。判別不能なら空文字列。
+- `sample_title` : 書籍名。判別不能なら空文字列。
+- `comment` : 上記【条件】に従ったコメント本文。タイトルや宛名は不要。コメント文のみ。
+"""
+
+
+# テーマ判定で認識する 5 テーマ。ファイル名の 】 直後〜最初の _ までの文字列を
+# 半角/全角スペース除去後にこの集合と完全一致比較する。順序は判定に影響しない。
+_KNOWN_THEMES: tuple[str, ...] = (
+    "読書",
+    "LIGレポート",
+    "パートナー",
+    "チームMTG",
+    "チーム実践",
+)
+
+# テーマ → システムプロンプト の対応表。
+# プロンプト未提供のテーマは ``get_system_prompt`` のフォールバックで
+# 既存プロンプト（SYSTEM_PROMPT）が使われる。
+_THEME_PROMPTS: dict[str, str] = {
+    "読書": READING_SYSTEM_PROMPT,
+    # "LIGレポート" / "パートナー" / "チームMTG" / "チーム実践" は別途追加予定。
+    # 提供されるまでは fallback（既存プロンプト）で動作。
+}
+
+
+def extract_theme(filename: str) -> str:
+    """PDF ファイル名からテーマ名を抽出する。
+
+    ファイル名フォーマット（例）:
+        ``"101-01-02【B1】読書_35歳までに必ずやるべきこと_吉野浩史.pdf"``
+        ``"112-16【B1】LIGレポート _医療法人志結会おざき歯科医院.pdf"`` (空白入りもあり)
+
+    ロジック:
+        1. ``】`` の直後の文字列を取り出す（無ければ空）。
+        2. 最初の ``_`` で切り、先頭/末尾の空白と半角・全角スペースを除去。
+        3. 既知 5 テーマと完全一致比較。一致しなければ空文字列を返す（＝既存プロンプト適用）。
+
+    Returns:
+        マッチしたテーマ名（``"読書"`` など）。マッチしないなら ``""``。
+    """
+    if not filename:
+        return ""
+    after_bracket = filename.split("】", 1)
+    if len(after_bracket) < 2:
+        return ""
+    segment = after_bracket[1].split("_", 1)[0].strip()
+    # ファイル名内の見栄え用空白を除去（"LIGレポート " のような末尾空白対策）。
+    segment_normalized = segment.replace(" ", "").replace("　", "")
+    for theme in _KNOWN_THEMES:
+        if segment_normalized == theme:
+            return theme
+    return ""
+
+
+def get_system_prompt(theme: str) -> str:
+    """テーマ名に対応するシステムプロンプトを返す。
+
+    未知テーマ / 空文字列 / プロンプト未提供のテーマは既存プロンプト
+    （じっせん実践事例用 SYSTEM_PROMPT）にフォールバックする。
+    """
+    return _THEME_PROMPTS.get(theme, SYSTEM_PROMPT)
+
+
 def _build_user_prompt(pdf_text: str, pdf_filename: str = "") -> str:
-    """ユーザープロンプトを構築する。"""
+    """ユーザープロンプトを構築する（テーマ非依存・抽出フィールドは全テーマ共通）。
+
+    ファイルが ``実践事例`` か ``読書感想文`` かによらず読めるよう、ファイル種別の
+    断定は避けて中立的に書く。各テーマの書き方の違いは system プロンプト側で
+    制御する（``get_system_prompt`` 参照）。
+    """
     file_note = f"\nファイル名: {pdf_filename}\n" if pdf_filename else ""
     return (
-        "以下は歯科医院の実践事例報告シートです。"
-        "本文から医院名・報告者氏名・実践事例タイトルを抽出し、"
-        "本文に対する手書き調コメントも生成してください。"
+        "以下は歯科医院スタッフから提出された報告ファイルです。"
+        "本文から医院名・報告者氏名・タイトル（実践事例名 / 書籍名 / 取り組み名 等）を抽出し、"
+        "本文に対する手書き調コメントを生成してください。"
+        "コメントの書き方（文字数・トーン・禁止事項など）は system プロンプトに従ってください。"
         f"{file_note}\n---\n{pdf_text}\n---"
     )
 
@@ -224,8 +324,15 @@ def _create_client() -> anthropic.Anthropic:
     )
 
 
-def _build_extraction_request_params() -> dict[str, Any]:
-    """構造化出力リクエスト用の共通パラメータを生成する。"""
+def _build_extraction_request_params(
+    system_prompt: str | None = None,
+) -> dict[str, Any]:
+    """構造化出力リクエスト用の共通パラメータを生成する。
+
+    Args:
+        system_prompt: 使用するシステムプロンプト。``None`` のときは既存
+            プロンプト（SYSTEM_PROMPT）にフォールバック（後方互換）。
+    """
     return {
         "model": CLAUDE_MODEL,
         "max_tokens": CLAUDE_MAX_TOKENS,
@@ -233,7 +340,7 @@ def _build_extraction_request_params() -> dict[str, Any]:
         "system": [
             {
                 "type": "text",
-                "text": SYSTEM_PROMPT,
+                "text": system_prompt if system_prompt is not None else SYSTEM_PROMPT,
                 "cache_control": {"type": "ephemeral"},
             }
         ],
@@ -316,7 +423,12 @@ def generate_comment_with_metadata(
     """
     client = _create_client()
     user_prompt = _build_user_prompt(pdf_text, pdf_filename)
-    base_params = _build_extraction_request_params()
+    theme = extract_theme(pdf_filename)
+    system_prompt = get_system_prompt(theme)
+    base_params = _build_extraction_request_params(system_prompt=system_prompt)
+    logger.info(
+        f"テーマ判定: filename='{pdf_filename}' → theme='{theme or '(該当なし→既定)'}'"
+    )
 
     for attempt in range(max_retries + 1):
         try:
@@ -388,10 +500,15 @@ def create_batch_requests(
     """
     requests: list[Request] = []
     for item in items:
+        pdf_filename = item.get("pdf_file_name", "")
         user_prompt = _build_user_prompt(
             pdf_text=item["pdf_text"],
-            pdf_filename=item.get("pdf_file_name", ""),
+            pdf_filename=pdf_filename,
         )
+        # Batch モードはアイテム単位でテーマを判定する。同一バッチに混在する
+        # 異なるテーマでも、それぞれ専用プロンプトでリクエストできる。
+        theme = extract_theme(pdf_filename)
+        system_prompt = get_system_prompt(theme)
         params = MessageCreateParamsNonStreaming(
             model=CLAUDE_MODEL,
             max_tokens=CLAUDE_MAX_TOKENS,
@@ -399,7 +516,7 @@ def create_batch_requests(
             system=[
                 {
                     "type": "text",
-                    "text": SYSTEM_PROMPT,
+                    "text": system_prompt,
                     "cache_control": {"type": "ephemeral"},
                 }
             ],

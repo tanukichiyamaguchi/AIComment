@@ -9,12 +9,16 @@ from anthropic.types import TextBlock
 
 from src.comment_generator import (
     EXTRACTION_SCHEMA,
+    READING_SYSTEM_PROMPT,
     SYSTEM_PROMPT,
+    _build_extraction_request_params,
     _build_user_prompt,
     _parse_extraction,
     _scrub_names_from_comment,
     create_batch_requests,
+    extract_theme,
     generate_comment_with_metadata,
+    get_system_prompt,
 )
 
 
@@ -292,6 +296,163 @@ class TestSystemPromptForbidsNames(unittest.TestCase):
             "様" in SYSTEM_PROMPT and "先生" in SYSTEM_PROMPT,
             "プロンプトに敬称 (様/先生) 禁止の明示が必要",
         )
+
+
+class TestExtractTheme(unittest.TestCase):
+    """``extract_theme``：PDF ファイル名から 5 テーマを判定する。
+
+    フォーマット: ``NNN-NN-N【B1】テーマ_…``
+    """
+
+    def test_reading_theme(self):
+        self.assertEqual(
+            extract_theme("101-01-02【B1】読書_35歳までに必ずやるべきこと_吉野浩史.pdf"),
+            "読書",
+        )
+
+    def test_lig_report_theme(self):
+        self.assertEqual(
+            extract_theme("101-13【B1】LIGレポート _あつたの森歯科クリニック.pdf"),
+            "LIGレポート",
+        )
+
+    def test_lig_report_without_space(self):
+        self.assertEqual(
+            extract_theme("103-01【B1】LIGレポート_医療法人フロンティアあま歯科.pdf"),
+            "LIGレポート",
+        )
+
+    def test_partner_theme(self):
+        self.assertEqual(
+            extract_theme("101-01-01【B1】パートナー_医）ワールデント_吉野浩史.pdf"),
+            "パートナー",
+        )
+
+    def test_team_mtg_theme(self):
+        self.assertEqual(
+            extract_theme("110-01-13【B1】チームMTG_医院での議事録.pdf"),
+            "チームMTG",
+        )
+
+    def test_team_practice_theme(self):
+        self.assertEqual(
+            extract_theme("101-01-08-0【B1】チーム実践_みんなの疑問解決.pdf"),
+            "チーム実践",
+        )
+
+    def test_team_practice_not_confused_with_team_mtg(self):
+        """「チーム実践」と「チームMTG」が混同されないこと（前方一致誤判定の予防）。"""
+        self.assertEqual(
+            extract_theme("999-99【B1】チーム実践_x.pdf"), "チーム実践"
+        )
+        self.assertEqual(
+            extract_theme("999-99【B1】チームMTG_x.pdf"), "チームMTG"
+        )
+
+    def test_unknown_theme_returns_empty(self):
+        self.assertEqual(
+            extract_theme("101-01-01【B1】実践事例_別のもの.pdf"), ""
+        )
+
+    def test_no_bracket_returns_empty(self):
+        self.assertEqual(extract_theme("ただのファイル.pdf"), "")
+
+    def test_empty_filename_returns_empty(self):
+        self.assertEqual(extract_theme(""), "")
+
+    def test_fullwidth_space_after_theme_is_stripped(self):
+        """テーマ名直後の全角スペースも除去して一致させる。"""
+        self.assertEqual(
+            extract_theme("101-13【B1】LIGレポート　_xxx.pdf"), "LIGレポート"
+        )
+
+
+class TestGetSystemPrompt(unittest.TestCase):
+    """``get_system_prompt``：テーマ → プロンプト の振り分け。"""
+
+    def test_reading_returns_reading_prompt(self):
+        self.assertEqual(get_system_prompt("読書"), READING_SYSTEM_PROMPT)
+
+    def test_unknown_theme_falls_back_to_default(self):
+        self.assertEqual(get_system_prompt(""), SYSTEM_PROMPT)
+        self.assertEqual(get_system_prompt("unknown"), SYSTEM_PROMPT)
+
+    def test_themes_without_dedicated_prompt_fall_back_to_default(self):
+        """LIGレポート / パートナー / チームMTG / チーム実践 はプロンプト未提供のため
+        現状は既存プロンプト（SYSTEM_PROMPT）が使われる（追加時はこのテストが落ちる）。
+        """
+        for theme in ("LIGレポート", "パートナー", "チームMTG", "チーム実践"):
+            self.assertEqual(
+                get_system_prompt(theme),
+                SYSTEM_PROMPT,
+                f"テーマ '{theme}' は未提供のため既存プロンプトに fallback すべき",
+            )
+
+
+class TestReadingSystemPrompt(unittest.TestCase):
+    """READING_SYSTEM_PROMPT が読書プロンプトの必須要素を含むことの回帰防止。"""
+
+    def test_includes_book_focus(self):
+        self.assertIn("書籍名", READING_SYSTEM_PROMPT)
+
+    def test_includes_character_count_100_to_250(self):
+        # 文字数指定（100〜250文字程度）が消えていないこと
+        self.assertIn("100", READING_SYSTEM_PROMPT)
+        self.assertIn("250", READING_SYSTEM_PROMPT)
+
+    def test_explicitly_forbids_asterisk(self):
+        self.assertIn("アスタリスク", READING_SYSTEM_PROMPT)
+
+    def test_forbids_proposer_name(self):
+        self.assertIn("提出者の名前", READING_SYSTEM_PROMPT)
+
+
+class TestExtractionRequestParamsUsesProvidedPrompt(unittest.TestCase):
+    """``_build_extraction_request_params`` が渡したプロンプトを system に入れる。"""
+
+    def test_uses_custom_system_prompt_when_provided(self):
+        params = _build_extraction_request_params(
+            system_prompt=READING_SYSTEM_PROMPT
+        )
+        self.assertEqual(params["system"][0]["text"], READING_SYSTEM_PROMPT)
+        # キャッシュ制御は維持
+        self.assertEqual(params["system"][0]["cache_control"]["type"], "ephemeral")
+
+    def test_falls_back_to_default_when_omitted(self):
+        params = _build_extraction_request_params()
+        self.assertEqual(params["system"][0]["text"], SYSTEM_PROMPT)
+
+
+class TestCreateBatchRequestsPicksThemePerItem(unittest.TestCase):
+    """Batch モード：同一バッチ内でアイテムごとにテーマ別プロンプトが選ばれる。"""
+
+    def test_mixed_themes_pick_different_system_prompts(self):
+        items = [
+            {
+                "custom_id": "item_0001",
+                "pdf_file_name": "101-01-02【B1】読書_本_田中.pdf",
+                "pdf_text": "...",
+            },
+            {
+                "custom_id": "item_0002",
+                "pdf_file_name": "101-01-08-0【B1】チーム実践_x.pdf",
+                "pdf_text": "...",
+            },
+            {
+                "custom_id": "item_0003",
+                "pdf_file_name": "ただの実践事例.pdf",  # 該当なし → 既存
+                "pdf_text": "...",
+            },
+        ]
+        reqs = create_batch_requests(items)
+        self.assertEqual(len(reqs), 3)
+        sys_texts = [r["params"]["system"][0]["text"] for r in reqs]
+        # 1件目は読書プロンプト
+        self.assertEqual(sys_texts[0], READING_SYSTEM_PROMPT)
+        # 2件目はプロンプト未提供 → 既存プロンプトに fallback
+        self.assertEqual(sys_texts[1], SYSTEM_PROMPT)
+        # 3件目はテーマなし → 既存プロンプト
+        self.assertEqual(sys_texts[2], SYSTEM_PROMPT)
 
 
 if __name__ == "__main__":
