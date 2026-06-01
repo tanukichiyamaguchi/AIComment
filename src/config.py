@@ -18,6 +18,19 @@ def _get_secret(key: str, default: str = "") -> str:
         return default
 
 
+def _get_bool(key: str, default: bool) -> bool:
+    """環境変数を真偽値として取得する。
+
+    GitHub Actions の ``workflow_dispatch`` boolean 入力は文字列 ``"true"`` /
+    ``"false"`` として渡ってくるため、文字列を緩く解釈する。未設定（空文字）
+    のときは ``default`` を返す。``false/0/no/off`` を偽、それ以外の非空値を真。
+    """
+    raw = _get_secret(key, "").strip().lower()
+    if not raw:
+        return default
+    return raw not in ("false", "0", "no", "off")
+
+
 # ── パス設定 ──
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 ASSETS_DIR = PROJECT_ROOT / "assets"
@@ -88,6 +101,15 @@ JISSEN_KUN_IMAGE = ASSETS_DIR / "jissen_kun.png"
 
 # ── PDF設定 ──
 PDF_PAGE_SIZE = "A4"
+
+# ── Gmail 下書き生成のオン/オフ ──
+# Gmail 下書き（医院宛メールの下書き）を作成するかどうか。
+# デフォルトは True（従来挙動を維持）。本番で不要になった場合は環境変数
+# ``ENABLE_GMAIL_DRAFTS=false`` で OFF にできる（GitHub Actions の
+# workflow_dispatch 入力 create_gmail_drafts から渡す想定）。
+# OFF のときは PDF 生成・Drive アップロード・出力一覧シート追記までは従来通り
+# 行い、最後の下書き作成ステップだけをスキップする。
+ENABLE_GMAIL_DRAFTS = _get_bool("ENABLE_GMAIL_DRAFTS", default=True)
 
 # ── ログ設定 ──
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")

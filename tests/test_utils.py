@@ -411,6 +411,26 @@ class TestEnsureFontsRetry(unittest.TestCase):
                 utils_mod.ensure_fonts()
             mock_get.assert_not_called()
 
+    def test_derives_missing_weight_from_local_without_download(self):
+        """片方のフォントがローカルにあれば、不足分は複製で作りネットを叩かない。
+
+        NotoSansJP-Regular.ttf はリポジトリにコミット済み。Regular/Bold は同一
+        variable font なので、Bold が無くても Regular の実体から複製して生成する
+        （実行時ダウンロードを廃止し CI/本番を安定化）。
+        """
+        with tempfile.TemporaryDirectory() as td:
+            reg = Path(td) / "reg.ttf"
+            bold = Path(td) / "bold.ttf"
+            reg.write_bytes(b"VARFONT")  # コミット済み Regular を模す
+            # bold は存在しない → Regular から複製されるはず
+            with patch.object(utils_mod, "FONT_REGULAR", reg), \
+                    patch.object(utils_mod, "FONT_BOLD", bold), \
+                    patch("requests.get") as mock_get:
+                utils_mod.ensure_fonts()
+            self.assertTrue(bold.exists())
+            self.assertEqual(bold.read_bytes(), b"VARFONT")  # Regular と同一実体
+            mock_get.assert_not_called()  # ネットワーク不要
+
 
 if __name__ == "__main__":
     unittest.main()

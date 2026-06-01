@@ -1584,5 +1584,31 @@ class TestCreateGroupedDraftsForRun(unittest.TestCase):
         self.assertIn("ほか2名", call.kwargs["person_name"])
 
 
+class TestGmailDraftsToggle(unittest.TestCase):
+    """ENABLE_GMAIL_DRAFTS による下書き作成 ON/OFF（通常モード）。"""
+
+    @staticmethod
+    def _item():
+        return {
+            "email": "a@example.com",
+            "person_name": "田中太郎",
+            "pdf_path": "/tmp/x.pdf",
+        }
+
+    @patch("src.config.ENABLE_GMAIL_DRAFTS", False)
+    def test_drafts_skipped_when_disabled(self):
+        """OFF のとき create_draft は一度も呼ばれない。"""
+        mock_gmail = MagicMock()
+        main_module._create_grouped_drafts_for_run([self._item()], mock_gmail)
+        mock_gmail.create_draft.assert_not_called()
+
+    @patch("src.config.ENABLE_GMAIL_DRAFTS", True)
+    def test_drafts_created_when_enabled(self):
+        """ON のとき従来どおり create_draft が呼ばれる。"""
+        mock_gmail = MagicMock()
+        main_module._create_grouped_drafts_for_run([self._item()], mock_gmail)
+        mock_gmail.create_draft.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()
