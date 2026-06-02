@@ -1430,9 +1430,15 @@ class TestSheetsWriteThrottle(unittest.TestCase):
 
     def test_old_writes_expire(self):
         """60 秒以上前の write はキューから除去される。"""
-        # 100 秒前の write を 100 件入れても、throttle 後は空になる
+        # 100 秒前の write を 100 件入れても、throttle 後は新しい 1 件だけ残る。
+        # 注意: throttle は time.monotonic()（絶対値は環境依存。起動直後の CI ランナー
+        # では 60 未満になり得る）で経過判定する。「大昔」を絶対値 0.0 で表すと
+        # monotonic()<60 の環境では「60 秒以上前」と判定されず失敗するため、必ず
+        # 現在からの相対値で古さを表す（P-025: monotonic 前提の時刻はテストでも相対化）。
+        import time as _time
+        old = _time.monotonic() - 100.0
         for _ in range(100):
-            sheets_client._SHEETS_WRITE_TIMES.append(0.0)  # very old
+            sheets_client._SHEETS_WRITE_TIMES.append(old)
         with patch("src.sheets_client.time.sleep") as mock_sleep:
             sheets_client._throttle_sheets_write()
         # 古い記録は全部捨てられ、新しい 1 件だけ残る
