@@ -368,7 +368,8 @@ python -m src.batch_main                      # 本番（全件）
 python -m src.batch_main --profile jissen_2024_q1 --test-count 5
 python -m src.main --profile jissen_2024_q3
 
-# バッチ結果取得から再開
+# 完了済みバッチから回収（結果取得 → Drive 再走査で items 再構築 → PDF生成・Drive・シートまで完走）。
+# 別ジョブで投入した batch_prep.json が無い回収でも、custom_id が file id 由来で安定なため結果と突合できる。
 python -m src.batch_main --batch-id msgbatch_xxx --step results
 ```
 

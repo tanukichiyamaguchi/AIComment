@@ -24,7 +24,7 @@ on:
         type: boolean
         default: false
       step:
-        description: 'Batch step (all=通常, results=完了済みバッチから結果回収のみ). resultsを使うときは batch_id 必須。'
+        description: 'Batch step (all=通常, results=完了済みバッチから回収＝結果取得→Drive再走査→PDF/Drive/シートまで完走). resultsを使うときは batch_id 必須。'
         type: choice
         default: 'all'
         options:
