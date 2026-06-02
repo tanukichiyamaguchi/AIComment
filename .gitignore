@@ -12,6 +12,9 @@ assets/NotoSansJP-Bold.ttf
 logs/
 *.egg-info/
 
+# Claude エージェントの一時 worktree（並列作業用）。リポジトリ管理外。
+.claude/worktrees/
+
 # Credential files
 credentials.json
 client_secret.json
