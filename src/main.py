@@ -34,6 +34,10 @@ from src.utils import (
 )
 from src import config, discover, drive_client, gmail_client, sheets_client
 from src import pdf_reader, comment_generator, pdf_creator, pdf_merger
+from src.comment_generator import (
+    PermanentRunFailureError,
+    permanent_failure_message,
+)
 from src.sheets_client import MasterRecord
 
 
@@ -163,6 +167,13 @@ def run(
     # 資料アップロード時にメインと同じ ``find_or_create_clinic_folder`` を
     # 通じて同じ医院フォルダ（医院番号で識別）に合流させる（P-019）。
     case_map: dict[str, tuple[str, str, str]] = {}
+
+    # ラン全体を停止する恒久エラー（残高不足 / 認証 / 権限）を検知したら、
+    # この変数に例外を入れてループを break する。以降の添付資料パススルーも
+    # スキップし、既に成功した分の下書き作成と一時ファイル削除だけ行う。
+    # 例外クラスは直接 import する（comment_generator モジュールがテストで
+    # モックされても except 節が壊れないよう、モジュール経由参照を避ける）。
+    run_halted: PermanentRunFailureError | None = None
 
     def _record_clinic_folder(
         clinic_number: str, clinic_name: str, clinic_folder_id: str
@@ -359,6 +370,20 @@ def run(
             )
             stats["success"] += 1
 
+        except PermanentRunFailureError as e:
+            # ラン全体で恒久的に失敗する条件（残高不足 / 認証 / 権限）を検知。
+            # 以降のどの PDF も必ず同じエラーになるため、残りを処理せず即停止する
+            # （無駄な API 呼び出し + エラーログの乱立を防ぐ）。既に成功・記録
+            # 済みの件は影響なし。未処理分は出力一覧シート未記録なので、残高
+            # チャージ後の再実行で処理対象として拾える。
+            run_halted = e
+            logger.error(
+                permanent_failure_message(
+                    processed=stats["success"], detail=str(e),
+                )
+            )
+            break
+
         except Exception as e:
             logger.error(f"処理エラー: {file_name} - {e}", exc_info=True)
             stats["error"] += 1
@@ -367,9 +392,15 @@ def run(
     # 添付資料 PDF は AI 処理（テキスト抽出 / Claude API / コメントページ生成
     # / 結合）を一切せず、同じ管理番号のメインと同じ出力フォルダへ元ファイル
     # のままコピーする。メイン処理が完了した後にまとめて処理する。
-    if attachment_files:
+    # ラン停止中（恒久エラー検知）は添付資料も処理せずスキップする。
+    if run_halted is not None:
+        logger.warning(
+            "恒久エラーのためラン停止中: 添付資料パススルーをスキップします"
+            f"（未処理 {len(attachment_files)}件）"
+        )
+    if attachment_files and run_halted is None:
         logger.info(f"--- 添付資料パススルー: {len(attachment_files)}件 ---")
-    for pdf_file in attachment_files:
+    for pdf_file in [] if run_halted is not None else attachment_files:
         file_id = pdf_file["id"]
         file_name = pdf_file["name"]
         mgmt_num = extract_management_number(file_name)
@@ -457,6 +488,8 @@ def run(
     # 空の項目は集約せず、PDF ごとに宛先空の下書きを作る（手動補完前提）。
     # Gmail 下書きの ON/OFF 判定は ``_create_grouped_drafts_for_run`` 内で行う
     # （ENABLE_GMAIL_DRAFTS=false ならスキップ）。一時ファイル削除は必ず行う。
+    # 既に成功した分の下書き作成と一時ファイル削除は、ラン停止時でも行う
+    # （完了済みの成果物は運用者に届ける）。
     try:
         _create_grouped_drafts_for_run(draft_items, gmail_client)
     finally:
@@ -475,18 +508,32 @@ def run(
 
     # 出力一覧シートの最終行に「完了」マーカーを 1 行追加（運用者がシート上で
     # 一目で完了を把握できるように）。書き込み自体は fail-soft（ログ・本処理は
-    # 既に終わっているため、マーカー失敗で例外を上げない）。
+    # 既に終わっているため、マーカー失敗で例外を上げない）。ラン停止時は
+    # 「中止」マーカーにして、シート上でも停止が分かるようにする。
+    if run_halted is not None:
+        marker_summary = (
+            f"中止（残高/認証/権限エラー） 成功 {stats['success']}件 / "
+            f"未処理あり・再実行が必要"
+        )
+    else:
+        marker_summary = (
+            f"成功 {stats['success']}件 / "
+            f"エラー {stats['error']}件 / "
+            f"スキップ {stats['skip'] + stats['skip_no_number'] + stats['skip_processed'] + stats['skip_attachment_orphan']}件"
+        )
     try:
         sheets_client.append_completion_marker(
             sheet_name=cfg.output_sheet_name,
-            summary=(
-                f"成功 {stats['success']}件 / "
-                f"エラー {stats['error']}件 / "
-                f"スキップ {stats['skip'] + stats['skip_no_number'] + stats['skip_processed'] + stats['skip_attachment_orphan']}件"
-            ),
+            summary=marker_summary,
         )
     except Exception as e:
         logger.warning(f"完了マーカーの追記に失敗（処理自体は完了済み）: {e}")
+
+    # ラン全体を停止する恒久エラーを検知していた場合、ここで再送出して
+    # プロセスを異常終了させる（GitHub Actions のジョブを失敗で終わらせ、
+    # 運用者に再実行を促す）。成果物の flush とマーカー追記は上で完了済み。
+    if run_halted is not None:
+        raise run_halted
 
 
 def _create_grouped_drafts_for_run(

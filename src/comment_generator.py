@@ -22,6 +22,74 @@ from src.config import (
 
 logger = logging.getLogger("jissen_comment")
 
+
+# ── ラン全体で恒久的に失敗する条件（fail-fast） ──
+# 本番 GitHub Actions ランで、ランの途中で Anthropic のクレジット残高が尽き、
+# 残り 49 件すべてが ``credit balance is too low`` の 400 になった事象への対処。
+# 「以降のどの API 呼び出しも必ず失敗する」恒久条件（残高不足 / 認証 / 権限）と、
+# 「その 1 件の PDF 固有の失敗」（プロンプト過大などの request-specific 400）を
+# 明確に区別する。前者はラン全体を即停止、後者は従来通り per-PDF fail-soft。
+
+# BadRequestError の message に含まれていたら「請求/残高の恒久エラー」と判定する語。
+# Anthropic の billing 系 400 は本文に下記いずれかを含む（小文字化して部分一致）。
+_BILLING_FAILURE_MARKERS: tuple[str, ...] = (
+    "credit balance is too low",
+    "credit balance",
+    "plans & billing",
+    "plans and billing",
+    "purchase credits",
+    "upgrade or purchase",
+    "billing",
+)
+
+
+class PermanentRunFailureError(anthropic.AnthropicError):
+    """ラン全体を継続不能にする恒久エラー（残高不足 / 認証 / 権限）。
+
+    1 件の PDF 固有エラーと区別するための専用型。これが送出されたら、
+    呼び出し側（main.run / batch_main）は残り PDF を処理せずランを即停止する。
+    ``args[0]`` に運用者向けの停止理由メッセージを保持する。
+    """
+
+
+def is_permanent_run_failure(exc: BaseException) -> bool:
+    """``exc`` が「以降のどの API 呼び出しも必ず失敗する」恒久エラーか判定する。
+
+    True を返す条件（run-wide permanent failure）:
+        - ``anthropic.AuthenticationError``（401, APIキー不正）
+        - ``anthropic.PermissionDeniedError``（403, 権限不足）
+        - ``anthropic.BadRequestError`` で message に billing 系の語を含む
+          （クレジット残高不足など）
+
+    False（＝一過性 / PDF 固有 → 従来通りリトライ or per-PDF fail-soft）:
+        - RateLimitError / InternalServerError / APITimeoutError / APIConnectionError
+        - request-specific な 400（プロンプト過大など billing と無関係なもの）
+        - Anthropic 由来でない例外
+    """
+    if isinstance(exc, PermanentRunFailureError):
+        return True
+    if isinstance(exc, (anthropic.AuthenticationError, anthropic.PermissionDeniedError)):
+        return True
+    if isinstance(exc, anthropic.BadRequestError):
+        message = (getattr(exc, "message", "") or str(exc)).lower()
+        return any(marker in message for marker in _BILLING_FAILURE_MARKERS)
+    return False
+
+
+# 運用者がログで一目で分かる停止メッセージ（クレジット切れ/認証/権限の総称）。
+_PERMANENT_FAILURE_OPERATOR_MESSAGE = (
+    "Anthropic API のクレジット残高不足（または認証/権限エラー）のため処理を"
+    "中止しました。{processed}件処理済み。残高をチャージ／設定を確認してから"
+    "再実行してください。"
+)
+
+
+def permanent_failure_message(processed: int, detail: str = "") -> str:
+    """運用者向けの停止メッセージを組み立てる（処理済み件数込み）。"""
+    base = _PERMANENT_FAILURE_OPERATOR_MESSAGE.format(processed=processed)
+    return f"{base} (詳細: {detail})" if detail else base
+
+
 # ── システムプロンプト（全件共通・キャッシュ対象） ──
 SYSTEM_PROMPT = """\
 #あなたの役割
@@ -528,6 +596,24 @@ def generate_comment_with_metadata(
             return data
 
         except (
+            anthropic.AuthenticationError,
+            anthropic.PermissionDeniedError,
+            anthropic.BadRequestError,
+        ) as e:
+            # 恒久エラー（残高不足 / 認証 / 権限）はリトライしても必ず失敗する。
+            # 即座に PermanentRunFailureError へ変換して送出し、呼び出し側が
+            # ラン全体を停止できるようにする（無駄な再試行・API 呼び出しをしない）。
+            if is_permanent_run_failure(e):
+                logger.error(
+                    f"恒久エラー検知（残高不足/認証/権限）→ ラン停止対象: {e}"
+                )
+                raise PermanentRunFailureError(str(e)) from e
+            # billing と無関係な request-specific 400（プロンプト過大など）は
+            # この PDF 固有の失敗。従来通りリトライせず即 raise し、呼び出し側が
+            # per-PDF で fail-soft する。
+            raise
+
+        except (
             anthropic.RateLimitError,
             anthropic.InternalServerError,
             anthropic.APITimeoutError,
@@ -604,7 +690,21 @@ def submit_batch(items: list[dict]) -> str:
 
     logger.info(f"Batch API送信: {len(requests)}件")
 
-    batch = client.messages.batches.create(requests=requests)
+    # バッチ作成時に残高不足/認証/権限の恒久エラーが起きたら、即停止できるよう
+    # PermanentRunFailureError に変換する（通常モードと同じ fail-fast 方針）。
+    try:
+        batch = client.messages.batches.create(requests=requests)
+    except (
+        anthropic.AuthenticationError,
+        anthropic.PermissionDeniedError,
+        anthropic.BadRequestError,
+    ) as e:
+        if is_permanent_run_failure(e):
+            logger.error(
+                f"恒久エラー検知（残高不足/認証/権限）→ バッチ送信を中止: {e}"
+            )
+            raise PermanentRunFailureError(str(e)) from e
+        raise
 
     logger.info(f"Batch作成完了: ID={batch.id}, ステータス={batch.processing_status}")
     return batch.id
@@ -617,7 +717,19 @@ def get_batch_status(batch_id: str) -> dict[str, Any]:
         {"status": str, "results_url": str | None, ...}
     """
     client = _create_client()
-    batch = client.messages.batches.retrieve(batch_id)
+    try:
+        batch = client.messages.batches.retrieve(batch_id)
+    except (
+        anthropic.AuthenticationError,
+        anthropic.PermissionDeniedError,
+        anthropic.BadRequestError,
+    ) as e:
+        if is_permanent_run_failure(e):
+            logger.error(
+                f"恒久エラー検知（残高不足/認証/権限）→ バッチ状態取得を中止: {e}"
+            )
+            raise PermanentRunFailureError(str(e)) from e
+        raise
 
     return {
         "id": batch.id,
@@ -646,7 +758,21 @@ def get_batch_results(
     results: dict[str, dict[str, str]] = {}
     failed_ids: list[str] = []
 
-    for result in client.messages.batches.results(batch_id):
+    try:
+        batch_results = client.messages.batches.results(batch_id)
+    except (
+        anthropic.AuthenticationError,
+        anthropic.PermissionDeniedError,
+        anthropic.BadRequestError,
+    ) as e:
+        if is_permanent_run_failure(e):
+            logger.error(
+                f"恒久エラー検知（残高不足/認証/権限）→ バッチ結果取得を中止: {e}"
+            )
+            raise PermanentRunFailureError(str(e)) from e
+        raise
+
+    for result in batch_results:
         custom_id = result.custom_id
         if result.result.type != "succeeded":
             logger.error(f"Batch失敗: {custom_id} - {result.result.type}")

@@ -11,6 +11,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from src import main as main_module
+from src.comment_generator import PermanentRunFailureError
 from src.discover import DiscoveredContext
 from src.profile import ProfileConfig
 
@@ -1608,6 +1609,147 @@ class TestGmailDraftsToggle(unittest.TestCase):
         mock_gmail = MagicMock()
         main_module._create_grouped_drafts_for_run([self._item()], mock_gmail)
         mock_gmail.create_draft.assert_called_once()
+
+
+class TestRunFailFastOnPermanentError(unittest.TestCase):
+    """ラン全体で恒久的に失敗する条件（クレジット残高不足 / 認証 / 権限）を
+    検知したら、残り PDF を処理せずランを即停止する（無駄な API 呼び出し +
+    エラーログの乱立を防ぐ）。本番で 49 件すべてが
+    ``credit balance is too low`` の 400 になった事象への根本対処。
+
+    PDF 固有の 400（プロンプト過大など）はラン全体を止めず、従来通り
+    per-PDF で fail-soft（ログ + stats['error'] + continue）する。
+    """
+
+    @patch("src.main.ensure_fonts")
+    @patch("src.main.pdf_merger")
+    @patch("src.main.pdf_creator")
+    @patch("src.main.pdf_reader")
+    @patch("src.main.comment_generator")
+    @patch("src.main.sheets_client")
+    @patch("src.main.drive_client")
+    @patch("src.discover.load_profile")
+    def test_permanent_failure_halts_run_and_skips_remaining(
+        self,
+        mock_load_profile,
+        mock_drive_client,
+        mock_sheets_client,
+        mock_gen,
+        mock_reader,
+        mock_creator,
+        mock_merger,
+        mock_ensure_fonts,
+    ):
+        """2 件目で残高不足（恒久エラー）を検知したら、3 件目以降を処理しない。
+
+        - 1 件目: 成功（API 呼び出し + download される）
+        - 2 件目: ``PermanentRunFailureError`` → ランを停止
+        - 3 件目: download / Claude を一切呼ばない（無駄打ちしない）
+        """
+        mock_load_profile.return_value = _make_profile()
+        mock_sheets_client.get_processed_management_numbers.return_value = set()
+        _install_run_mocks(
+            mock_drive_client, mock_gen, mock_reader, mock_creator, mock_merger,
+            mock_sheets_client=mock_sheets_client,
+            pdf_files=[
+                {"id": "id_1", "name": "001-01-1新規.pdf"},
+                {"id": "id_2", "name": "001-01-2新規.pdf"},
+                {"id": "id_3", "name": "001-01-3新規.pdf"},
+            ],
+        )
+        # main.py は PermanentRunFailureError / permanent_failure_message を
+        # 直接 import 済み（comment_generator モジュールのモックに依存しない）。
+        # 2 件目で恒久エラー（残高不足）を送出させる。
+        success_meta = {
+            "clinic_name": "山田歯科",
+            "person_name": "田中太郎",
+            "sample_title": "事例タイトル",
+            "comment": "コメント本文",
+        }
+        mock_gen.generate_comment_with_metadata.side_effect = [
+            success_meta,
+            PermanentRunFailureError("credit balance is too low"),
+        ]
+
+        # 恒久エラーは run() の外へ再送出される（GHA ジョブを失敗させる）。
+        with self.assertLogs("jissen_comment", level="INFO") as logs:
+            with self.assertRaises(PermanentRunFailureError):
+                main_module.run(test_count=0, profile_name="jissen_default")
+
+        # 3 件目は処理対象に入らない: Claude は 2 回だけ呼ばれる（成功 + 恒久）。
+        self.assertEqual(
+            mock_gen.generate_comment_with_metadata.call_count, 2,
+        )
+        # download も 2 件分（3 件目はダウンロードすらしない＝無駄打ちなし）。
+        self.assertEqual(mock_drive_client.download_pdf.call_count, 2)
+        downloaded_ids = [
+            c.args[0] for c in mock_drive_client.download_pdf.call_args_list
+        ]
+        self.assertEqual(downloaded_ids, ["id_1", "id_2"])
+        # 成功した 1 件だけがシートに記録される。
+        self.assertEqual(mock_sheets_client.append_output_record.call_count, 1)
+        # 運用者向けの停止メッセージがログに出ている。
+        joined = "\n".join(logs.output)
+        self.assertIn("中止", joined)
+        self.assertIn("残高", joined)
+
+    @patch("src.main.ensure_fonts")
+    @patch("src.main.pdf_merger")
+    @patch("src.main.pdf_creator")
+    @patch("src.main.pdf_reader")
+    @patch("src.main.comment_generator")
+    @patch("src.main.sheets_client")
+    @patch("src.main.drive_client")
+    @patch("src.discover.load_profile")
+    def test_request_specific_400_does_not_halt_run(
+        self,
+        mock_load_profile,
+        mock_drive_client,
+        mock_sheets_client,
+        mock_gen,
+        mock_reader,
+        mock_creator,
+        mock_merger,
+        mock_ensure_fonts,
+    ):
+        """PDF 固有の 400（恒久ではない）は per-PDF fail-soft。ランは続行する。
+
+        2 件目で一般的な ValueError（PDF 固有失敗の代理）が出ても、3 件目は
+        通常通り処理される（download / Claude が呼ばれる）。
+        """
+        mock_load_profile.return_value = _make_profile()
+        mock_sheets_client.get_processed_management_numbers.return_value = set()
+        _install_run_mocks(
+            mock_drive_client, mock_gen, mock_reader, mock_creator, mock_merger,
+            mock_sheets_client=mock_sheets_client,
+            pdf_files=[
+                {"id": "id_1", "name": "001-01-1新規.pdf"},
+                {"id": "id_2", "name": "001-01-2新規.pdf"},
+                {"id": "id_3", "name": "001-01-3新規.pdf"},
+            ],
+        )
+        success_meta = {
+            "clinic_name": "山田歯科",
+            "person_name": "田中太郎",
+            "sample_title": "事例タイトル",
+            "comment": "コメント本文",
+        }
+        # 2 件目だけ PDF 固有エラー（恒久ではない）。1・3 件目は成功。
+        mock_gen.generate_comment_with_metadata.side_effect = [
+            success_meta,
+            ValueError("コメントが空です"),
+            success_meta,
+        ]
+
+        main_module.run(test_count=0, profile_name="jissen_default")
+
+        # 3 件すべて Claude に投げられる（恒久ではないので止めない）。
+        self.assertEqual(
+            mock_gen.generate_comment_with_metadata.call_count, 3,
+        )
+        self.assertEqual(mock_drive_client.download_pdf.call_count, 3)
+        # 成功した 2 件（1・3 件目）がシートに記録される。
+        self.assertEqual(mock_sheets_client.append_output_record.call_count, 2)
 
 
 if __name__ == "__main__":

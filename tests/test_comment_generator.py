@@ -14,6 +14,7 @@ from src.comment_generator import (
     READING_SYSTEM_PROMPT,
     SYSTEM_PROMPT,
     TEAM_MTG_SYSTEM_PROMPT,
+    PermanentRunFailureError,
     _build_extraction_request_params,
     _build_user_prompt,
     _parse_extraction,
@@ -22,11 +23,56 @@ from src.comment_generator import (
     extract_theme,
     generate_comment_with_metadata,
     get_system_prompt,
+    is_permanent_run_failure,
 )
 
 
 def _text_block(text: str) -> TextBlock:
     return TextBlock(type="text", text=text, citations=None)
+
+
+def _credit_balance_error() -> anthropic.BadRequestError:
+    """本番で観測された「クレジット残高不足」400 を再現する。"""
+    body = {
+        "type": "error",
+        "error": {
+            "type": "invalid_request_error",
+            "message": (
+                "Your credit balance is too low to access the Anthropic API. "
+                "Please go to Plans & Billing to upgrade or purchase credits."
+            ),
+        },
+    }
+    return anthropic.BadRequestError(
+        message=body["error"]["message"],
+        response=MagicMock(status_code=400, headers={}),
+        body=body,
+    )
+
+
+def _auth_error() -> anthropic.AuthenticationError:
+    return anthropic.AuthenticationError(
+        message="invalid x-api-key",
+        response=MagicMock(status_code=401, headers={}),
+        body=None,
+    )
+
+
+def _permission_error() -> anthropic.PermissionDeniedError:
+    return anthropic.PermissionDeniedError(
+        message="Request not allowed",
+        response=MagicMock(status_code=403, headers={}),
+        body=None,
+    )
+
+
+def _request_specific_bad_request() -> anthropic.BadRequestError:
+    """特定 PDF 固有の 400（プロンプト過大など）。ラン全体を止めてはいけない。"""
+    return anthropic.BadRequestError(
+        message="prompt is too long: 250000 tokens > 200000 maximum",
+        response=MagicMock(status_code=400, headers={}),
+        body=None,
+    )
 
 
 def _valid_payload(comment: str = "テストコメント本文（200文字以上の想定）") -> str:
@@ -179,6 +225,113 @@ class TestGenerateCommentWithMetadata(unittest.TestCase):
         mock_client.messages.create.return_value = mock_response
         with self.assertRaises(ValueError):
             generate_comment_with_metadata("PDF全文", max_retries=1)
+
+
+class TestIsPermanentRunFailure(unittest.TestCase):
+    """``is_permanent_run_failure`` は「以降のどの API 呼び出しも必ず失敗する」
+    恒久条件（残高不足 / 認証 / 権限）だけを True と判定する。一過性エラーや
+    PDF 固有の 400 は False（＝従来通り per-PDF fail-soft / リトライ）。"""
+
+    def test_credit_balance_too_low_is_permanent(self):
+        self.assertTrue(is_permanent_run_failure(_credit_balance_error()))
+
+    def test_authentication_error_is_permanent(self):
+        self.assertTrue(is_permanent_run_failure(_auth_error()))
+
+    def test_permission_denied_error_is_permanent(self):
+        self.assertTrue(is_permanent_run_failure(_permission_error()))
+
+    def test_request_specific_bad_request_is_not_permanent(self):
+        # プロンプト過大など、その PDF 固有の 400 はラン全体を止めない。
+        self.assertFalse(is_permanent_run_failure(_request_specific_bad_request()))
+
+    def test_rate_limit_error_is_not_permanent(self):
+        # 一過性。リトライ対象であり、ラン停止条件ではない。
+        rate = anthropic.RateLimitError(
+            message="rate limit",
+            response=MagicMock(status_code=429, headers={}),
+            body=None,
+        )
+        self.assertFalse(is_permanent_run_failure(rate))
+
+    def test_internal_server_error_is_not_permanent(self):
+        err = anthropic.InternalServerError(
+            message="overloaded",
+            response=MagicMock(status_code=500, headers={}),
+            body=None,
+        )
+        self.assertFalse(is_permanent_run_failure(err))
+
+    def test_billing_wording_variants_are_permanent(self):
+        # message 表現が変わっても billing 系の語を含めば恒久扱い。
+        for msg in (
+            "Your credit balance is too low.",
+            "Please go to Plans & Billing to upgrade.",
+            "billing issue: purchase credits to continue",
+        ):
+            err = anthropic.BadRequestError(
+                message=msg,
+                response=MagicMock(status_code=400, headers={}),
+                body=None,
+            )
+            self.assertTrue(
+                is_permanent_run_failure(err), f"should be permanent: {msg!r}"
+            )
+
+    def test_non_anthropic_exception_is_not_permanent(self):
+        self.assertFalse(is_permanent_run_failure(ValueError("boom")))
+
+
+class TestGenerateCommentRaisesPermanentImmediately(unittest.TestCase):
+    """``generate_comment_with_metadata`` は恒久エラーを **リトライせず** 即座に
+    ``PermanentRunFailureError`` として送出する（無駄な API 再試行をしない）。"""
+
+    @patch("src.comment_generator._create_client")
+    @patch("src.comment_generator.time.sleep")
+    def test_credit_balance_raises_permanent_without_retry(
+        self, mock_sleep, mock_create_client,
+    ):
+        mock_client = MagicMock()
+        mock_create_client.return_value = mock_client
+        mock_client.messages.create.side_effect = _credit_balance_error()
+
+        with self.assertRaises(PermanentRunFailureError):
+            generate_comment_with_metadata("PDF全文", max_retries=3)
+
+        # 恒久エラーはリトライしない（1 回だけ呼ぶ・sleep しない）
+        self.assertEqual(mock_client.messages.create.call_count, 1)
+        mock_sleep.assert_not_called()
+
+    @patch("src.comment_generator._create_client")
+    @patch("src.comment_generator.time.sleep")
+    def test_authentication_error_raises_permanent_without_retry(
+        self, mock_sleep, mock_create_client,
+    ):
+        mock_client = MagicMock()
+        mock_create_client.return_value = mock_client
+        mock_client.messages.create.side_effect = _auth_error()
+
+        with self.assertRaises(PermanentRunFailureError):
+            generate_comment_with_metadata("PDF全文", max_retries=3)
+        self.assertEqual(mock_client.messages.create.call_count, 1)
+        mock_sleep.assert_not_called()
+
+    @patch("src.comment_generator._create_client")
+    @patch("src.comment_generator.time.sleep")
+    def test_request_specific_bad_request_still_raises_bad_request(
+        self, mock_sleep, mock_create_client,
+    ):
+        # PDF 固有の 400 は従来通り BadRequestError のまま raise（per-PDF で
+        # 呼び出し側が握りつぶす）。PermanentRunFailureError には変換しない。
+        mock_client = MagicMock()
+        mock_create_client.return_value = mock_client
+        mock_client.messages.create.side_effect = _request_specific_bad_request()
+
+        with self.assertRaises(anthropic.BadRequestError) as ctx:
+            generate_comment_with_metadata("PDF全文", max_retries=2)
+        self.assertNotIsInstance(ctx.exception, PermanentRunFailureError)
+        # 恒久ではない 400 もリトライしない（即 raise）→ create は 1 回
+        self.assertEqual(mock_client.messages.create.call_count, 1)
 
 
 class TestCreateBatchRequests(unittest.TestCase):
