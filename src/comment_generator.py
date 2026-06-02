@@ -59,6 +59,80 @@ def _backoff_seconds(attempt: int) -> float:
     return base + random.uniform(0.0, 1.0)
 
 
+# Batch 系 API 呼び出し（submit / status / results）の既定リトライ回数。
+# ``generate_comment_with_metadata`` の既定（5）と揃える。本番 GitHub Actions ラン
+# （run_id=26811653746）で ``get_batch_status`` 内の 503 が 1 度も再試行されずに
+# 即送出され、3 時間のポーリング待機が水の泡になった事象への対処。
+_BATCH_API_MAX_RETRIES = 5
+
+
+def _call_with_retries(
+    sdk_call: Any,
+    *,
+    operation: str,
+    max_retries: int = _BATCH_API_MAX_RETRIES,
+) -> Any:
+    """Anthropic SDK 呼び出しを 1 回ラップして「一過性リトライ + 恒久即停止」を適用する。
+
+    Batch 系 3 関数（``submit_batch`` / ``get_batch_status`` / ``get_batch_results``）
+    で同一の挙動を担保するための共通化。過度な抽象化を避けるため、各関数の
+    except ブロックを置き換える程度に留める（ジェネレータ／HTTP リトライポリシ
+    ／メトリクス送信などは一切持たない）。
+
+    Args:
+        sdk_call: 引数 0 個の callable。SDK の 1 回の呼び出し（``lambda: client.x.y(z)``）。
+        operation: 運用ログ向けのオペレーション名（例 ``"batches.retrieve"``）。
+        max_retries: 一過性エラー時の最大リトライ回数。既定 5。
+
+    Returns:
+        ``sdk_call()`` の戻り値。
+
+    Raises:
+        ``PermanentRunFailureError``: 残高不足/認証/権限など、以降の API 呼び出しも
+            必ず失敗する恒久エラー。リトライしない（``is_permanent_run_failure``）。
+        ``anthropic.BadRequestError``: 恒久ではない 400（プロンプト過大など）。
+            リトライしない（呼び出し側で個別に握りつぶす設計）。
+        ``anthropic.RateLimitError`` / ``InternalServerError`` / ``APITimeoutError``
+            / ``APIConnectionError`` / ``OverloadedError``: 一過性。``max_retries``
+            まで指数バックオフ + ジッターで再試行し、上限到達で原例外を再送出。
+    """
+    for attempt in range(max_retries + 1):
+        try:
+            return sdk_call()
+        except (
+            anthropic.AuthenticationError,
+            anthropic.PermissionDeniedError,
+            anthropic.BadRequestError,
+        ) as e:
+            # 恒久エラー（残高不足 / 認証 / 権限）はリトライしない。
+            if is_permanent_run_failure(e):
+                logger.error(
+                    f"恒久エラー検知（残高不足/認証/権限）→ {operation} を中止: {e}"
+                )
+                raise PermanentRunFailureError(str(e)) from e
+            # billing と無関係な request-specific 400（Batch 系でも稀に発生）は
+            # 一過性ではないため、リトライせず原例外を再送出する。
+            raise
+        except _RETRYABLE_API_ERRORS as e:
+            if attempt < max_retries:
+                wait = _backoff_seconds(attempt)
+                logger.warning(
+                    f"API一過性エラー [{operation}] "
+                    f"(試行{attempt + 1}/{max_retries + 1}): {e}. "
+                    f"{wait:.1f}秒後にリトライ..."
+                )
+                time.sleep(wait)
+            else:
+                logger.error(
+                    f"API一過性エラー [{operation}]: リトライ上限到達: {e}"
+                )
+                raise
+
+    raise RuntimeError(
+        f"unreachable: {operation} retry loop exited without return or raise"
+    )
+
+
 # ── ラン全体で恒久的に失敗する条件（fail-fast） ──
 # 本番 GitHub Actions ランで、ランの途中で Anthropic のクレジット残高が尽き、
 # 残り 49 件すべてが ``credit balance is too low`` の 400 になった事象への対処。
@@ -713,6 +787,12 @@ def create_batch_requests(
 def submit_batch(items: list[dict]) -> str:
     """Batch APIにリクエストを一括送信する。
 
+    一過性エラー（429/5xx/529 過負荷/接続/タイムアウト）は ``_call_with_retries``
+    が指数バックオフ + ジッターで最大 ``_BATCH_API_MAX_RETRIES`` 回再試行する。
+    恒久エラー（残高不足/認証/権限）は ``PermanentRunFailureError`` に変換され
+    即送出（fail-fast、リトライしない）。本番 GHA で 503 が 1 度返っただけで
+    バッチ送信が落ちる事故への対処。
+
     Args:
         items: create_batch_requestsと同じ形式のリスト
 
@@ -723,23 +803,10 @@ def submit_batch(items: list[dict]) -> str:
     requests = create_batch_requests(items)
 
     logger.info(f"Batch API送信: {len(requests)}件")
-
-    # バッチ作成時に残高不足/認証/権限の恒久エラーが起きたら、即停止できるよう
-    # PermanentRunFailureError に変換する（通常モードと同じ fail-fast 方針）。
-    try:
-        batch = client.messages.batches.create(requests=requests)
-    except (
-        anthropic.AuthenticationError,
-        anthropic.PermissionDeniedError,
-        anthropic.BadRequestError,
-    ) as e:
-        if is_permanent_run_failure(e):
-            logger.error(
-                f"恒久エラー検知（残高不足/認証/権限）→ バッチ送信を中止: {e}"
-            )
-            raise PermanentRunFailureError(str(e)) from e
-        raise
-
+    batch = _call_with_retries(
+        lambda: client.messages.batches.create(requests=requests),
+        operation="batches.create",
+    )
     logger.info(f"Batch作成完了: ID={batch.id}, ステータス={batch.processing_status}")
     return batch.id
 
@@ -747,24 +814,19 @@ def submit_batch(items: list[dict]) -> str:
 def get_batch_status(batch_id: str) -> dict[str, Any]:
     """バッチの処理ステータスを取得する。
 
+    本番 GHA ラン（run_id=26811653746）で 3 時間ポーリングの最後の 1 回が
+    503 ``overloaded_error`` を返してリトライされず即送出され、待機が水の泡に
+    なった事象への対処。``_call_with_retries`` が一過性エラーを指数バックオフで
+    吸収する（既定 5 回）。恒久エラーは ``PermanentRunFailureError`` に変換。
+
     Returns:
         {"status": str, "results_url": str | None, ...}
     """
     client = _create_client()
-    try:
-        batch = client.messages.batches.retrieve(batch_id)
-    except (
-        anthropic.AuthenticationError,
-        anthropic.PermissionDeniedError,
-        anthropic.BadRequestError,
-    ) as e:
-        if is_permanent_run_failure(e):
-            logger.error(
-                f"恒久エラー検知（残高不足/認証/権限）→ バッチ状態取得を中止: {e}"
-            )
-            raise PermanentRunFailureError(str(e)) from e
-        raise
-
+    batch = _call_with_retries(
+        lambda: client.messages.batches.retrieve(batch_id),
+        operation="batches.retrieve",
+    )
     return {
         "id": batch.id,
         "status": batch.processing_status,
@@ -783,6 +845,11 @@ def get_batch_results(
 ) -> tuple[dict[str, dict[str, str]], list[str]]:
     """バッチの結果を取得し、構造化出力をパースする。
 
+    結果ストリームの取得自体（``batches.results``）も Batch 送信と同じく一過性
+    エラーリトライ対象。``_call_with_retries`` が指数バックオフで吸収する。
+    結果イテレーション中に途中で接続が切れる場合はストリーム側の責務（Anthropic
+    SDK 内部の HTTP リトライ）。
+
     Returns:
         (results, failed_ids) のタプル。
         results: ``{custom_id: {clinic_name, person_name, sample_title, comment}}``
@@ -792,19 +859,10 @@ def get_batch_results(
     results: dict[str, dict[str, str]] = {}
     failed_ids: list[str] = []
 
-    try:
-        batch_results = client.messages.batches.results(batch_id)
-    except (
-        anthropic.AuthenticationError,
-        anthropic.PermissionDeniedError,
-        anthropic.BadRequestError,
-    ) as e:
-        if is_permanent_run_failure(e):
-            logger.error(
-                f"恒久エラー検知（残高不足/認証/権限）→ バッチ結果取得を中止: {e}"
-            )
-            raise PermanentRunFailureError(str(e)) from e
-        raise
+    batch_results = _call_with_retries(
+        lambda: client.messages.batches.results(batch_id),
+        operation="batches.results",
+    )
 
     for result in batch_results:
         custom_id = result.custom_id

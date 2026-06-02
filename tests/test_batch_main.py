@@ -10,6 +10,8 @@ import sys
 import unittest
 from unittest.mock import MagicMock, patch
 
+import anthropic
+
 from src import batch_main
 from src.comment_generator import PermanentRunFailureError
 from src.config import LOGS_DIR
@@ -1307,6 +1309,64 @@ class TestBatchStateFilesPersistence(unittest.TestCase):
                 loaded = batch_main._load_results_from_disk()
                 self.assertEqual(loaded, results)
 
+    @patch("src.batch_main.comment_generator")
+    def test_step2_persists_batch_id_atomically(self, mock_gen):
+        """``step2_submit_batch`` が batch_id を atomic write で永続化する。
+
+        Anthropic Batch は 29 日保持されるため、step3 が落ちても
+        ``--step results --batch-id <id>`` で再開できる。書き込み中クラッシュで
+        ``batch_id.txt`` が空 / 半端な値になると再開不能になるため atomic。
+        """
+        from pathlib import Path as _P
+        import tempfile as _tf
+        mock_gen.submit_batch.return_value = "batch_real_id_1234567890"
+        with _tf.TemporaryDirectory() as tmp:
+            with patch.object(batch_main, "LOGS_DIR", _P(tmp)):
+                batch_id = batch_main.step2_submit_batch(
+                    _make_batch_items(["001-01-1新規.pdf"])
+                )
+                self.assertEqual(batch_id, "batch_real_id_1234567890")
+                # 永続ファイルに正しく書かれている
+                self.assertEqual(
+                    (_P(tmp) / "batch_id.txt").read_text(),
+                    "batch_real_id_1234567890",
+                )
+                # tmp ファイルは残らない（atomic rename 完了）
+                self.assertFalse((_P(tmp) / "batch_id.txt.tmp").exists())
+
+    @patch("src.batch_main.comment_generator")
+    def test_run_resume_from_step_results_loads_batch_id(self, mock_gen):
+        """``run(step="results", batch_id=None)`` は disk の batch_id を読み戻す。
+
+        本番事象の再開シナリオの回帰防止。step3 が 503 で死んだ後、
+        オペレータが ``--step results`` で別 GHA 実行を起こしたとき、
+        ``logs/batch_id.txt`` から自動で batch_id をロードして結果取得に進む。
+        """
+        from pathlib import Path as _P
+        import tempfile as _tf
+        ok_status = {
+            "id": "batch_persisted", "status": "ended",
+            "request_counts": {
+                "processing": 0, "succeeded": 1,
+                "errored": 0, "canceled": 0, "expired": 0,
+            },
+        }
+        mock_gen.get_batch_status.return_value = ok_status
+        mock_gen.get_batch_results.return_value = ({"item_0001": {
+            "clinic_name": "X", "person_name": "Y",
+            "sample_title": "Z", "comment": "C" * 50,
+        }}, [])
+        with _tf.TemporaryDirectory() as tmp:
+            tmp_path = _P(tmp)
+            (tmp_path / "batch_id.txt").write_text("batch_persisted")
+            with patch.object(batch_main, "LOGS_DIR", tmp_path), \
+                 patch.object(batch_main.discover, "resolve_run_config",
+                              return_value=_make_profile()), \
+                 patch.object(batch_main, "step4_generate_pdfs") as mock_step4:
+                batch_main.run(batch_mode=True, step="results", batch_id=None)
+                # batch_id を disk から読んで step3 が呼ばれた
+                mock_gen.get_batch_status.assert_called_once_with("batch_persisted")
+
 
 class TestBatchGmailDraftsToggle(unittest.TestCase):
     """ENABLE_GMAIL_DRAFTS による下書き作成 ON/OFF（Batchモード）。"""
@@ -1332,6 +1392,138 @@ class TestBatchGmailDraftsToggle(unittest.TestCase):
         """ON のとき従来どおり create_draft が呼ばれる。"""
         batch_main._create_grouped_drafts_for_batch([self._item()])
         mock_gmail.create_draft.assert_called_once()
+
+
+class TestStep3PollingResilience(unittest.TestCase):
+    """``step3_wait_and_get_results`` のポーリングループ自体の例外耐性。
+
+    本番 GHA ラン（run_id=26811653746, 3h22m）で、``get_batch_status`` 内の
+    ``client.messages.batches.retrieve(batch_id)`` が 503 ``overloaded_error``
+    を 1 度返しただけで、``step3_wait_and_get_results`` の ``while`` ループを
+    抜けて Traceback。3 時間ぶんの待機が水の泡になった。
+
+    多層防御：
+      (a) ``get_batch_status`` 内で一過性エラーは指数バックオフリトライ
+          （``TestBatchApiRetriesOnTransientErrors`` 参照）。
+      (b) **更にその上**、本テストで担保するように、ポーリングループ自体も
+          1 回のステータス取得失敗で打ち切らず ``poll_interval`` 待って continue。
+          ``PermanentRunFailureError`` は即 raise（fail-fast、PR #46 と同じ方針）。
+          ``max_wait`` は維持。
+    """
+
+    def _transient_503(self) -> anthropic.InternalServerError:
+        return anthropic.InternalServerError(
+            message="Error code: 503 - overloaded_error",
+            response=MagicMock(status_code=503, headers={}),
+            body={
+                "type": "overloaded_error",
+                "message": "API key validation is temporarily unavailable. Please retry.",
+            },
+        )
+
+    @patch("src.batch_main._save_results_to_disk")
+    @patch("src.batch_main.comment_generator")
+    @patch("src.batch_main.time.sleep")
+    def test_polling_continues_when_get_status_raises_transient(
+        self, mock_sleep, mock_gen, mock_save,
+    ):
+        """1 回の ``get_batch_status`` が一過性例外を投げてもループ継続。
+
+        get_batch_status のリトライ上限を超えて例外が漏れてきても、ポーリングは
+        ``poll_interval`` 待って次イテレーションへ進む。次回 OK なら結果取得まで到達する。
+        """
+        ok_status = {
+            "id": "batch_xx",
+            "status": "ended",
+            "request_counts": {
+                "processing": 0, "succeeded": 5,
+                "errored": 0, "canceled": 0, "expired": 0,
+            },
+        }
+        mock_gen.get_batch_status.side_effect = [
+            self._transient_503(),  # 1 回目: 503 漏れ（ループは continue）
+            ok_status,              # 2 回目: 成功（ended → break）
+        ]
+        mock_gen.get_batch_results.return_value = ({"item_0001": {
+            "clinic_name": "X", "person_name": "Y",
+            "sample_title": "Z", "comment": "C",
+        }}, [])
+
+        results = batch_main.step3_wait_and_get_results(
+            "batch_xx", poll_interval=1, max_wait=10,
+        )
+        self.assertEqual(len(results), 1)
+        self.assertEqual(mock_gen.get_batch_status.call_count, 2)
+        mock_gen.get_batch_results.assert_called_once_with("batch_xx")
+
+    @patch("src.batch_main._save_results_to_disk")
+    @patch("src.batch_main.comment_generator")
+    @patch("src.batch_main.time.sleep")
+    def test_polling_halts_immediately_on_permanent_failure(
+        self, mock_sleep, mock_gen, mock_save,
+    ):
+        """``PermanentRunFailureError`` はループ内で握りつぶさず即 raise（fail-fast）。
+
+        恒久エラー（残高不足/認証/権限）はリトライしても必ず失敗するため、
+        ループを継続せず即停止して呼び出し側へ伝播する（PR #46 と同じ方針）。
+        """
+        mock_gen.PermanentRunFailureError = PermanentRunFailureError  # 経由参照対策
+        mock_gen.get_batch_status.side_effect = PermanentRunFailureError(
+            "Anthropic API の認証エラーのため処理を中止しました。"
+        )
+        with self.assertRaises(PermanentRunFailureError):
+            batch_main.step3_wait_and_get_results(
+                "batch_xx", poll_interval=1, max_wait=10,
+            )
+        # 1 回呼んで即 raise（リトライしない・get_batch_results に到達しない）
+        self.assertEqual(mock_gen.get_batch_status.call_count, 1)
+        mock_gen.get_batch_results.assert_not_called()
+
+    @patch("src.batch_main._save_results_to_disk")
+    @patch("src.batch_main.comment_generator")
+    @patch("src.batch_main.time.sleep")
+    def test_polling_respects_max_wait_with_continuous_transient(
+        self, mock_sleep, mock_gen, mock_save,
+    ):
+        """一過性エラーが続いても ``max_wait`` を超えたら TimeoutError で停止。
+
+        無限ループにならず、上限時間（既定 86400 秒）を必ず守る。
+        ``poll_interval=10, max_wait=30`` で 4 周（0/10/20/30）し、4 周目で
+        ``elapsed >= max_wait`` の判定により break。
+        """
+        mock_gen.get_batch_status.side_effect = self._transient_503()
+        with self.assertRaises(TimeoutError):
+            batch_main.step3_wait_and_get_results(
+                "batch_xx", poll_interval=10, max_wait=30,
+            )
+        # 一度も成功しないため get_batch_results に到達しない
+        mock_gen.get_batch_results.assert_not_called()
+
+    @patch("src.batch_main._save_results_to_disk")
+    @patch("src.batch_main.comment_generator")
+    @patch("src.batch_main.time.sleep")
+    def test_polling_normal_path_unchanged(
+        self, mock_sleep, mock_gen, mock_save,
+    ):
+        """既存挙動の保持：例外が起きない正常系では従来通り 1 回で ended → 結果取得。"""
+        ok_status = {
+            "id": "batch_xx", "status": "ended",
+            "request_counts": {
+                "processing": 0, "succeeded": 3,
+                "errored": 0, "canceled": 0, "expired": 0,
+            },
+        }
+        mock_gen.get_batch_status.return_value = ok_status
+        mock_gen.get_batch_results.return_value = ({"k": {
+            "clinic_name": "", "person_name": "",
+            "sample_title": "", "comment": "x",
+        }}, [])
+        results = batch_main.step3_wait_and_get_results(
+            "batch_xx", poll_interval=60, max_wait=86400,
+        )
+        self.assertEqual(len(results), 1)
+        mock_gen.get_batch_status.assert_called_once_with("batch_xx")
+        mock_gen.get_batch_results.assert_called_once_with("batch_xx")
 
 
 class TestBatchFailFastOnPermanentError(unittest.TestCase):
