@@ -11,6 +11,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from src import batch_main
+from src.comment_generator import PermanentRunFailureError
 from src.config import LOGS_DIR
 from src.discover import DiscoveredContext
 from src.profile import ProfileConfig
@@ -1331,6 +1332,52 @@ class TestBatchGmailDraftsToggle(unittest.TestCase):
         """ON のとき従来どおり create_draft が呼ばれる。"""
         batch_main._create_grouped_drafts_for_batch([self._item()])
         mock_gmail.create_draft.assert_called_once()
+
+
+class TestBatchFailFastOnPermanentError(unittest.TestCase):
+    """Batch モードでも、バッチ作成・送信時に残高/認証/権限の恒久エラーが
+    起きたら即停止する。``submit_batch`` が ``PermanentRunFailureError`` を
+    上げたら、それを握りつぶさず ``run`` の外へ伝播させ、後続ステップ
+    （結果取得 / PDF 生成）を実行しない。
+    """
+
+    @patch("src.batch_main.comment_generator")
+    def test_step2_submit_propagates_permanent_failure(self, mock_gen):
+        """``submit_batch`` の恒久エラーは ``step2_submit_batch`` から伝播する。"""
+        mock_gen.submit_batch.side_effect = PermanentRunFailureError(
+            "Anthropic API のクレジット残高不足のため処理を中止しました。"
+        )
+        items = _make_batch_items(["001-01-1新規.pdf"])
+        with self.assertRaises(PermanentRunFailureError):
+            batch_main.step2_submit_batch(items)
+
+    @patch("src.batch_main.step4_generate_pdfs")
+    @patch("src.batch_main.step3_wait_and_get_results")
+    @patch("src.batch_main.step2_submit_batch")
+    @patch("src.batch_main.step1_prepare")
+    @patch("src.batch_main.discover.resolve_run_config")
+    def test_run_halts_at_submit_and_skips_results_and_pdfs(
+        self,
+        mock_resolve,
+        mock_step1,
+        mock_step2,
+        mock_step3,
+        mock_step4,
+    ):
+        """``run(step="all")`` は submit の恒久エラーで停止し、step3/step4 を
+        呼ばない（無駄に結果取得 / PDF 生成へ進まない）。"""
+        mock_resolve.return_value = _make_profile()
+        mock_step1.return_value = _make_batch_items(["001-01-1新規.pdf"])
+        mock_step2.side_effect = PermanentRunFailureError(
+            "Anthropic API のクレジット残高不足のため処理を中止しました。"
+        )
+
+        with self.assertRaises(PermanentRunFailureError):
+            batch_main.run(batch_mode=True, step="all")
+
+        mock_step2.assert_called_once()
+        mock_step3.assert_not_called()
+        mock_step4.assert_not_called()
 
 
 if __name__ == "__main__":

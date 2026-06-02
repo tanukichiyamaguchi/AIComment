@@ -162,6 +162,40 @@ PR #36 で参加者マスターの A 列を 2 セグメント管理番号 (``xxx
 誤発送の両方を防ぐ。実装例: `src/sheets_client.lookup_email_by_clinic_and_person`
 / `_normalize_person_name` / `_levenshtein_distance`。
 
+### P-024: 「ラン全体で恒久的に失敗する条件」は per-item fail-soft と分離して即停止せよ（fail-fast）
+本番 GHA ラン（164 件）で、途中で Anthropic のクレジット残高が尽き、88 件成功
+後の残り 49 件が**全件** `BadRequestError`（`credit balance is too low`）になった。
+当時の `main.run` / `batch_main.step4` は各 PDF の例外を一律
+`except Exception: stats['error'] += 1; continue` で握りつぶしていたため、
+「以降のどの API 呼び出しも必ず失敗する」恒久条件でも 49 回ぶん無駄に
+API を叩き、エラーログを乱立させた。per-PDF の fail-soft（1 件固有の失敗で
+全体を止めない）は正しいが、それは「リトライ/スキップすれば次は成功し得る」
+一過性・item 固有エラーにのみ妥当で、残高切れ・認証(401)・権限(403)のような
+**run-wide permanent failure** に適用すると「確実に失敗する処理を N 回繰り返す」
+アンチパターンになる。**Rule**: 外部 API を item ループで叩くバッチ処理では、
+捕捉した例外を「(a) その item 固有の失敗（→ ログ + continue）」「(b) ラン全体が
+継続不能な恒久条件（→ 即停止）」に**必ず型・内容で分類**する。判定は
+**例外の型**（`AuthenticationError`/`PermissionDeniedError`）と、汎用 400 の中の
+**message 内容**（billing 文言 `credit balance` / `billing` / `purchase credits` 等を
+含むか）で行う。billing と無関係な request-specific 400（プロンプト過大など）は
+従来通り per-item fail-soft（ラン全体を止めない）。恒久条件は専用例外
+（`comment_generator.PermanentRunFailureError`）に正規化し、(1) `generate_comment_with_metadata`
+はリトライせず即送出（一過性リトライ tuple に混ぜない）、(2) 呼び出し側ループは
+break して残り item を処理しない、(3) 成功済みの成果物 flush と一時ファイル
+削除は済ませてから、(4) 例外を再送出して GHA ジョブを**非ゼロ終了**させる
+（silent return は「未処理 49 件があるのにワークフローが緑」になり事故）。
+注意: `except SomeError` の `SomeError` を**モジュール経由参照**
+（`comment_generator.PermanentRunFailureError`）で書くと、テストで
+`comment_generator` モジュール全体がモックされたとき `except <MagicMock>` で
+`TypeError` になり既存テストを巻き込む。例外クラスは呼び出し側モジュールへ
+**直接 import**（`from src.comment_generator import PermanentRunFailureError`）して、
+`except` 節がモックに依存しないようにすること。これは堅牢化であり、49 件の
+エラー自体の消去にはクレジット追加（請求側対応）が別途必要。実装例:
+`src/comment_generator.is_permanent_run_failure` / `PermanentRunFailureError`
+/ `permanent_failure_message`、`src/main.run` の `except PermanentRunFailureError`
++ break、Batch は `submit_batch` / `get_batch_status` / `get_batch_results` で
+変換し `step2`/`step3` 経由で `run` 外へ伝播。
+
 ## Session Log
 - **2026-03-16**: Project initialized with workflow orchestration architecture.
 - **2026-05-01**: Added 5-agent team and 3 deterministic check scripts to handle 1000+ PDF scale. Each agent owns one of the failure modes in P-001 through P-005. See `tasks/todo.md` Phase 6 for the standard operating sequence.
@@ -202,3 +236,4 @@ PR #36 で参加者マスターの A 列を 2 セグメント管理番号 (``xxx
 - **2026-05-29**: 医院フォルダ名を参加者マスターの確定医院名へ同期（既存フォルダもリネーム、P-019 の限定的緩和）。要望は「PDF（ファイル名先頭）の医院番号 → 参加者マスター照合 → 医院名をフォルダ名に反映」。新規フォルダは P-021 で既にマスター医院名を最優先使用済みだったが、**同じ医院番号の既存フォルダは P-019 の「リネームしない」仕様で再利用時に旧名のまま**残り、マスター登録前に AI 抽出名で作られたフォルダにマスター医院名が反映されなかった（＝真の gap）。対応: `find_or_create_clinic_folder` / `upload_pdf_to_clinic_person` に `clinic_name_authoritative: bool = False` を追加。**マスター由来の確定名のときだけ**（`bool(clinic_name_from_master)`）、既存フォルダ名が確定名と異なれば `files().update` でリネーム。AI 抽出値（`authoritative=False`）ではリネームしない＝`三浦歯科` ↔ `三浦歯科医院` の往復 churn を防ぐ P-019 の意図は維持。リネームはフォルダ ID・URL 不変なので医院フォルダ URL シートの既存リンクは保持。リネーム失敗は WARNING のみで続行（フォルダ ID で処理継続、1000 件中 1 件の失敗で全体を止めない）。呼び出し 3 経路（main / batch_main 本体 / batch_main 添付資料）で確定判定を渡す（添付資料は `master_records` から再判定）。テスト 507 → 511 件（rename 実行 / 一致時無動作 / 非確定時非リネーム / 失敗非致命 の 4 件）。教訓: (1) **要望された機能が「ほぼ既存」のとき、本当の差分は意図的な設計判断の中にある**。今回の真の gap は P-019 の「リネームしない」で、新規命名ロジックではなかった。コードを読み「どこまで出来ていて何が足りないか」を特定してから実装方針を確認した。(2) **音声入力由来の用語ゆれ（委員 vs 医院）と無関係な末尾句（準備中）は実装前に必ず確認する**。コードベースの実語彙（医院 / 参加者）に照らして 3 点確認し、「委員＝医院の言い間違い」「準備中は無視」と判明、誤実装を回避。(3) **意図的な抑制（P-019 のリネーム停止）を緩和するときは元の意図を壊さない条件を足す**。"authoritative なソース由来のときだけ" という条件で churn 防止（元の目的）と反映（新要望）を両立。
 - **2026-05-29**: 自動検出モードの参加者マスター参照先を共有「参加者マスター」へ変更（F-09 を撤回）。ユーザー報告「フォルダ名の医院名がスプレッドシートの医院名と一致しない」の根本原因。自動検出モード（`--target-folder テストN`）は F-09（P-022）で `master_sheet_name = f"{target_folder_name}_参加者マスター"`（例 `テスト9_参加者マスター`）を読んでいたが、ユーザーは実データを共有の `参加者マスター` タブに入力していた。システムは空の per-folder タブ（`read_master_records` がヘッダーのみで自動作成）を読み → `lookup_clinic_name` が "" を返し → 医院名が AI 抽出値にフォールバック → フォルダ名がマスター医院名と不一致、かつ Gmail 下書きも宛先空、という事故が起きていた。対応: `discover.RunConfig.from_discovered` の `master_sheet_name` を `MASTER_SHEET_NAME`（共有 `参加者マスター`）に変更。これでプロファイルモード・自動検出モードの両方が同じ共有タブを読む。トレードオフ: F-09 が防いでいた「全セミナー共有タブによるセミナー取り違え」リスクは運用規律に委ねる（実行前に `参加者マスター` の中身を対象セミナーのデータへ差し替える＝ユーザーの既存運用、2026-05-26 エントリと整合）。下書きは自動送信されない（レビュー前提）ため、誤タブのままでも送信事故には直結しない。test_discover の F-09 回帰テスト 2 件を「共有タブを読む」検証に置換（511 件維持）。README の医院フォルダ命名記述も PR #41 のリネーム挙動に合わせて正確化。教訓: (1) **「安全のための分離」と「ユーザーの実運用」が食い違うと、分離はサイレントな空読みを生む**。F-09 は誤送信を防ぐ意図だったが、ユーザーが共有タブ運用だったため逆に「マスター未参照」を量産した。安全機構は実運用フローに沿わせる（沿わせられないなら空タブ実行時に明示警告/HARD FAIL で気づかせる — `read_master_records` の 0 件 WARNING は既にあるが運用者の目に入っていなかった）。(2) **同一論点で過去に相反する判断（2026-05-26 の単一タブ運用 vs F-09 の per-folder 分離）が残っていると事故になる**。最新のユーザー意図を確認して一方に寄せ、矛盾を残さない。
 - **2026-05-29**: CI「Python テスト」の transient 失敗を root-cause 修正（フォント DL リトライ）。PR #42 で CI のみ失敗（ローカル / clean worktree / 最新依存 venv の全てで 511 passed のため再現せず）。原因: `test_pdf_creator` / `test_pdf_merger` が実 `ensure_fonts()` を呼び、`assets/*.ttf`（.gitignore で fresh checkout に不在）を GitHub raw から都度ダウンロードしていた。リトライ無しのため一時的ネットワーク障害（5xx / タイムアウト）で即 `RuntimeError` → テスト失敗。ローカルはフォントがキャッシュ済みで早期 return するため再現しない（＝CI 限定 flaky の典型）。修正: `ensure_fonts()` を指数バックオフ（2/4/8 秒）最大 4 回リトライ化（P-017 と同思想、本番 1000 件実行の CDN 一時障害耐性も向上）。未使用の `fonts` dict / `base_url` を削除。pytest 511 → 514 件。教訓: (1) **テストが実ネットワーク I/O に依存すると CI 限定 flaky になる**。ローカルはキャッシュ / 既存ファイルで隠れて気づけない。CI-only 失敗は「fresh checkout で初めて走る I/O（DL・ファイル生成）」をまず疑う。(2) **切り分けは CI 環境に寄せる**（clean worktree + 最新依存 venv）。それでも再現しなければ「外部依存 × 実行タイミング」を疑う。(3) **外部取得は最初からリトライ前提で書く**（quota 用 throttle とは別に、一過性エラー用のバックオフ retry）。
+- **2026-06-02**: 本番ラン途中のクレジット切れに fail-fast 停止を導入（reproduce-first、P-024）。本番 GHA ラン 164 件中 49 件が同一エラー `BadRequestError: credit balance is too low` で失敗（88 件成功 → 残高ゼロ → 残り全件失敗）。真因は請求側（残高切れ）で、本 PR はそれを早期検知して停止する**堅牢化**（49 件の実消去にはクレジット追加が必要）。RCA: `main.run` / `batch_main` が per-PDF 例外を一律 `except Exception: continue` で握りつぶし、「以降のどの API 呼び出しも必ず失敗する恒久条件」と「1 件固有の失敗」を区別していなかったため、残高切れ後も 49 回無駄に API を叩きエラーログを乱立させた。reproduce-first で先に失敗テスト（残高切れ 400 / 認証エラーをモックし「ランが即停止し残り PDF を処理しない／無駄に API を叩かない」を検証）を書いて red を確認 → 実装で green。修正: `comment_generator` に `PermanentRunFailureError` + `is_permanent_run_failure`（型 = AuthenticationError/PermissionDeniedError、汎用 400 は message の billing 文言で判定）+ `permanent_failure_message` を追加。`generate_comment_with_metadata` は恒久エラーをリトライせず即 `PermanentRunFailureError` へ変換送出（一過性リトライ tuple と分離）、request-specific 400（プロンプト過大等）は従来通り即 raise（per-PDF fail-soft）。`main.run` は `except PermanentRunFailureError` で break → 添付資料パススルーもスキップ → 成功済みの下書き flush + 一時ファイル削除 → 「中止」マーカー追記 → 例外再送出で GHA 非ゼロ終了。Batch は `submit_batch`/`get_batch_status`/`get_batch_results` の 3 Anthropic 呼び出しで変換し、`step2`/`step3` 経由で `run` 外へ自然伝播（握りつぶす except なしを確認）。横展開 grep: Anthropic 呼び出しは `comment_generator` の 4 箇所のみで全て対処済み、永続エラーを握りつぶして無駄継続する箇所は他に無し。落とし穴: `except comment_generator.PermanentRunFailureError`（モジュール経由参照）は `comment_generator` 全体をモックする既存テストで `except <MagicMock>` → `TypeError` を誘発し integration smoke 3 件を巻き込んだため、例外クラスを `main.py` へ直接 import して解消。pytest 568 → 583 件（+15: classifier 8 / 即送出 3 / main halt 2 / batch halt 2）、mypy Success 維持。reporter: 本番ログ全件解析（ユーザー報告）。
