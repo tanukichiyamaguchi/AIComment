@@ -1572,5 +1572,257 @@ class TestBatchFailFastOnPermanentError(unittest.TestCase):
         mock_step4.assert_not_called()
 
 
+class TestCustomIdForFile(unittest.TestCase):
+    """``_custom_id_for_file``: file id 由来の決定的・Anthropic 安全な custom_id。"""
+
+    def test_deterministic_and_anthropic_safe(self):
+        cid = batch_main._custom_id_for_file("1A2b_-Zk9")
+        # 同じ file id なら必ず同じ（決定的）
+        self.assertEqual(cid, batch_main._custom_id_for_file("1A2b_-Zk9"))
+        # Anthropic custom_id 制約（英数・``_``・``-`` / 1〜64 文字）に収まる
+        self.assertLessEqual(len(cid), 64)
+        self.assertRegex(cid, r"^[A-Za-z0-9_-]{1,64}$")
+
+    def test_long_or_unusual_id_falls_back_to_hash(self):
+        """64 文字超 / 異文字を含む id はハッシュにフォールバック（決定的）。"""
+        weird = "x/y z" + "Z" * 80  # 長い + ``/`` ``空白`` で制約違反
+        cid = batch_main._custom_id_for_file(weird)
+        self.assertLessEqual(len(cid), 64)
+        self.assertRegex(cid, r"^[A-Za-z0-9_-]{1,64}$")
+        # ハッシュフォールバックも決定的（同じ入力 → 同じ出力）
+        self.assertEqual(cid, batch_main._custom_id_for_file(weird))
+        # 別の id とは衝突しない
+        self.assertNotEqual(cid, batch_main._custom_id_for_file("other"))
+
+
+class TestReconstructItemsFromDrive(unittest.TestCase):
+    """``reconstruct_items_from_drive``: Drive 再走査で items 再構築（CB-4 回収）。"""
+
+    @patch("src.batch_main.drive_client")
+    def test_rebuilds_main_items_and_persists_attachments(self, mock_drive):
+        from pathlib import Path as _P
+        import tempfile as _tf
+        mock_drive.list_pdfs.return_value = [
+            {"id": "driveA", "name": "001-01-1事例.pdf"},
+            {"id": "driveB", "name": "002-02-2事例.pdf"},
+            {"id": "driveC", "name": "002-02-2【添付資料】補足.pdf"},
+            {"id": "driveD", "name": "管理番号なし【添付資料】.pdf"},
+        ]
+        profile = _make_profile(input_folder_id="in_xyz")
+        with _tf.TemporaryDirectory() as tmp:
+            with patch.object(batch_main, "LOGS_DIR", _P(tmp)):
+                items = batch_main.reconstruct_items_from_drive(profile)
+                # メインのみ items 化（添付資料は除外）
+                self.assertEqual(len(items), 2)
+                self.assertEqual(
+                    [it["custom_id"] for it in items],
+                    [batch_main._custom_id_for_file("driveA"),
+                     batch_main._custom_id_for_file("driveB")],
+                )
+                self.assertEqual(
+                    [it["pdf_data_id"] for it in items], ["driveA", "driveB"],
+                )
+                # 本文 DL しない → pdf_text を載せない
+                self.assertNotIn("pdf_text", items[0])
+                # 管理番号を持つ添付資料のみ batch_attachments.json に再構築
+                att = json.loads(
+                    (_P(tmp) / "batch_attachments.json").read_text()
+                )
+                self.assertEqual(len(att), 1)
+                self.assertEqual(att[0]["file_id"], "driveC")
+                self.assertEqual(att[0]["management_number"], "002-02-2")
+        mock_drive.list_pdfs.assert_called_once_with(folder_id="in_xyz")
+        # 軽量再構築：本文ダウンロードは一切しない
+        mock_drive.download_pdf.assert_not_called()
+
+    @patch("src.batch_main.drive_client")
+    def test_custom_id_independent_of_scan_order(self, mock_drive):
+        """走査順が入れ替わっても file→custom_id 対応は不変（位置依存しない）。
+
+        これが回収の肝。投入時と再走査時で Drive の返却順 / 重複除外が変わっても
+        同一ファイルは同じ custom_id になり、batch_results.json と突合できる。
+        """
+        from pathlib import Path as _P
+        import tempfile as _tf
+        files = [
+            {"id": "fa", "name": "001-01-1.pdf"},
+            {"id": "fb", "name": "002-02-2.pdf"},
+            {"id": "fc", "name": "003-03-3.pdf"},
+        ]
+        profile = _make_profile()
+        with _tf.TemporaryDirectory() as tmp:
+            with patch.object(batch_main, "LOGS_DIR", _P(tmp)):
+                mock_drive.list_pdfs.return_value = list(files)
+                map1 = {
+                    it["pdf_data_id"]: it["custom_id"]
+                    for it in batch_main.reconstruct_items_from_drive(profile)
+                }
+                mock_drive.list_pdfs.return_value = list(reversed(files))
+                map2 = {
+                    it["pdf_data_id"]: it["custom_id"]
+                    for it in batch_main.reconstruct_items_from_drive(profile)
+                }
+        self.assertEqual(map1, map2)
+
+
+class TestResolveItemsForStep4(unittest.TestCase):
+    """``_resolve_items_for_step4``: batch_prep.json 優先 → Drive 再走査。"""
+
+    @patch("src.batch_main.drive_client")
+    def test_prefers_batch_prep_when_present(self, mock_drive):
+        from pathlib import Path as _P
+        import tempfile as _tf
+        profile = _make_profile()
+        with _tf.TemporaryDirectory() as tmp:
+            with patch.object(batch_main, "LOGS_DIR", _P(tmp)):
+                (_P(tmp) / "batch_prep.json").write_text(json.dumps([
+                    {"custom_id": "item_0001", "pdf_data_id": "x",
+                     "pdf_file_name": "001-01-1.pdf", "pdf_text": "t"},
+                ]))
+                items = batch_main._resolve_items_for_step4(profile)
+        self.assertEqual(len(items), 1)
+        # 旧 positional custom_id のバッチも disk からそのまま復元できる
+        self.assertEqual(items[0]["custom_id"], "item_0001")
+        mock_drive.list_pdfs.assert_not_called()
+
+    @patch("src.batch_main.drive_client")
+    def test_falls_back_to_drive_when_prep_absent(self, mock_drive):
+        from pathlib import Path as _P
+        import tempfile as _tf
+        mock_drive.list_pdfs.return_value = [
+            {"id": "driveA", "name": "001-01-1事例.pdf"},
+        ]
+        profile = _make_profile(input_folder_id="in_zzz")
+        with _tf.TemporaryDirectory() as tmp:
+            with patch.object(batch_main, "LOGS_DIR", _P(tmp)):
+                items = batch_main._resolve_items_for_step4(profile)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(
+            items[0]["custom_id"], batch_main._custom_id_for_file("driveA"),
+        )
+        mock_drive.list_pdfs.assert_called_once_with(folder_id="in_zzz")
+
+    @patch("src.batch_main.drive_client")
+    def test_empty_prep_falls_back_to_drive(self, mock_drive):
+        """``batch_prep.json`` が空配列なら Drive 再走査にフォールバックする。"""
+        from pathlib import Path as _P
+        import tempfile as _tf
+        mock_drive.list_pdfs.return_value = [
+            {"id": "driveA", "name": "001-01-1事例.pdf"},
+        ]
+        profile = _make_profile()
+        with _tf.TemporaryDirectory() as tmp:
+            with patch.object(batch_main, "LOGS_DIR", _P(tmp)):
+                (_P(tmp) / "batch_prep.json").write_text("[]")
+                items = batch_main._resolve_items_for_step4(profile)
+        self.assertEqual(len(items), 1)
+        mock_drive.list_pdfs.assert_called_once()
+
+
+class TestStep4SilentZeroGuard(unittest.TestCase):
+    """results があるのに items 0 件なら loud に停止（無言の成功 0 件を防止、CB-4）。"""
+
+    @patch("src.batch_main.pdf_merger")
+    @patch("src.batch_main.pdf_creator")
+    @patch("src.batch_main.drive_client")
+    @patch("src.batch_main.sheets_client")
+    @patch("src.batch_main.ensure_fonts")
+    def test_raises_when_results_present_but_items_unresolvable(
+        self, mock_fonts, mock_sheets, mock_drive, mock_creator, mock_merger,
+    ):
+        from pathlib import Path as _P
+        import tempfile as _tf
+        # batch_prep.json も無く Drive 再走査も 0 件 → items を解決できない
+        mock_drive.list_pdfs.return_value = []
+        profile = _make_profile()
+        with _tf.TemporaryDirectory() as tmp:
+            with patch.object(batch_main, "LOGS_DIR", _P(tmp)):
+                with self.assertRaises(RuntimeError):
+                    batch_main.step4_generate_pdfs(
+                        profile, results=_make_batch_results(1), items=None,
+                    )
+        # 出力一覧シートへは 1 行も書かない（無言の 0 件を残さない）
+        mock_sheets.append_output_record.assert_not_called()
+
+
+class TestRunResultsRecoveryEndToEnd(unittest.TestCase):
+    """``run(step="results", batch_id=X)``：結果取得 → Drive 再走査で items 再構築
+    → step4 完走（回収バグ＝「結果は取れるが出力 0 件」の回帰防止）。"""
+
+    @patch("src.config.ENABLE_GMAIL_DRAFTS", False)
+    @patch("src.batch_main.ensure_fonts")
+    @patch("src.batch_main.pdf_merger")
+    @patch("src.batch_main.pdf_creator")
+    @patch("src.batch_main.sheets_client")
+    @patch("src.batch_main.drive_client")
+    @patch("src.batch_main.comment_generator")
+    def test_recovery_rescans_drive_and_completes_step4(
+        self, mock_gen, mock_drive, mock_sheets, mock_creator, mock_merger,
+        mock_fonts,
+    ):
+        from pathlib import Path as _P
+        import tempfile as _tf
+        # Drive 再走査で 1 件のメイン PDF が見つかる
+        mock_drive.list_pdfs.return_value = [
+            {"id": "driveA", "name": "001-01-1事例.pdf"},
+        ]
+        _install_step4_mocks(mock_drive, mock_merger, mock_sheets)
+        mock_sheets.get_processed_management_numbers.return_value = set()
+        mock_sheets.get_recorded_clinic_numbers.return_value = set()
+        # 完了済みバッチ。結果は file id 由来の custom_id で返る（投入時と同じ）。
+        cid = batch_main._custom_id_for_file("driveA")
+        mock_gen.get_batch_status.return_value = {
+            "id": "msgbatch_done", "status": "ended",
+            "request_counts": {"processing": 0, "succeeded": 1,
+                               "errored": 0, "canceled": 0, "expired": 0},
+        }
+        mock_gen.get_batch_results.return_value = ({cid: {
+            "clinic_name": "山田歯科", "person_name": "田中太郎",
+            "sample_title": "事例", "comment": "コメント本文",
+        }}, [])
+        with _tf.TemporaryDirectory() as tmp:
+            with patch.object(batch_main, "LOGS_DIR", _P(tmp)), \
+                 patch.object(batch_main.discover, "resolve_run_config",
+                              return_value=_make_profile()):
+                batch_main.run(batch_mode=True, step="results",
+                               batch_id="msgbatch_done")
+        # step4 に到達し出力一覧へ追記された＝回収完走（旧コードはここに来ない）
+        mock_sheets.append_output_record.assert_called_once()
+        kw = mock_sheets.append_output_record.call_args.kwargs
+        self.assertEqual(kw["management_number"], "001-01-1")
+        # Drive 再走査が profile の入力フォルダで行われた
+        mock_drive.list_pdfs.assert_called_with(folder_id="input_folder_xxx")
+
+    @patch("src.batch_main.step4_generate_pdfs")
+    @patch("src.batch_main.comment_generator")
+    def test_discrete_results_without_batch_id_does_not_run_step4(
+        self, mock_gen, mock_step4,
+    ):
+        """``--step results`` を batch_id なし（disk から補完）で呼ぶ discrete 運用
+        では step4 を走らせない。回収（batch_id 明示）との切り分けの回帰防止。
+        長時間ポーリング直後に PDF 生成を始めて GHA 6h を超える事故を防ぐ意図。
+        """
+        from pathlib import Path as _P
+        import tempfile as _tf
+        mock_gen.get_batch_status.return_value = {
+            "id": "b1", "status": "ended",
+            "request_counts": {"processing": 0, "succeeded": 1,
+                               "errored": 0, "canceled": 0, "expired": 0},
+        }
+        mock_gen.get_batch_results.return_value = ({"file-driveA": {
+            "clinic_name": "X", "person_name": "Y",
+            "sample_title": "Z", "comment": "C" * 30,
+        }}, [])
+        with _tf.TemporaryDirectory() as tmp:
+            with patch.object(batch_main, "LOGS_DIR", _P(tmp)), \
+                 patch.object(batch_main.discover, "resolve_run_config",
+                              return_value=_make_profile()):
+                (_P(tmp) / "batch_id.txt").write_text("b1")
+                batch_main.run(batch_mode=True, step="results", batch_id=None)
+        # 結果取得はするが step4 は走らない（discrete）
+        mock_gen.get_batch_status.assert_called_once_with("b1")
+        mock_step4.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -706,10 +706,11 @@ class TestBatchE2E(unittest.TestCase):
                 "errored": 0, "canceled": 0, "expired": 0,
             },
         }
-        # custom_id は item_0001 ... 形式
+        # custom_id は Drive file id 由来の安定 ID（step1 が _custom_id_for_file
+        # で生成）。回収のための内容アドレス化に合わせ、結果も同じ key で返す。
         results = {
-            f"item_{i:04d}": _make_metadata(suffix=f"_{i}")
-            for i in range(1, pdf_count + 1)
+            batch_main._custom_id_for_file(f["id"]): _make_metadata(suffix=f"_{i}")
+            for i, f in enumerate(_make_pdf_files(pdf_count), start=1)
         }
         mock_gen.get_batch_results.return_value = (results, [])
         mock_merger.make_output_filename.return_value = (
@@ -867,8 +868,8 @@ class TestBatchE2E(unittest.TestCase):
 
         # Step4 で prep_file 経由（items=None で再読込）でも再ダウンロード可能
         results = {
-            "item_0001": _make_metadata(suffix="_1"),
-            "item_0002": _make_metadata(suffix="_2"),
+            batch_main._custom_id_for_file("id_0001"): _make_metadata(suffix="_1"),
+            batch_main._custom_id_for_file("id_0002"): _make_metadata(suffix="_2"),
         }
         mock_drive.download_pdf.reset_mock()
         # items=None だとプレファイルからロード
@@ -1224,8 +1225,8 @@ class TestTargetFolderE2E(unittest.TestCase):
             },
         }
         results = {
-            f"item_{i:04d}": _make_metadata(suffix=f"_{i}")
-            for i in range(1, 4)
+            batch_main._custom_id_for_file(f["id"]): _make_metadata(suffix=f"_{i}")
+            for i, f in enumerate(_make_pdf_files(3), start=1)
         }
         mock_gen.get_batch_results.return_value = (results, [])
         mock_merger.make_output_filename.return_value = (
@@ -1656,9 +1657,9 @@ class TestAttachmentPassthroughE2E(unittest.TestCase):
                 "errored": 0, "canceled": 0, "expired": 0,
             },
         }
-        # メインは 1 件だけ → custom_id は item_0001
+        # メインは 1 件だけ。custom_id は file id 由来（_custom_id_for_file）。
         mock_gen.get_batch_results.return_value = (
-            {"item_0001": _make_metadata()}, [],
+            {batch_main._custom_id_for_file("id_main"): _make_metadata()}, [],
         )
         mock_merger.make_output_filename.return_value = (
             "山田歯科＿田中太郎＿事例タイトル.pdf"
@@ -1849,7 +1850,8 @@ class TestClinicNumberFolderE2E(unittest.TestCase):
             },
         }
         mock_gen.get_batch_results.return_value = (
-            {f"item_{i:04d}": _make_metadata() for i in range(1, 3)}, [],
+            {batch_main._custom_id_for_file(f"id_{i}"): _make_metadata()
+             for i in range(1, 3)}, [],
         )
         mock_merger.make_output_filename.return_value = "out.pdf"
 
