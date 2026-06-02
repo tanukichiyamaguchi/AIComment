@@ -23,6 +23,17 @@ on:
         description: 'Create Gmail drafts for clinics (OFF by default; turn ON to email)'
         type: boolean
         default: false
+      step:
+        description: 'Batch step (all=通常, results=完了済みバッチから結果回収のみ). resultsを使うときは batch_id 必須。'
+        type: choice
+        default: 'all'
+        options:
+          - all
+          - results
+      batch_id:
+        description: 'step=results 時のみ使用。回収したい完了済みバッチID（例 msgbatch_xxx）。'
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -59,26 +70,45 @@ jobs:
       - name: Run comment generation
         run: |
           # 優先順位:
-          # 1. target_folder 指定 → フォルダ自動検出モード（profile より優先）
-          # 2. profile 指定        → 既存プロファイルモード
-          # 3. どちらも未指定      → jissen_default プロファイル（既存挙動）
+          # 1. step=results 指定（Batchモード必須）→ 既存バッチIDから結果回収のみ。
+          #    Anthropic 側で完了済みのバッチを取りに行く。新規投入しない。
+          # 2. target_folder 指定 → フォルダ自動検出モード（profile より優先）
+          # 3. profile 指定        → 既存プロファイルモード
+          # 4. どちらも未指定      → jissen_default プロファイル（既存挙動）
           if [ "${{ inputs.batch_mode }}" = "true" ]; then
             ENTRY="python -m src.batch_main"
           else
             ENTRY="python -m src.main"
           fi
 
+          STEP_FLAG=""
+          if [ "${{ inputs.step }}" = "results" ]; then
+            # results モードは batch_main 専用（通常モードには step 概念がない）。
+            if [ "${{ inputs.batch_mode }}" != "true" ]; then
+              echo "::error::step=results は Batch モード (batch_mode=true) でのみ使えます"
+              exit 1
+            fi
+            if [ -z "${{ inputs.batch_id }}" ]; then
+              echo "::error::step=results を使うときは batch_id 必須（例 msgbatch_xxx）"
+              exit 1
+            fi
+            STEP_FLAG="--step results --batch-id ${{ inputs.batch_id }}"
+          fi
+
           if [ -n "${{ inputs.target_folder }}" ]; then
             $ENTRY \
               --target-folder "${{ inputs.target_folder }}" \
-              --test-count ${{ inputs.test_count }}
+              --test-count ${{ inputs.test_count }} \
+              $STEP_FLAG
           elif [ -n "${{ inputs.profile }}" ]; then
             $ENTRY \
               --profile "${{ inputs.profile }}" \
-              --test-count ${{ inputs.test_count }}
+              --test-count ${{ inputs.test_count }} \
+              $STEP_FLAG
           else
             $ENTRY \
-              --test-count ${{ inputs.test_count }}
+              --test-count ${{ inputs.test_count }} \
+              $STEP_FLAG
           fi
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
