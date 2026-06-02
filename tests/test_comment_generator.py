@@ -15,9 +15,12 @@ from src.comment_generator import (
     SYSTEM_PROMPT,
     TEAM_MTG_SYSTEM_PROMPT,
     PermanentRunFailureError,
+    _backoff_seconds,
     _build_extraction_request_params,
     _build_user_prompt,
+    _OverloadedError,
     _parse_extraction,
+    _RETRYABLE_API_ERRORS,
     _scrub_names_from_comment,
     create_batch_requests,
     extract_theme,
@@ -25,6 +28,15 @@ from src.comment_generator import (
     get_system_prompt,
     is_permanent_run_failure,
 )
+
+
+def _overloaded_error() -> Exception:
+    """本番で観測された 529 Overloaded（一過性のサーバー過負荷）を再現する。"""
+    return _OverloadedError(
+        message="Overloaded",
+        response=MagicMock(status_code=529, headers={}),
+        body={"type": "error", "error": {"type": "overloaded_error"}},
+    )
 
 
 def _text_block(text: str) -> TextBlock:
@@ -203,6 +215,65 @@ class TestGenerateCommentWithMetadata(unittest.TestCase):
         with self.assertRaises(anthropic.APIConnectionError):
             generate_comment_with_metadata("PDF全文", max_retries=2)
         self.assertEqual(mock_sleep.call_count, 2)
+
+    @patch("src.comment_generator._create_client")
+    @patch("src.comment_generator.time.sleep")
+    def test_retries_on_overloaded_529_then_succeeds(self, mock_sleep, mock_create_client):
+        """529 Overloaded（一過性過負荷）はリトライして成功できること。
+
+        本番で 67 件失敗した事象の回帰防止。OverloadedError は InternalServerError の
+        派生ではないため、明示的に retry 対象へ含めていないと 1 度も再試行されず即失敗する。
+        """
+        mock_client = MagicMock()
+        mock_create_client.return_value = mock_client
+        success = MagicMock()
+        success.content = [_text_block(_valid_payload("OK"))]
+        mock_client.messages.create.side_effect = [
+            _overloaded_error(),
+            _overloaded_error(),
+            success,
+        ]
+        data = generate_comment_with_metadata("PDF全文")
+        self.assertEqual(data["comment"], "OK")
+        self.assertEqual(mock_sleep.call_count, 2)  # 2回失敗 → 2回リトライ前 sleep
+
+    @patch("src.comment_generator._create_client")
+    @patch("src.comment_generator.time.sleep")
+    def test_raises_when_overloaded_exhausted(self, mock_sleep, mock_create_client):
+        """529 がリトライ上限まで続いたら最終的に送出（per-PDF fail-soft に委ねる）。"""
+        mock_client = MagicMock()
+        mock_create_client.return_value = mock_client
+        mock_client.messages.create.side_effect = _overloaded_error()
+        with self.assertRaises(_OverloadedError):
+            generate_comment_with_metadata("PDF全文", max_retries=3)
+        self.assertEqual(mock_sleep.call_count, 3)
+
+    def test_overloaded_error_is_in_retryable_set(self):
+        """529 Overloaded が確実にリトライ対象集合に含まれること。"""
+        self.assertIn(_OverloadedError, _RETRYABLE_API_ERRORS)
+        # 恒久エラー（認証/権限）はリトライ対象に含めない
+        self.assertNotIn(anthropic.AuthenticationError, _RETRYABLE_API_ERRORS)
+
+    def test_overloaded_not_classified_as_permanent(self):
+        """529 は恒久エラーではない（fail-fast 停止の対象にしない）。"""
+        self.assertFalse(is_permanent_run_failure(_overloaded_error()))
+
+
+class TestBackoffSeconds(unittest.TestCase):
+    """指数バックオフ + ジッターの境界。"""
+
+    def test_first_attempt_in_range(self):
+        for _ in range(50):
+            w = _backoff_seconds(0)
+            self.assertGreaterEqual(w, 2.0)
+            self.assertLess(w, 3.0)  # 2 + [0,1)
+
+    def test_capped_at_max(self):
+        # 大きな attempt でも _BACKOFF_CAP_SECONDS(30) + ジッター(<1) を超えない
+        for _ in range(50):
+            w = _backoff_seconds(20)
+            self.assertGreaterEqual(w, 30.0)
+            self.assertLess(w, 31.0)
 
     @patch("src.comment_generator._create_client")
     @patch("src.comment_generator.time.sleep")

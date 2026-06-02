@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import re
 import time
 from typing import Any
@@ -21,6 +22,41 @@ from src.config import (
 )
 
 logger = logging.getLogger("jissen_comment")
+
+# 529 Overloaded（一過性のサーバー過負荷）例外。
+# anthropic は SDK バージョンにより OverloadedError を top-level に公開しないこと
+# があり（v0.105 では未公開）、かつ OverloadedError は InternalServerError の派生
+# ではない（status_code=529, APIStatusError 直下）。そのため既存の retry tuple では
+# 捕捉されず、過負荷時に 1 度も再試行されず即エラーになっていた（本番で 529 が 67 件）。
+# 公開先の差異を吸収するため両対応で取得する。
+try:  # pragma: no cover - 公開先は SDK 版に依存
+    from anthropic import OverloadedError as _OverloadedError  # type: ignore[attr-defined]
+except ImportError:  # pragma: no cover
+    from anthropic._exceptions import OverloadedError as _OverloadedError
+
+# 一過性（リトライ対象）の Anthropic 例外。429 RateLimit / 5xx InternalServer /
+# 接続・タイムアウト に加え、529 Overloaded を含める。恒久エラー（認証/権限/残高）は
+# is_permanent_run_failure で別判定し fail-fast 停止する（リトライしない）。
+_RETRYABLE_API_ERRORS: tuple[type[BaseException], ...] = (
+    anthropic.RateLimitError,
+    anthropic.InternalServerError,
+    anthropic.APITimeoutError,
+    anthropic.APIConnectionError,
+    _OverloadedError,
+)
+
+# 指数バックオフの上限秒数（過負荷が続いても 1 件あたりの待ちが過大にならない上限）。
+_BACKOFF_CAP_SECONDS = 30.0
+
+
+def _backoff_seconds(attempt: int) -> float:
+    """指数バックオフ + ジッター（秒）を返す。
+
+    ``2**(attempt+1)`` を ``_BACKOFF_CAP_SECONDS`` で頭打ちし、0〜1 秒のジッターを
+    加える。過負荷（529）時に多数のリクエストが同時に再試行して波が揃うのを防ぐ。
+    """
+    base = min(2.0 ** (attempt + 1), _BACKOFF_CAP_SECONDS)
+    return base + random.uniform(0.0, 1.0)
 
 
 # ── ラン全体で恒久的に失敗する条件（fail-fast） ──
@@ -63,6 +99,7 @@ def is_permanent_run_failure(exc: BaseException) -> bool:
 
     False（＝一過性 / PDF 固有 → 従来通りリトライ or per-PDF fail-soft）:
         - RateLimitError / InternalServerError / APITimeoutError / APIConnectionError
+          / OverloadedError(529 過負荷) … いずれも _RETRYABLE_API_ERRORS でリトライ
         - request-specific な 400（プロンプト過大など billing と無関係なもの）
         - Anthropic 由来でない例外
     """
@@ -536,7 +573,7 @@ def _scrub_names_from_comment(
 def generate_comment_with_metadata(
     pdf_text: str,
     pdf_filename: str = "",
-    max_retries: int = 3,
+    max_retries: int = 5,
 ) -> dict[str, str]:
     """通常モードで医院名・氏名・実践事例タイトル・コメントを一括抽出/生成する。
 
@@ -613,21 +650,18 @@ def generate_comment_with_metadata(
             # per-PDF で fail-soft する。
             raise
 
-        except (
-            anthropic.RateLimitError,
-            anthropic.InternalServerError,
-            anthropic.APITimeoutError,
-            anthropic.APIConnectionError,
-        ) as e:
+        except _RETRYABLE_API_ERRORS as e:
+            # 一過性エラー（429/5xx/529 Overloaded/接続/タイムアウト）は指数バック
+            # オフ + ジッターでリトライする。529 過負荷はここで吸収される。
             if attempt < max_retries:
-                wait = 2 ** (attempt + 1)
+                wait = _backoff_seconds(attempt)
                 logger.warning(
-                    f"API エラー (試行{attempt + 1}/{max_retries + 1}): {e}. "
-                    f"{wait}秒後にリトライ..."
+                    f"API一過性エラー (試行{attempt + 1}/{max_retries + 1}): {e}. "
+                    f"{wait:.1f}秒後にリトライ..."
                 )
                 time.sleep(wait)
             else:
-                logger.error(f"API エラー: リトライ上限到達: {e}")
+                logger.error(f"API一過性エラー: リトライ上限到達: {e}")
                 raise
 
     raise RuntimeError("unreachable: retry loop exited without return or raise")
