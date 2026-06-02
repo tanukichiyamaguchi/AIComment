@@ -196,6 +196,36 @@ break して残り item を処理しない、(3) 成功済みの成果物 flush 
 + break、Batch は `submit_batch` / `get_batch_status` / `get_batch_results` で
 変換し `step2`/`step3` 経由で `run` 外へ伝播。
 
+### P-025: 一過性リトライは「API 呼び出し 1 箇所」だけでなく「その上位ポーリングループ」にも入れよ（多層防御）
+本番 GHA ラン（run_id=26811653746, branch=main, 3h22m）で、Batch API への
+バッチ送信は成功 67 件投入したが、3 時間ポーリング後の最終 1 回で
+`get_batch_status()` 内の `client.messages.batches.retrieve(batch_id)` が
+`503 overloaded_error` (`API key validation is temporarily unavailable. Please retry.`)
+を返した瞬間、リトライされず即送出され `step3_wait_and_get_results` の `while`
+ループを抜けて Traceback。**3 時間ぶんの待機が水の泡**になった。原因は二段:
+(a) PR #47 で `_RETRYABLE_API_ERRORS` + `_backoff_seconds` を導入したが、
+    `generate_comment_with_metadata` 内でのみ使われており、Batch 系 3 関数
+    （`submit_batch` / `get_batch_status` / `get_batch_results`）は
+    PR #46 の **恒久エラー変換 except だけ** を持って一過性リトライがなかった。
+(b) `step3_wait_and_get_results` のポーリングループ本体も `try/except` 無しで、
+    `get_batch_status` が 1 度でも例外を出すと即終了する設計だった。
+**Rule**: 長時間ポーリング系の処理では、API 呼び出し 1 箇所のリトライだけに
+頼らず、**その上位のループ** にも同じ「一過性は continue / 恒久は即 raise」の
+例外耐性を入れる（多層防御）。1 関数のリトライ上限を超えても、ループそのもの
+は ``poll_interval`` 待って継続できる設計にしておけば、半日待った状態を 503
+1 発で失わなくて済む。判定対象に `503 overloaded_error` も必ず含むこと
+（OverloadedError は 529、`InternalServerError` は 5xx の汎用親、両方
+`_RETRYABLE_API_ERRORS` に含まれている）。
+
+また、こうした「途中で死ぬ」前提のバッチ処理では、再開可能な永続キー
+（Anthropic の場合は `batch_id`、保持期間 29 日）を atomic write で必ず
+ディスクへ書き、別 GHA 実行から `--step results --batch-id <id>` で再開できる
+経路を残す。バッチ送信は既に課金確定済みなので、再送信すると同じ料金が
+再度発生する（=「3 時間+再送 6 時間で結局 9 時間」になる）。実装例:
+`src/comment_generator._call_with_retries`（Batch 系 3 関数共通の retry helper）、
+`src/batch_main.step3_wait_and_get_results` のループ内 try/except、
+`src/batch_main.step2_submit_batch` の `batch_id.txt` atomic write。
+
 ## Session Log
 - **2026-03-16**: Project initialized with workflow orchestration architecture.
 - **2026-05-01**: Added 5-agent team and 3 deterministic check scripts to handle 1000+ PDF scale. Each agent owns one of the failure modes in P-001 through P-005. See `tasks/todo.md` Phase 6 for the standard operating sequence.

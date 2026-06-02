@@ -38,6 +38,7 @@ from src.utils import (
 from src.config import LOGS_DIR
 from src import config, discover, drive_client, gmail_client, sheets_client
 from src import pdf_reader, comment_generator, pdf_creator, pdf_merger
+from src.comment_generator import PermanentRunFailureError
 from src.discover import RunConfig
 from src.profile import ProfileConfig
 from src.sheets_client import MasterRecord
@@ -281,6 +282,18 @@ def step1_prepare(
 def step2_submit_batch(items: list[dict]) -> str:
     """Step 2: Batch API送信。
 
+    バッチID永続化（CB-2 / 再開可能性）:
+        Anthropic Batch API は **29 日間** 結果を保持する。``step3`` 以降で
+        一過性エラー / GHA タイムアウト / プロセス強制終了などで落ちても、
+        ``logs/batch_id.txt`` を読み戻して
+        ``python -m src.batch_main --step results --batch-id <id>`` で結果取得
+        フェーズから再開できる（無料 = 既にバッチは Anthropic 側で課金確定済み）。
+        GHA は ``logs/`` を ``actions/upload-artifact@v4`` で 30 日保管するため、
+        Job が失敗してもアーティファクトから batch_id を取り出せる。
+
+        書き込みは ``.tmp`` → ``rename`` の atomic write で、書き込み途中
+        クラッシュで空ファイル / 半端な内容を残さない（P-023 と同じ方針）。
+
     Args:
         items: step1_prepareの戻り値
 
@@ -294,8 +307,15 @@ def step2_submit_batch(items: list[dict]) -> str:
 
     batch_id_file = LOGS_DIR / "batch_id.txt"
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
-    batch_id_file.write_text(batch_id)
-    logger.info(f"バッチID保存: {batch_id_file} → {batch_id}")
+    # atomic write: tmp に書いて fsync 相当の rename で置換。書き込み途中で
+    # プロセスが死んでも、batch_id.txt は空 or 半端な値で残らない。
+    tmp = batch_id_file.with_suffix(batch_id_file.suffix + ".tmp")
+    tmp.write_text(batch_id)
+    tmp.replace(batch_id_file)
+    logger.info(
+        f"バッチID保存: {batch_id_file} → {batch_id} "
+        f"（29日間 Anthropic 側で保持。--step results --batch-id {batch_id} で再開可能）"
+    )
 
     return batch_id
 
@@ -306,6 +326,19 @@ def step3_wait_and_get_results(
     max_wait: int = 86400,
 ) -> dict[str, dict[str, str]]:
     """Step 3: バッチ結果をポーリングで取得する（構造化出力をパース済み）。
+
+    多層防御の例外耐性:
+        本番 GHA ラン（run_id=26811653746, 3h22m）で、3 時間ポーリングの最後に
+        ``get_batch_status`` 内の ``client.messages.batches.retrieve(batch_id)`` が
+        503 ``overloaded_error`` を返し、リトライされず即 Traceback。3 時間の
+        待機が水の泡になった。対策は二段構え：
+            1. ``comment_generator.get_batch_status`` 内で一過性エラーを
+               指数バックオフリトライ（既定 5 回）。
+            2. **更にその上**、本ループでも一過性例外を捕捉して
+               ``poll_interval`` 待って continue する。1 関数のリトライ上限を
+               超えても、ポーリングそのものは継続できるようにする。
+               ``PermanentRunFailureError`` だけは即 raise（fail-fast、PR #46 と
+               同じ方針）。``max_wait`` の制限は維持。
 
     Args:
         batch_id: バッチID
@@ -320,7 +353,24 @@ def step3_wait_and_get_results(
 
     elapsed = 0
     while elapsed < max_wait:
-        status = comment_generator.get_batch_status(batch_id)
+        try:
+            status = comment_generator.get_batch_status(batch_id)
+        except PermanentRunFailureError:
+            # 恒久エラー（残高不足/認証/権限）はリトライ無意味。即 raise して
+            # 呼び出し側 (`run`) がランを停止する（PR #46 / lessons P-024）。
+            raise
+        except Exception as e:
+            # 一過性エラーが内側のリトライ上限を超えて漏れてきたケース。
+            # ループそのものは続行する（多層防御）。warning ログを出し、
+            # ``poll_interval`` 待ってから次イテレーションへ。
+            logger.warning(
+                f"バッチ状態取得が一過性失敗（リトライ済み）。"
+                f"{poll_interval}秒後に再試行します: {e}"
+            )
+            time.sleep(poll_interval)
+            elapsed += poll_interval
+            continue
+
         logger.info(f"バッチステータス: {status['status']} ({status['request_counts']})")
 
         if status["status"] == "ended":
