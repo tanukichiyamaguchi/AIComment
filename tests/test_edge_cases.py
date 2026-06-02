@@ -679,5 +679,709 @@ class TestAllProfilesLoadable(unittest.TestCase):
                 self.assertEqual(cfg.output_folder_id, f"out_{name}")
 
 
+# ---------------------------------------------------------------------------
+# 7. Batch API 一過性エラー（503 / 529 / RateLimit 等）の境界
+#
+# 本番事象（run_id=26811653746）の再発防止:
+#   batch ポーリングが 3 時間後に 503 一発で落ちた。原因仮説は以下:
+#     - ``submit_batch`` / ``get_batch_status`` / ``get_batch_results`` の
+#       3 関数が「一過性エラー」を捕捉していない（恒久エラー判定のみある）。
+#     - ``step3_wait_and_get_results`` のポーリングループも、``get_batch_status``
+#       が単発 503 を投げると catch せず即 raise してランを止める。
+#   どちらも一過性であり、本来は指数バックオフでリトライすれば抜けられる。
+#
+# 以下のテスト群は **defect-investigator が submit_batch / get_batch_status /
+# get_batch_results に retry を入れ、step3 ポーリングループに transient 吸収を
+# 入れる前提** で書かれている。修正前は red のまま push し、修正後 green に
+# なる前提（テスト名・docstring に「修正前 red」を明記）。
+# ---------------------------------------------------------------------------
+
+
+import anthropic as _anthropic
+from anthropic.types import TextBlock as _TextBlock
+
+from src import batch_main as _batch_main
+from src import comment_generator as _cg
+from src.comment_generator import (
+    PermanentRunFailureError as _PermanentRunFailureError,
+    _OverloadedError as _OverloadedErr,
+    _RETRYABLE_API_ERRORS as _RETRYABLE,
+)
+
+
+def _503_internal_server(message: str = "Internal Server Error") -> _anthropic.InternalServerError:
+    """本番ログに出ていた 503 InternalServerError を再現する。
+
+    本番では body に ``{"type": "error", "error": {"type": "overloaded_error",
+    "message": "API key validation is temporarily unavailable. Please try again later."}}``
+    が含まれていた。これは Anthropic ステータスとしては 503 なので、SDK は
+    ``InternalServerError`` で送出する（``OverloadedError`` ではない）。
+    """
+    body = {
+        "type": "error",
+        "error": {"type": "overloaded_error", "message": message},
+    }
+    return _anthropic.InternalServerError(
+        message=message,
+        response=MagicMock(status_code=503, headers={}),
+        body=body,
+    )
+
+
+def _529_overloaded() -> Exception:
+    """529 Overloaded（top-level の OverloadedError もしくは
+    ``_exceptions.OverloadedError``）を再現する。"""
+    return _OverloadedErr(
+        message="Overloaded",
+        response=MagicMock(status_code=529, headers={}),
+        body={"type": "error", "error": {"type": "overloaded_error"}},
+    )
+
+
+def _rate_limit() -> _anthropic.RateLimitError:
+    return _anthropic.RateLimitError(
+        message="rate limit",
+        response=MagicMock(status_code=429, headers={}),
+        body=None,
+    )
+
+
+def _auth_401() -> _anthropic.AuthenticationError:
+    return _anthropic.AuthenticationError(
+        message="invalid x-api-key",
+        response=MagicMock(status_code=401, headers={}),
+        body=None,
+    )
+
+
+def _permission_403() -> _anthropic.PermissionDeniedError:
+    return _anthropic.PermissionDeniedError(
+        message="forbidden",
+        response=MagicMock(status_code=403, headers={}),
+        body=None,
+    )
+
+
+def _mk_status(status: str, **counts: int) -> Any:
+    """``messages.batches.retrieve`` の戻り値を模す。
+
+    ``processing_status`` と ``request_counts``（``processing/succeeded/errored
+    /canceled/expired``）を持つ MagicMock を返す。
+    """
+    obj = MagicMock()
+    obj.id = "batch_abc"
+    obj.processing_status = status
+    rc = MagicMock()
+    rc.processing = counts.get("processing", 0)
+    rc.succeeded = counts.get("succeeded", 0)
+    rc.errored = counts.get("errored", 0)
+    rc.canceled = counts.get("canceled", 0)
+    rc.expired = counts.get("expired", 0)
+    obj.request_counts = rc
+    return obj
+
+
+def _mk_batch_result(
+    custom_id: str,
+    *,
+    succeeded: bool = True,
+    text: str = '{"clinic_name":"X歯科","person_name":"山田太郎","sample_title":"事例","comment":"' + ("テスト" * 60) + '"}',
+    result_type: str = "errored",
+) -> Any:
+    """``messages.batches.results`` のイテレータ要素を模す。
+
+    ``succeeded=True`` のとき ``result.type=="succeeded"`` + 構造化出力 JSON、
+    ``False`` のとき ``result_type``（"errored" / "expired" / "canceled"）に
+    したがって失敗扱いになる。
+    """
+    res = MagicMock()
+    res.custom_id = custom_id
+    if succeeded:
+        res.result.type = "succeeded"
+        message = MagicMock()
+        message.content = [_TextBlock(type="text", text=text, citations=None)]
+        res.result.message = message
+    else:
+        res.result.type = result_type
+    return res
+
+
+class TestRetryableApiErrorsTupleMembership(unittest.TestCase):
+    """``_RETRYABLE_API_ERRORS`` に必要な型が **直接** 含まれている回帰防止。
+
+    529 / 503 系の取り扱いに穴があると本番で 503 一発で落ちる（run_id=26811653746）。
+    既存 ``test_comment_generator.py::test_overloaded_error_is_in_retryable_set``
+    は 529 だけを検証するため、ここで 5 種すべてを 1 ステップで網羅する。
+    """
+
+    def test_internal_server_error_503_is_retryable(self):
+        """``InternalServerError`` (status_code=503) はリトライ tuple に含まれる。"""
+        self.assertIn(_anthropic.InternalServerError, _RETRYABLE)
+
+    def test_overloaded_529_is_retryable(self):
+        self.assertIn(_OverloadedErr, _RETRYABLE)
+
+    def test_rate_limit_429_is_retryable(self):
+        self.assertIn(_anthropic.RateLimitError, _RETRYABLE)
+
+    def test_api_connection_is_retryable(self):
+        self.assertIn(_anthropic.APIConnectionError, _RETRYABLE)
+
+    def test_api_timeout_is_retryable(self):
+        self.assertIn(_anthropic.APITimeoutError, _RETRYABLE)
+
+    def test_authentication_401_is_not_retryable(self):
+        """恒久エラー（認証）は **絶対に** リトライ tuple に入れない。"""
+        self.assertNotIn(_anthropic.AuthenticationError, _RETRYABLE)
+
+    def test_permission_403_is_not_retryable(self):
+        self.assertNotIn(_anthropic.PermissionDeniedError, _RETRYABLE)
+
+    def test_bad_request_400_is_not_retryable(self):
+        """400 BadRequest はリトライしない（billing 系は別経路で恒久判定）。"""
+        self.assertNotIn(_anthropic.BadRequestError, _RETRYABLE)
+
+    def test_concrete_503_instance_is_caught_by_retryable_tuple(self):
+        """本番で観測された 503（body の error.type=overloaded_error）でも
+        ``isinstance`` で確実に retryable と判定される。"""
+        err = _503_internal_server(
+            "API key validation is temporarily unavailable. Please try again later."
+        )
+        self.assertIsInstance(err, _RETRYABLE)
+
+    def test_concrete_529_instance_is_caught_by_retryable_tuple(self):
+        self.assertIsInstance(_529_overloaded(), _RETRYABLE)
+
+
+class TestSubmitBatchRetriesOnTransient(unittest.TestCase):
+    """``submit_batch`` は ``messages.batches.create`` の一過性エラーを
+    リトライする。
+
+    修正前 red のシナリオ: 現状 ``submit_batch`` は ``BadRequestError`` /
+    ``AuthenticationError`` / ``PermissionDeniedError`` のみキャッチして
+    恒久判定にかけ、それ以外（503/529/429/接続/タイムアウト）はリトライせず
+    即 raise する。defect-investigator の修正でリトライが追加されたら green。
+    """
+
+    @patch("src.comment_generator._create_client")
+    @patch("src.comment_generator.time.sleep")
+    def test_503_then_success(self, mock_sleep, mock_create_client):
+        """503 が 1 回 → 2 回目で成功。"""
+        mock_client = MagicMock()
+        mock_create_client.return_value = mock_client
+        success = MagicMock()
+        success.id = "batch_xyz"
+        success.processing_status = "in_progress"
+        mock_client.messages.batches.create.side_effect = [
+            _503_internal_server(),
+            success,
+        ]
+        items = [{"custom_id": "item_0001", "pdf_text": "x", "pdf_file_name": "001-01-1.pdf"}]
+        batch_id = _cg.submit_batch(items)
+        self.assertEqual(batch_id, "batch_xyz")
+        self.assertEqual(mock_client.messages.batches.create.call_count, 2)
+
+    @patch("src.comment_generator._create_client")
+    @patch("src.comment_generator.time.sleep")
+    def test_529_then_success(self, mock_sleep, mock_create_client):
+        """529 過負荷が 1 回 → 2 回目で成功。"""
+        mock_client = MagicMock()
+        mock_create_client.return_value = mock_client
+        success = MagicMock()
+        success.id = "batch_xyz"
+        success.processing_status = "in_progress"
+        mock_client.messages.batches.create.side_effect = [
+            _529_overloaded(),
+            success,
+        ]
+        items = [{"custom_id": "item_0001", "pdf_text": "x", "pdf_file_name": "001-01-1.pdf"}]
+        batch_id = _cg.submit_batch(items)
+        self.assertEqual(batch_id, "batch_xyz")
+
+    @patch("src.comment_generator._create_client")
+    @patch("src.comment_generator.time.sleep")
+    def test_rate_limit_then_success(self, mock_sleep, mock_create_client):
+        mock_client = MagicMock()
+        mock_create_client.return_value = mock_client
+        success = MagicMock()
+        success.id = "batch_xyz"
+        success.processing_status = "in_progress"
+        mock_client.messages.batches.create.side_effect = [
+            _rate_limit(),
+            success,
+        ]
+        items = [{"custom_id": "item_0001", "pdf_text": "x", "pdf_file_name": "001-01-1.pdf"}]
+        self.assertEqual(_cg.submit_batch(items), "batch_xyz")
+
+    @patch("src.comment_generator._create_client")
+    @patch("src.comment_generator.time.sleep")
+    def test_multiple_consecutive_transients_then_success(
+        self, mock_sleep, mock_create_client,
+    ):
+        """503 × 3 連続 → 4 回目で成功。境界（リトライ上限ぎりぎり）を確認する。"""
+        mock_client = MagicMock()
+        mock_create_client.return_value = mock_client
+        success = MagicMock()
+        success.id = "batch_xyz"
+        success.processing_status = "in_progress"
+        mock_client.messages.batches.create.side_effect = [
+            _503_internal_server(),
+            _529_overloaded(),
+            _rate_limit(),
+            success,
+        ]
+        items = [{"custom_id": "item_0001", "pdf_text": "x", "pdf_file_name": "001-01-1.pdf"}]
+        self.assertEqual(_cg.submit_batch(items), "batch_xyz")
+        self.assertEqual(mock_client.messages.batches.create.call_count, 4)
+
+
+class TestGetBatchStatusRetriesOnTransient(unittest.TestCase):
+    """``get_batch_status`` は ``messages.batches.retrieve`` の一過性エラーを
+    リトライする。
+
+    修正前 red のシナリオ: 現状 ``get_batch_status`` は恒久エラー判定のみ
+    で、503/529/429/接続/タイムアウトは即 raise。本番では 3h ポーリング中の
+    1 回の 503 でランが落ちた。defect-investigator 修正後 green。
+    """
+
+    @patch("src.comment_generator._create_client")
+    @patch("src.comment_generator.time.sleep")
+    def test_503_then_in_progress_status(self, mock_sleep, mock_create_client):
+        mock_client = MagicMock()
+        mock_create_client.return_value = mock_client
+        mock_client.messages.batches.retrieve.side_effect = [
+            _503_internal_server(),
+            _mk_status("in_progress", processing=10, succeeded=0),
+        ]
+        status = _cg.get_batch_status("batch_abc")
+        self.assertEqual(status["status"], "in_progress")
+        self.assertEqual(mock_client.messages.batches.retrieve.call_count, 2)
+
+    @patch("src.comment_generator._create_client")
+    @patch("src.comment_generator.time.sleep")
+    def test_overloaded_message_503_treated_as_transient(
+        self, mock_sleep, mock_create_client,
+    ):
+        """本番ログで観測された「API key validation is temporarily unavailable」
+        503 を一過性として扱うこと（メッセージで恒久判定にしない）。"""
+        mock_client = MagicMock()
+        mock_create_client.return_value = mock_client
+        mock_client.messages.batches.retrieve.side_effect = [
+            _503_internal_server(
+                "API key validation is temporarily unavailable. Please try again later."
+            ),
+            _mk_status("ended", succeeded=1),
+        ]
+        status = _cg.get_batch_status("batch_abc")
+        self.assertEqual(status["status"], "ended")
+
+    @patch("src.comment_generator._create_client")
+    @patch("src.comment_generator.time.sleep")
+    def test_three_consecutive_503_then_success(
+        self, mock_sleep, mock_create_client,
+    ):
+        """503 × 3 → 4 回目で成功。リトライ上限ぎりぎりの境界。"""
+        mock_client = MagicMock()
+        mock_create_client.return_value = mock_client
+        mock_client.messages.batches.retrieve.side_effect = [
+            _503_internal_server(),
+            _503_internal_server(),
+            _503_internal_server(),
+            _mk_status("ended", succeeded=10),
+        ]
+        status = _cg.get_batch_status("batch_abc")
+        self.assertEqual(status["status"], "ended")
+        self.assertEqual(mock_client.messages.batches.retrieve.call_count, 4)
+
+    @patch("src.comment_generator._create_client")
+    @patch("src.comment_generator.time.sleep")
+    def test_transient_exhausted_raises_original_type(
+        self, mock_sleep, mock_create_client,
+    ):
+        """一過性が最大回数まで続けば最終的に raise（無限リトライ禁止）。"""
+        mock_client = MagicMock()
+        mock_create_client.return_value = mock_client
+        mock_client.messages.batches.retrieve.side_effect = _503_internal_server()
+        with self.assertRaises(_anthropic.InternalServerError):
+            _cg.get_batch_status("batch_abc")
+
+    @patch("src.comment_generator._create_client")
+    @patch("src.comment_generator.time.sleep")
+    def test_permanent_wins_over_transient_in_mixed_sequence(
+        self, mock_sleep, mock_create_client,
+    ):
+        """503 → 401（401 が来た時点で恒久と判定し PermanentRunFailureError）。
+
+        モック上、retrieve に複数 side_effect を仕込んだとき、retry 実装に
+        よっては 503 で待機 → 401 で即停止というシーケンスになる。401 で
+        ``PermanentRunFailureError`` に変換され、リトライしないことを確認。
+        """
+        mock_client = MagicMock()
+        mock_create_client.return_value = mock_client
+        mock_client.messages.batches.retrieve.side_effect = [
+            _503_internal_server(),
+            _auth_401(),
+        ]
+        with self.assertRaises(_PermanentRunFailureError):
+            _cg.get_batch_status("batch_abc")
+
+    @patch("src.comment_generator._create_client")
+    @patch("src.comment_generator.time.sleep")
+    def test_permission_403_during_polling_is_permanent(
+        self, mock_sleep, mock_create_client,
+    ):
+        """403 PermissionDenied は一過性扱いせず PermanentRunFailureError。"""
+        mock_client = MagicMock()
+        mock_create_client.return_value = mock_client
+        mock_client.messages.batches.retrieve.side_effect = _permission_403()
+        with self.assertRaises(_PermanentRunFailureError):
+            _cg.get_batch_status("batch_abc")
+
+
+class TestGetBatchResultsRetriesOnTransient(unittest.TestCase):
+    """``get_batch_results`` は ``messages.batches.results`` の一過性エラーを
+    リトライする。修正前 red。"""
+
+    @patch("src.comment_generator._create_client")
+    @patch("src.comment_generator.time.sleep")
+    def test_503_then_success_returns_results(
+        self, mock_sleep, mock_create_client,
+    ):
+        mock_client = MagicMock()
+        mock_create_client.return_value = mock_client
+        # 1 回目: 503 / 2 回目: 1 件の成功結果を返す iterator
+        mock_client.messages.batches.results.side_effect = [
+            _503_internal_server(),
+            iter([_mk_batch_result("item_0001", succeeded=True)]),
+        ]
+        results, failed_ids = _cg.get_batch_results("batch_abc")
+        self.assertEqual(len(results), 1)
+        self.assertEqual(failed_ids, [])
+        self.assertEqual(mock_client.messages.batches.results.call_count, 2)
+
+    @patch("src.comment_generator._create_client")
+    @patch("src.comment_generator.time.sleep")
+    def test_529_then_success(self, mock_sleep, mock_create_client):
+        mock_client = MagicMock()
+        mock_create_client.return_value = mock_client
+        mock_client.messages.batches.results.side_effect = [
+            _529_overloaded(),
+            iter([_mk_batch_result("item_0001", succeeded=True)]),
+        ]
+        results, failed_ids = _cg.get_batch_results("batch_abc")
+        self.assertEqual(len(results), 1)
+
+
+class TestGetBatchResultsPartialAndEmpty(unittest.TestCase):
+    """部分 errored / 空 iterator の境界。"""
+
+    @patch("src.comment_generator._create_client")
+    def test_partial_errored_results_collects_failed_ids(self, mock_create_client):
+        """succeeded=N1, errored=N2 のとき、failed_ids に errored の custom_id が
+        全件入り、results には succeeded のみ。"""
+        mock_client = MagicMock()
+        mock_create_client.return_value = mock_client
+        mock_client.messages.batches.results.return_value = iter([
+            _mk_batch_result("item_0001", succeeded=True),
+            _mk_batch_result("item_0002", succeeded=False, result_type="errored"),
+            _mk_batch_result("item_0003", succeeded=True),
+            _mk_batch_result("item_0004", succeeded=False, result_type="errored"),
+        ])
+        results, failed_ids = _cg.get_batch_results("batch_abc")
+        self.assertEqual(set(results.keys()), {"item_0001", "item_0003"})
+        self.assertEqual(sorted(failed_ids), ["item_0002", "item_0004"])
+
+    @patch("src.comment_generator._create_client")
+    def test_all_errored_results_yields_empty_results_and_full_failed_ids(
+        self, mock_create_client,
+    ):
+        """全件 errored: results は空、failed_ids は全件分。"""
+        mock_client = MagicMock()
+        mock_create_client.return_value = mock_client
+        mock_client.messages.batches.results.return_value = iter([
+            _mk_batch_result("item_0001", succeeded=False, result_type="errored"),
+            _mk_batch_result("item_0002", succeeded=False, result_type="errored"),
+            _mk_batch_result("item_0003", succeeded=False, result_type="errored"),
+        ])
+        results, failed_ids = _cg.get_batch_results("batch_abc")
+        self.assertEqual(results, {})
+        self.assertEqual(sorted(failed_ids), ["item_0001", "item_0002", "item_0003"])
+
+    @patch("src.comment_generator._create_client")
+    def test_empty_iterator_yields_empty_results_and_empty_failed_ids(
+        self, mock_create_client,
+    ):
+        """``messages.batches.results`` が完全に空イテレータを返した場合。
+
+        全件 errored だが Anthropic 側が結果を 1 件も返さないという特殊
+        ケース。``get_batch_results`` は ``({}, [])`` を返して呼び出し側に
+        判断を委ねる（per-PDF fail-soft は呼び出し側で実施）。
+        """
+        mock_client = MagicMock()
+        mock_create_client.return_value = mock_client
+        mock_client.messages.batches.results.return_value = iter([])
+        results, failed_ids = _cg.get_batch_results("batch_abc")
+        self.assertEqual(results, {})
+        self.assertEqual(failed_ids, [])
+
+    @patch("src.comment_generator._create_client")
+    def test_expired_result_type_is_treated_as_failed(self, mock_create_client):
+        """result.type == "expired" も failed_ids に入る（succeeded 以外は全て失敗）。"""
+        mock_client = MagicMock()
+        mock_create_client.return_value = mock_client
+        mock_client.messages.batches.results.return_value = iter([
+            _mk_batch_result("item_0001", succeeded=False, result_type="expired"),
+        ])
+        results, failed_ids = _cg.get_batch_results("batch_abc")
+        self.assertEqual(results, {})
+        self.assertEqual(failed_ids, ["item_0001"])
+
+    @patch("src.comment_generator._create_client")
+    def test_canceled_result_type_is_treated_as_failed(self, mock_create_client):
+        mock_client = MagicMock()
+        mock_create_client.return_value = mock_client
+        mock_client.messages.batches.results.return_value = iter([
+            _mk_batch_result("item_0001", succeeded=False, result_type="canceled"),
+        ])
+        results, failed_ids = _cg.get_batch_results("batch_abc")
+        self.assertEqual(results, {})
+        self.assertEqual(failed_ids, ["item_0001"])
+
+
+class TestGetBatchResultsRetriesExhausted(unittest.TestCase):
+    """一過性エラーがリトライ上限を超えて続いた場合の挙動。
+
+    修正前 red: ``get_batch_results`` はリトライ実装なしのため 1 回目で raise。
+    修正後 green: リトライ上限まで再試行 → 最終 raise。
+    """
+
+    @patch("src.comment_generator._create_client")
+    @patch("src.comment_generator.time.sleep")
+    def test_503_continuously_raises_after_retries(
+        self, mock_sleep, mock_create_client,
+    ):
+        mock_client = MagicMock()
+        mock_create_client.return_value = mock_client
+        mock_client.messages.batches.results.side_effect = _503_internal_server()
+        with self.assertRaises(_anthropic.InternalServerError):
+            _cg.get_batch_results("batch_abc")
+
+
+class TestStep3PollingLoopSurvivesTransients(unittest.TestCase):
+    """``step3_wait_and_get_results`` のポーリングループは ``get_batch_status``
+    の一過性エラーを呑み込み次ラウンドへ進む。
+
+    修正前 red のシナリオ: 現状 step3 は ``get_batch_status`` を try/except
+    なしで呼ぶため、単発 503 で即 raise → ラン停止（本番事象 run_id=
+    26811653746）。 defect-investigator は (1) get_batch_status 内 retry、
+    または (2) step3 ループ内で transient 用 try/except のいずれかで対処
+    する想定。どちらの修正でも次のテストは green になる。
+    """
+
+    @patch("src.batch_main.time.sleep")
+    @patch("src.batch_main.comment_generator")
+    def test_step3_continues_after_transient_status_error(
+        self, mock_gen, mock_sleep,
+    ):
+        """503 を 1 回 raise → 次のポーリングで ended が返り results へ進む。
+
+        修正前 red:
+            現状の step3 ループは ``get_batch_status`` の 503 を catch しない。
+            最初の status 呼び出しで InternalServerError が伝播してテスト失敗。
+        修正後 green:
+            ポーリングループは transient を catch して次ラウンドへ進む。
+        """
+        mock_gen.get_batch_status.side_effect = [
+            _503_internal_server(),
+            {
+                "id": "batch_abc",
+                "status": "ended",
+                "request_counts": {
+                    "processing": 0, "succeeded": 1,
+                    "errored": 0, "canceled": 0, "expired": 0,
+                },
+            },
+        ]
+        mock_gen.get_batch_results.return_value = (
+            {"item_0001": {"clinic_name": "X歯科", "person_name": "山田",
+                            "sample_title": "事例", "comment": "A" * 100}},
+            [],
+        )
+        with patch.object(_batch_main, "_save_results_to_disk"):
+            results = _batch_main.step3_wait_and_get_results(
+                "batch_abc", poll_interval=1, max_wait=10,
+            )
+        self.assertEqual(len(results), 1)
+        self.assertGreaterEqual(mock_gen.get_batch_status.call_count, 2)
+
+    @patch("src.batch_main.time.sleep")
+    @patch("src.batch_main.comment_generator")
+    def test_step3_continues_after_three_consecutive_503_then_ended(
+        self, mock_gen, mock_sleep,
+    ):
+        """503 を 3 回連続 → 4 回目で processing=0, succeeded=N → results 取得。
+
+        本番想定: 数時間のポーリング中に数回 5xx が発生しても落ちない。
+        修正前 red、修正後 green。
+        """
+        mock_gen.get_batch_status.side_effect = [
+            _503_internal_server(),
+            _503_internal_server(),
+            _503_internal_server(),
+            {
+                "id": "batch_abc",
+                "status": "ended",
+                "request_counts": {
+                    "processing": 0, "succeeded": 3,
+                    "errored": 0, "canceled": 0, "expired": 0,
+                },
+            },
+        ]
+        mock_gen.get_batch_results.return_value = (
+            {f"item_{i:04d}": {"clinic_name": "X歯科", "person_name": "山田",
+                                "sample_title": "事例", "comment": "A" * 100}
+             for i in (1, 2, 3)},
+            [],
+        )
+        with patch.object(_batch_main, "_save_results_to_disk"):
+            results = _batch_main.step3_wait_and_get_results(
+                "batch_abc", poll_interval=1, max_wait=20,
+            )
+        self.assertEqual(len(results), 3)
+
+    @patch("src.batch_main.time.sleep")
+    @patch("src.batch_main.comment_generator")
+    def test_step3_continues_after_529_during_polling(
+        self, mock_gen, mock_sleep,
+    ):
+        """ポーリング途中の 529 過負荷も吸収して継続する。修正前 red、修正後 green。"""
+        mock_gen.get_batch_status.side_effect = [
+            _529_overloaded(),
+            {
+                "id": "batch_abc",
+                "status": "ended",
+                "request_counts": {
+                    "processing": 0, "succeeded": 1,
+                    "errored": 0, "canceled": 0, "expired": 0,
+                },
+            },
+        ]
+        mock_gen.get_batch_results.return_value = ({"item_0001": {
+            "clinic_name": "X歯科", "person_name": "山田",
+            "sample_title": "事例", "comment": "A" * 100,
+        }}, [])
+        with patch.object(_batch_main, "_save_results_to_disk"):
+            results = _batch_main.step3_wait_and_get_results(
+                "batch_abc", poll_interval=1, max_wait=20,
+            )
+        self.assertEqual(len(results), 1)
+
+    @patch("src.batch_main.time.sleep")
+    @patch("src.batch_main.comment_generator")
+    def test_step3_permanent_error_halts_immediately(self, mock_gen, mock_sleep):
+        """ポーリング中の恒久エラー（401/403 → PermanentRunFailureError）は
+        吸収せず即停止する（リトライしない / 残ループしない）。"""
+        mock_gen.get_batch_status.side_effect = _PermanentRunFailureError(
+            "Anthropic API のクレジット残高不足のため処理を中止しました。"
+        )
+        with self.assertRaises(_PermanentRunFailureError):
+            with patch.object(_batch_main, "_save_results_to_disk"):
+                _batch_main.step3_wait_and_get_results(
+                    "batch_abc", poll_interval=1, max_wait=10,
+                )
+        # 恒久エラーは即停止 → get_batch_status は 1 回しか呼ばれない
+        self.assertEqual(mock_gen.get_batch_status.call_count, 1)
+        # 結果取得にも進まない
+        mock_gen.get_batch_results.assert_not_called()
+
+
+class TestStep3PollingTimeoutBoundary(unittest.TestCase):
+    """``in_progress`` が続いて ``max_wait`` を超えるシナリオ。
+
+    既存実装は ``while elapsed < max_wait`` でループし、抜けたら
+    ``raise TimeoutError("Batch API結果の取得がタイムアウトしました")`` を
+    上げる（``step3_wait_and_get_results`` line 332-334）。
+    本テストは現状の挙動を固定する（修正前後どちらも green を期待）。
+    """
+
+    @patch("src.batch_main.time.sleep")
+    @patch("src.batch_main.comment_generator")
+    def test_in_progress_exceeds_max_wait_raises_timeout(self, mock_gen, mock_sleep):
+        """``in_progress`` が ``max_wait`` を超え続けたら TimeoutError。"""
+        mock_gen.get_batch_status.return_value = {
+            "id": "batch_abc",
+            "status": "in_progress",
+            "request_counts": {
+                "processing": 10, "succeeded": 0,
+                "errored": 0, "canceled": 0, "expired": 0,
+            },
+        }
+        with self.assertRaises(TimeoutError):
+            _batch_main.step3_wait_and_get_results(
+                "batch_abc", poll_interval=1, max_wait=2,
+            )
+        # 結果取得には進まない
+        mock_gen.get_batch_results.assert_not_called()
+
+    @patch("src.batch_main.time.sleep")
+    @patch("src.batch_main.comment_generator")
+    def test_timeout_message_mentions_timeout(self, mock_gen, mock_sleep):
+        """TimeoutError のメッセージに「タイムアウト」が含まれる。
+
+        運用者が logs/ で grep して即特定できることを担保する。
+        """
+        mock_gen.get_batch_status.return_value = {
+            "id": "batch_abc",
+            "status": "in_progress",
+            "request_counts": {
+                "processing": 10, "succeeded": 0,
+                "errored": 0, "canceled": 0, "expired": 0,
+            },
+        }
+        with self.assertRaises(TimeoutError) as ctx:
+            _batch_main.step3_wait_and_get_results(
+                "batch_abc", poll_interval=1, max_wait=2,
+            )
+        self.assertIn("タイムアウト", str(ctx.exception))
+
+
+class TestSubmitBatchTransientExhausted(unittest.TestCase):
+    """``submit_batch`` で一過性が最大回数まで続いたら raise する。
+
+    修正前 red、修正後 green。リトライ実装後もループ抜け raise は必須。
+    """
+
+    @patch("src.comment_generator._create_client")
+    @patch("src.comment_generator.time.sleep")
+    def test_continuous_503_raises_internal_server_error(
+        self, mock_sleep, mock_create_client,
+    ):
+        mock_client = MagicMock()
+        mock_create_client.return_value = mock_client
+        mock_client.messages.batches.create.side_effect = _503_internal_server()
+        items = [{"custom_id": "item_0001", "pdf_text": "x", "pdf_file_name": "001-01-1.pdf"}]
+        with self.assertRaises(_anthropic.InternalServerError):
+            _cg.submit_batch(items)
+
+
+class TestSubmitBatchPermanentInMixedSequence(unittest.TestCase):
+    """``submit_batch`` で 503 → 401 の順で来たとき、401 で恒久判定して停止する。"""
+
+    @patch("src.comment_generator._create_client")
+    @patch("src.comment_generator.time.sleep")
+    def test_503_then_401_raises_permanent_run_failure(
+        self, mock_sleep, mock_create_client,
+    ):
+        mock_client = MagicMock()
+        mock_create_client.return_value = mock_client
+        mock_client.messages.batches.create.side_effect = [
+            _503_internal_server(),
+            _auth_401(),
+        ]
+        items = [{"custom_id": "item_0001", "pdf_text": "x", "pdf_file_name": "001-01-1.pdf"}]
+        with self.assertRaises(_PermanentRunFailureError):
+            _cg.submit_batch(items)
+
+
 if __name__ == "__main__":
     unittest.main()
