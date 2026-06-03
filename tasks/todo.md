@@ -325,3 +325,37 @@ PR #37 マージ後、本番実行で「下書きは作られるが宛先が空�
 - 新規フォルダ命名は無変更（既にマスター名）。既存フォルダのみ挙動追加。
 - P-019 の意図（AI 抽出名での往復 churn 防止）は `authoritative` ガードで維持。
 - 次回本番で WARNING 級の差分（旧名 → 確定名へ同期）のログが出るか観測予定。
+
+## Phase 16: Batch 回収機能の正しい実装（2026-06-02, draft PR）
+
+### 背景 / 根本原因
+`--step results --batch-id <id>` 回収が出力 0 件の no-op。3 層の根本原因（ルーティングで
+step4 不実行 / items を `batch_prep.json` からしか読めず回収ランに不在 / `custom_id` 位置依存で
+Drive 再走査と突合不可）。詳細は lessons.md P-026。
+
+### 設計判断
+- D1: `custom_id` を Drive file id 由来の安定 ID 化（`_custom_id_for_file`）。
+- D2: `reconstruct_items_from_drive`（list + ファイル名分類のみ、本文 DL なし、添付資料も再構築）。
+- D3: `_resolve_items_for_step4`（`batch_prep.json` 優先 → Drive 再走査）。
+- D4: `is_recovery = step=="results" and batch_id is not None` のときだけ step4 完走
+  （discrete results / GHA 6h を保護）。
+- D5: results 非空 & items 空 → `RuntimeError`（無言 0 件撲滅）。
+
+### タスク
+- [x] step1 `custom_id` を安定 ID 化
+- [x] `reconstruct_items_from_drive` 追加
+- [x] `_resolve_items_for_step4` 追加
+- [x] `run()` ルーティング（`is_recovery`）+ step4 へ items 解決を委譲
+- [x] step4 loud guard（results 非空 & items 空 → 例外）
+- [x] README / workflow `step` 説明を完走仕様へ更新
+- [x] tests/test_batch_main.py に 12 件追加
+- [x] E2E smoke 6 件を file id 由来 key に更新
+- [x] pytest 652 件 green / mypy 既存 stub 警告のみ
+
+### Review（結果）
+- 回収コマンドは不変（`--step results --batch-id X`）だが、結果取得だけでなく
+  Drive 再走査 → items 再構築 → step4 まで完走するようになった。`batch_prep.json` が
+  無い別ジョブからの回収でも完走する。
+- 後方互換: `batch_prep.json` があれば優先利用（旧 positional バッチも復元可）。
+  discrete `--step results`（batch_id なし）/ `--step pdfs` / `--step all` は挙動維持。
+- マージは強制しない（draft PR）。

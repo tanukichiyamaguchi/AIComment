@@ -21,7 +21,9 @@ Claude APIで医院名・氏名・実践事例タイトル・コメントを抽�
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import re
 import shutil
 import tempfile
 import time
@@ -92,6 +94,113 @@ def _load_results_from_disk() -> dict[str, dict[str, str]]:
             f"{results_file} がありません。--step results を先に実行してください"
         )
     return json.loads(results_file.read_text())
+
+
+# Anthropic Batch の custom_id 制約（英数・``_``・``-`` のみ / 最大 64 文字）。
+_CUSTOM_ID_SAFE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _custom_id_for_file(file_id: str) -> str:
+    """Drive file id から決定的な custom_id を生成する（CB-4 / 回収の要）。
+
+    位置依存の連番（``item_0001``…）だと、回収時の Drive 再走査で並び順・
+    重複除外がずれて Anthropic 結果（``batch_results.json`` の key）と突合できない。
+    file id 由来の安定 ID にすることで、同一 Drive ファイルは投入時と再走査時で
+    必ず同じ custom_id になり、結果と確実に紐づく。
+
+    Anthropic の custom_id 制約（``^[A-Za-z0-9_-]{1,64}$``）に収まらない場合
+    （file id が想定外に長い / 異文字を含む）は、SHA-256 ハッシュにフォール
+    バックする（同じ file id なら必ず同じ値＝決定的）。
+    """
+    candidate = f"file-{file_id}"
+    if len(candidate) <= 64 and _CUSTOM_ID_SAFE.match(candidate):
+        return candidate
+    digest = hashlib.sha256(file_id.encode("utf-8")).hexdigest()[:48]
+    return f"file-{digest}"
+
+
+def reconstruct_items_from_drive(
+    profile: ProfileConfig | RunConfig,
+) -> list[dict]:
+    """Drive を再走査して step4 用の items を再構築する（CB-4 / 回収）。
+
+    ``batch_prep.json`` が無い回収シナリオ（別 GHA ジョブでバッチ投入し、
+    結果回収を新しいジョブで行う＝logs/ アーティファクトが復元されない）向け。
+
+    step4 が必要とするのは ``custom_id`` / ``pdf_data_id`` / ``pdf_file_name``
+    のみ（``pdf_text`` は step2 のプロンプト用で step4 では不要）。よって本文の
+    ダウンロード・テキスト抽出は一切行わず、Drive のファイル一覧＋ファイル名分類
+    だけで軽量に items を再構築する。``custom_id`` は ``_custom_id_for_file`` で
+    安定生成するため、投入時と同じ ID を再現でき ``batch_results.json`` と突合できる。
+
+    重複判定（処理済みスキップ）はここでは行わない。メイン PDF の重複は step4 の
+    CB-3 が管理番号で弾き、添付資料はメイン処理で構築する ``case_map`` で
+    glue されるため、回収時は「Drive にある全ファイル」を素直に再構築すればよい
+    （冪等性は step4 側が担保）。添付資料情報は step4 の ``_process_attachments``
+    が disk から読むため、``batch_attachments.json`` もここで再構築する。
+    """
+    logger = setup_logging()
+    logger.info("=== Drive 再走査による items 再構築（回収）===")
+
+    pdf_files = drive_client.list_pdfs(folder_id=profile.input_folder_id)
+    main_files = [f for f in pdf_files if not is_attachment_filename(f["name"])]
+    attachment_files = [f for f in pdf_files if is_attachment_filename(f["name"])]
+
+    items = [
+        {
+            "custom_id": _custom_id_for_file(f["id"]),
+            "pdf_data_id": f["id"],
+            "pdf_file_name": f["name"],
+        }
+        for f in main_files
+    ]
+
+    # 添付資料は管理番号を持つものだけ（``_process_attachments`` が管理番号で
+    # case_map を引くため）。重複判定はかけない（step4 が冪等に処理する）。
+    attachment_records = [
+        {
+            "file_id": f["id"],
+            "file_name": f["name"],
+            "management_number": extract_management_number(f["name"]),
+        }
+        for f in attachment_files
+        if extract_management_number(f["name"])
+    ]
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    _atomic_write_json(LOGS_DIR / _BATCH_ATTACHMENTS_FILE, attachment_records)
+
+    logger.info(
+        f"Drive 再走査で再構築: メイン {len(items)}件 / "
+        f"添付資料 {len(attachment_records)}件（custom_id は file id 由来で安定・"
+        f"本文 DL なし）"
+    )
+    return items
+
+
+def _resolve_items_for_step4(
+    profile: ProfileConfig | RunConfig,
+) -> list[dict]:
+    """step4 用の items を解決する（disk 優先 → Drive 再走査フォールバック）。
+
+    ``batch_prep.json`` が非空ならそれを使う（step1 が作った厳密な items。旧
+    positional custom_id のバッチもこれで復元可能）。無い / 空のときは Drive を
+    再走査して再構築する（``reconstruct_items_from_drive``、CB-4 回収シナリオ）。
+    """
+    logger = setup_logging()
+    prep_file = LOGS_DIR / "batch_prep.json"
+    if prep_file.exists():
+        items = json.loads(prep_file.read_text())
+        if items:
+            logger.info(f"items を batch_prep.json からロード ({len(items)}件)")
+            return items
+        logger.warning(
+            "batch_prep.json が空のため Drive 再走査で items を再構築します（回収）"
+        )
+    else:
+        logger.info(
+            "batch_prep.json が無いため Drive 再走査で items を再構築します（回収）"
+        )
+    return reconstruct_items_from_drive(profile)
 
 
 def step1_prepare(
@@ -242,7 +351,9 @@ def step1_prepare(
             continue
 
         items.append({
-            "custom_id": f"item_{i:04d}",
+            # custom_id は Drive file id 由来の安定 ID。回収時の Drive 再走査でも
+            # 同じ ID を再現でき batch_results.json と確実に突合できる（CB-4）。
+            "custom_id": _custom_id_for_file(file_id),
             "pdf_data_id": file_id,  # 後でダウンロードし直す用
             "pdf_file_name": file_name,
             "pdf_text": pdf_text,
@@ -421,7 +532,18 @@ def step4_generate_pdfs(
     ensure_fonts()
 
     if items is None:
-        items = _load_items_from_disk()
+        items = _resolve_items_for_step4(profile)
+
+    # CB-4: バッチ結果があるのに処理対象 items を 1 件も解決できないのは異常
+    # （別ジョブで死んだ回収で batch_prep.json が無く Drive 再走査も 0 件、
+    # プロファイル / 対象フォルダの取り違え等）。黙って「成功 0 件」を書くと回収
+    # 失敗が隠れてしまうため、ここで loud に停止する（無言の no-op を撲滅）。
+    if results and not items:
+        raise RuntimeError(
+            "step4: バッチ結果は存在しますが処理対象 items を 1 件も解決できません"
+            "（batch_prep.json も Drive 再走査も 0 件）。プロファイル / 対象フォルダが"
+            "バッチ投入時と一致しているか確認してください（無言の成功 0 件を防止）。"
+        )
 
     # CB-3: Step4 開始時に **再度** 処理済み管理番号をスナップショットする。
     # Step1 のスナップショット (`processed`) は items の決定に使ったが、
@@ -950,6 +1072,14 @@ def run(
     items: list[dict] | None = None
     results: dict[str, dict[str, str]] | None = None
 
+    # 回収判定: 明示的に ``--batch-id`` を渡した ``results`` 実行だけを「回収」と
+    # みなし、step4 まで完走させる。``batch_id`` を ``batch_id.txt`` から補完する
+    # discrete な ``results``（batch-orchestrator の 1000 件分割運用）では step4 を
+    # 走らせない＝長時間ポーリング直後に PDF 生成を始めて GHA 6h を超える事故を
+    # 防ぐ。``batch_id`` はこの後の results ブロックで補完され得るため、補完前の
+    # 「明示指定だったか」をここで確定させる。
+    is_recovery = step == "results" and batch_id is not None
+
     if step in ("all", "prepare"):
         items = step1_prepare(cfg, test_count=test_count)
 
@@ -970,16 +1100,16 @@ def run(
             batch_id = batch_id_file.read_text().strip()
         results = step3_wait_and_get_results(batch_id)
 
-    if step in ("all", "pdfs"):
-        # CB-2: step=pdfs を別 GHA 実行から呼ぶケース。in-memory results /
-        # items が無ければ disk から復元する（step3 が batch_results.json を
-        # 永続化、step1 が batch_prep.json を永続化）。
+    if step in ("all", "pdfs") or is_recovery:
+        # CB-2: step=pdfs / 回収を別 GHA 実行から呼ぶケース。in-memory results が
+        # 無ければ disk（batch_results.json、step3 が永続化）から復元する。
+        # CB-4: items の解決は step4 に委譲する（batch_prep.json があればそれを
+        # 優先、無ければ Drive 再走査で再構築）。``--step results --batch-id`` で
+        # 死んだジョブから回収する場合、batch_prep.json は別ジョブにしか無いため、
+        # ここでは in-memory items（=None）をそのまま渡し step4 で解決させる。
         if results is None:
             results = _load_results_from_disk()
             logger.info(f"results を batch_results.json からロード ({len(results)}件)")
-        if items is None:
-            items = _load_items_from_disk()
-            logger.info(f"items を batch_prep.json からロード ({len(items)}件)")
         step4_generate_pdfs(cfg, results, items=items)
 
     logger.info("=== Batchモード処理完了 ===")
