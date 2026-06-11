@@ -226,7 +226,19 @@ break して残り item を処理しない、(3) 成功済みの成果物 flush 
 `src/batch_main.step3_wait_and_get_results` のループ内 try/except、
 `src/batch_main.step2_submit_batch` の `batch_id.txt` atomic write。
 
+### P-027: .gitignore からエントリを外す変更と `git add -A` を同時に行わない
+Phase 17-A で `.gitignore` から `node_modules/` / `dist/` を外した直後に
+`git add -A` でコミットしたところ、ディスク上に残っていた node_modules と
+dist（約 50 万行）がコミットに混入した（amend で即修正）。ignore されていた
+パスは「見えていないだけで存在する」。**Rule**: `.gitignore` のエントリを
+削除するときは、(1) 先に該当パスの実体を `rm -rf` で削除（または意図的に
+追跡開始するか判断）し、(2) `git status` で staged 対象を確認してから
+コミットする。`git add -A` は ignore 解除直後の作業ツリーに対しては
+「何が入るか」を必ず目視確認する。コミット直後の `git show --stat` で
+意図したファイル数か検算する習慣も有効（今回 357 files changed で気づけた）。
+
 ## Session Log
+- **2026-06-11**: Phase 17 一掃リファクタリング（A〜C）。(A) 初期スキャフォールド由来の TypeScript 一式（src/*.ts, tests/*.test.ts, tsconfig, package.json, CI の typescript-tests ジョブ）を削除。本番経路（python -m src.batch_main / src.main）からの参照ゼロ・実装はモックのみであることを調査で確定してから削除し、CLAUDE.md の Project Overview / Build & Test を Python 実態に更新。(B) 完全デッドコードの src/matcher.py + test_matcher.py を削除（本体コードから呼び出しゼロ、AI 抽出への置き換えで不要化済み）。(C) main / batch_main の二重実装（PDF 分類 / デデュープ / 医院名標準化 / 医院フォルダ記録 / 下書き蓄積・集約 / 完了マーカー / 添付資料パススルー、計 476 行）を src/run_common.py へ単一実装として集約。依存モジュールは注入方式にして既存テストのモジュール属性パッチを維持し、629 テスト無修正で全パス。外部挙動不変。P-027 を追加。
 - **2026-03-16**: Project initialized with workflow orchestration architecture.
 - **2026-05-01**: Added 5-agent team and 3 deterministic check scripts to handle 1000+ PDF scale. Each agent owns one of the failure modes in P-001 through P-005. See `tasks/todo.md` Phase 6 for the standard operating sequence.
 - **2026-05-03**: Diagnosed `storageQuotaExceeded` regression after PR #8. Root cause was that service accounts cannot own files in My Drive (quota = 0). Fix: route Drive writes through OAuth user token (`GOOGLE_OAUTH_TOKEN_JSON`, falls back to legacy `GMAIL_TOKEN_JSON`). Sheets writes left on service-account auth (no quota issue there).

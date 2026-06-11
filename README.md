@@ -441,6 +441,7 @@ python -m src.batch_main --batch-id msgbatch_xxx --step results
 ├── src/
 │   ├── main.py              # 通常モード エントリポイント
 │   ├── batch_main.py         # Batchモード エントリポイント
+│   ├── run_common.py         # 両モード共通の後段処理（分類・デデュープ・下書き集約等）
 │   ├── config.py             # 設定値管理
 │   ├── profile.py            # プロファイル loader / resolver
 │   ├── discover.py           # フォルダ自動検出モード（INPUT_ROOT 配下から実行設定を派生）
