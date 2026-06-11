@@ -1,7 +1,10 @@
 # AIComment - Development Guidelines
 
 ## Project Overview
-AI-powered code comment generation with workflow orchestration.
+じっせん君コメントシステム — 歯科セミナー実践事例 PDF への AI コメント生成パイプライン。
+Google Drive（入力 PDF）→ Claude API（コメント生成）→ コメントページ結合 PDF →
+Google Drive（出力）/ Google Sheets（出力一覧）/ Gmail（下書き）。
+実装は Python（`src/`）、本番実行は GitHub Actions（`generate_comments.yml`）。
 
 ## 実行環境の制約（絶対遵守）
 
@@ -14,9 +17,8 @@ AI-powered code comment generation with workflow orchestration.
 ブラウザ認証など「ローカル前提」に見える処理であっても、Codespaces 内で完結する代替手段（手動URL貼付フロー / デバイスフロー / Cloud Shell移行 等）を必ず提示すること。
 
 ## Build & Test
-- `npm run build` — compile TypeScript
-- `npm test` — run tests with Node.js test runner
-- `npm run lint` — type-check without emitting
+- `python -m pytest tests/` — run tests
+- `python -m mypy src/ --ignore-missing-imports` — type-check
 
 ## Workflow Orchestration
 
