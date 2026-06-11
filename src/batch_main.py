@@ -35,10 +35,9 @@ from src.utils import (
     ensure_fonts,
     extract_clinic_number,
     extract_management_number,
-    is_attachment_filename,
 )
 from src.config import LOGS_DIR
-from src import config, discover, drive_client, gmail_client, sheets_client
+from src import discover, drive_client, gmail_client, run_common, sheets_client
 from src import pdf_reader, comment_generator, pdf_creator, pdf_merger
 from src.comment_generator import PermanentRunFailureError
 from src.discover import RunConfig
@@ -143,8 +142,7 @@ def reconstruct_items_from_drive(
     logger.info("=== Drive 再走査による items 再構築（回収）===")
 
     pdf_files = drive_client.list_pdfs(folder_id=profile.input_folder_id)
-    main_files = [f for f in pdf_files if not is_attachment_filename(f["name"])]
-    attachment_files = [f for f in pdf_files if is_attachment_filename(f["name"])]
+    main_files, attachment_files = run_common.split_main_and_attachments(pdf_files)
 
     items = [
         {
@@ -242,14 +240,10 @@ def step1_prepare(
     pdf_files = drive_client.list_pdfs(folder_id=profile.input_folder_id)
     logger.info(f"PDF一覧: {len(pdf_files)}件")
 
-    # 入力 PDF を「メイン実践事例」と「添付資料」に早期分類する（P-016）。
     # 添付資料は Claude API に投げず、Step4 で出力へコピーするだけなので、
     # メインのバッチ投入経路（items）には含めない。
-    main_files = [f for f in pdf_files if not is_attachment_filename(f["name"])]
-    attachment_files = [f for f in pdf_files if is_attachment_filename(f["name"])]
-    logger.info(
-        f"入力分類: メイン実践事例 {len(main_files)}件 / "
-        f"添付資料 {len(attachment_files)}件"
+    main_files, attachment_files = run_common.split_main_and_attachments(
+        pdf_files, logger,
     )
 
     # 重複判定（増分処理）— Batch API への投入前に実施する。
@@ -259,34 +253,10 @@ def step1_prepare(
         sheet_name=profile.output_sheet_name,
     )
 
-    skip_no_number = 0
-    skip_processed = 0
-    targets: list[dict] = []
     skipped_records: list[dict] = []  # M-2: manifest 出力用
-    for pdf_file in main_files:
-        file_name = pdf_file["name"]
-        mgmt_num = extract_management_number(file_name)
-        if not mgmt_num:
-            logger.warning(
-                f"管理番号をファイル名から抽出できないためスキップ"
-                f"（先頭が NNN-NN-N 形式でない / 重複検知不可）: {file_name}"
-            )
-            skip_no_number += 1
-            skipped_records.append({
-                "file_id": pdf_file["id"], "file_name": file_name,
-                "reason": "no_management_number",
-            })
-            continue
-        if mgmt_num in processed:
-            logger.info(f"処理済みのためスキップ: {mgmt_num} ({file_name})")
-            skip_processed += 1
-            skipped_records.append({
-                "file_id": pdf_file["id"], "file_name": file_name,
-                "reason": "already_processed",
-                "management_number": mgmt_num,
-            })
-            continue
-        targets.append(pdf_file)
+    targets, skip_no_number, skip_processed = run_common.select_new_targets(
+        main_files, processed, logger, skipped_records,
+    )
 
     if test_count > 0:
         targets = targets[:test_count]
@@ -570,14 +540,11 @@ def step4_generate_pdfs(
     # 識別）に合流させる（P-019）。
     case_map: dict[str, tuple[str, str, str]] = {}
 
-    # 医院フォルダURLシート（``<出力シート名>_医院``）の記録済み医院番号を
-    # 実行開始時に 1 回スナップショットする。ループ中に記録した医院番号は
-    # ``clinics_recorded_this_run`` で追跡し、両方に無い医院だけ追記する。
-    clinic_sheet_name = f"{profile.output_sheet_name}_医院"
-    recorded_clinics = sheets_client.get_recorded_clinic_numbers(
-        sheet_name=clinic_sheet_name,
+    # 医院フォルダURLシート（``<出力シート名>_医院``）への記録は
+    # ClinicFolderRecorder が担う（記録済みスナップショット + 実行内重複防止）。
+    clinic_recorder = run_common.ClinicFolderRecorder(
+        sheets_client, profile.output_sheet_name,
     )
-    clinics_recorded_this_run: set[str] = set()
 
     # 参加者マスターシートを Step4 開始時に 1 回だけ読み込む。医院名の標準化
     # （フォルダ命名・各種シート列）と Gmail 下書きの TO ルックアップを兼ねる
@@ -593,31 +560,6 @@ def step4_generate_pdfs(
     # PDF ファイルは集約まで生存させる必要があるので session_outputs_dir に書く。
     session_outputs_dir = Path(tempfile.mkdtemp(prefix="aicomment_batch_outputs_"))
     draft_items: list[dict[str, Any]] = []
-
-    def _record_clinic_folder(
-        clinic_number: str, clinic_name: str, clinic_folder_id: str
-    ) -> None:
-        """医院フォルダURLシートに医院を 1 行記録する（重複防止込み）。
-
-        医院番号が実行開始時のスナップショットにも同一実行内で記録済みの
-        集合にも無いときだけ追記する。医院番号が空の場合は記録しない。
-        """
-        if not clinic_number:
-            return
-        if clinic_number in recorded_clinics:
-            return
-        if clinic_number in clinics_recorded_this_run:
-            return
-        clinic_folder_url = (
-            f"https://drive.google.com/drive/folders/{clinic_folder_id}"
-        )
-        sheets_client.append_clinic_folder_record(
-            clinic_number=clinic_number,
-            clinic_name=clinic_name,
-            clinic_folder_url=clinic_folder_url,
-            sheet_name=clinic_sheet_name,
-        )
-        clinics_recorded_this_run.add(clinic_number)
 
     for item in items:
         custom_id = item["custom_id"]
@@ -661,25 +603,15 @@ def step4_generate_pdfs(
             stats["skip_already_processed"] += 1
             continue
 
-        # 医院名は参加者マスターから引いた標準表記を最優先（表記統一 +
-        # 「開業準備中」等の固定文字列対応）。未登録なら AI 抽出値で代用
-        # （現状維持の挙動）。代用時は必ず警告ログを出す。以後すべての
-        # 医院名用途で ``clinic_name`` 変数を使う。
-        clinic_name_from_master = sheets_client.lookup_clinic_name(
-            master_records, clinic_number,
+        # 医院名は参加者マスターの標準表記を最優先、未登録なら AI 抽出値で
+        # 代用（警告ログは resolve_clinic_name 内）。以後すべての医院名
+        # 用途で ``clinic_name`` 変数を使う。
+        clinic_name, clinic_name_is_authoritative = (
+            run_common.resolve_clinic_name(
+                sheets_client, master_records,
+                clinic_number, clinic_name_from_ai, logger,
+            )
         )
-        if clinic_name_from_master:
-            clinic_name = clinic_name_from_master
-            logger.info(
-                f"医院名をマスターシートから取得: "
-                f"{clinic_number} → {clinic_name}"
-            )
-        else:
-            clinic_name = clinic_name_from_ai
-            logger.warning(
-                f"参加者マスター未登録、AI 抽出値で代用: "
-                f"医院番号={clinic_number}, AI 抽出={clinic_name_from_ai}"
-            )
 
         output_filename = pdf_merger.make_output_filename(
             clinic_name, person_name, sample_title
@@ -717,7 +649,7 @@ def step4_generate_pdfs(
                     person_name=person_name,
                     file_name=output_filename,
                     # マスター由来の確定医院名なら既存フォルダ名も同期させる
-                    clinic_name_authoritative=bool(clinic_name_from_master),
+                    clinic_name_authoritative=clinic_name_is_authoritative,
                 )
 
                 sheets_client.append_output_record(
@@ -729,7 +661,7 @@ def step4_generate_pdfs(
                     sheet_name=profile.output_sheet_name,
                 )
                 # 医院フォルダURLシートに医院を記録（同一医院は 1 行のみ）。
-                _record_clinic_folder(
+                clinic_recorder.record(
                     clinic_number, clinic_name,
                     upload_result["clinic_folder_id"],
                 )
@@ -790,20 +722,17 @@ def step4_generate_pdfs(
         f"未取得 {stats['missing']}/{total}件"
     )
 
-    # 出力一覧シートの最終行に「完了」マーカーを 1 行追加（運用者がシート上で
-    # 一目で完了を把握できるように）。書き込み自体は fail-soft（Step4 本体は
-    # 既に終わっているため、マーカー失敗で例外を上げない）。
-    try:
-        sheets_client.append_completion_marker(
-            sheet_name=profile.output_sheet_name,
-            summary=(
-                f"成功 {stats['success']}件 / "
-                f"エラー {stats['error']}件 / "
-                f"未取得 {stats['missing']}件"
-            ),
-        )
-    except Exception as e:
-        logger.warning(f"完了マーカーの追記に失敗（処理自体は完了済み）: {e}")
+    # 出力一覧シートの最終行に「完了」マーカーを 1 行追加（fail-soft）。
+    run_common.append_completion_marker_safe(
+        sheets_client,
+        profile.output_sheet_name,
+        (
+            f"成功 {stats['success']}件 / "
+            f"エラー {stats['error']}件 / "
+            f"未取得 {stats['missing']}件"
+        ),
+        logger,
+    )
 
 
 def _collect_draft_item_batch(
@@ -813,31 +742,17 @@ def _collect_draft_item_batch(
     person_name: str,
     pdf_path: Path,
 ) -> None:
-    """PDF アップロード成功後、Gmail 下書き用の (メール, 個人名, PDF) を
-    ``draft_items`` に追加する。マスター lookup の例外は警告ログを出して
-    握りつぶす（fail-soft、PDF 処理は止めない）。
+    """Gmail 下書き用の (メール, 個人名, PDF) を ``draft_items`` に蓄積する。
+
+    実装は ``run_common.collect_draft_item`` に委譲する（通常モードと共通、
+    fail-soft）。
     """
-    logger = setup_logging()
-    try:
-        email = sheets_client.lookup_email_by_clinic_and_person(
-            master_records, clinic_number, person_name,
-        )
-        if not email:
-            logger.warning(
-                f"メール未ヒット → 宛先空で下書き予定 "
-                f"(医院管理番号={clinic_number}, 個人名={person_name!r})"
-            )
-        draft_items.append({
-            "email": email,
-            "person_name": person_name,
-            "pdf_path": pdf_path,
-            "clinic_number": clinic_number,
-        })
-    except Exception as e:
-        logger.error(
-            f"メール lookup 失敗（PDF 処理は続行、下書きは作らない）: {e}",
-            exc_info=True,
-        )
+    run_common.collect_draft_item(
+        draft_items, master_records, sheets_client,
+        clinic_number=clinic_number,
+        person_name=person_name,
+        pdf_path=pdf_path,
+    )
 
 
 def _create_grouped_drafts_for_batch(
@@ -845,75 +760,11 @@ def _create_grouped_drafts_for_batch(
 ) -> None:
     """``draft_items`` をメールアドレスでグループ化して下書きを作成する。
 
-    通常モード (``main._create_grouped_drafts_for_run``) と同じロジック:
-    メールアドレスごとに 1 通の下書きにまとめ、空メールは PDF ごとに個別の
-    宛先空下書きを作る。例外は警告ログを出して握りつぶす（fail-soft）。
-
-    ``config.ENABLE_GMAIL_DRAFTS=false`` のときは下書きを 1 通も作らずに戻る。
+    実装は ``run_common.create_grouped_drafts`` に委譲する（通常モードと
+    共通、P-023）。``gmail_client`` は呼び出し時のモジュール属性を渡す
+    （テストのモジュールパッチを生かすため）。
     """
-    logger = setup_logging()
-    if not config.ENABLE_GMAIL_DRAFTS:
-        logger.info(
-            f"Gmail下書きはOFF（ENABLE_GMAIL_DRAFTS=false）のため作成をスキップ"
-            f"（蓄積 {len(draft_items)}件は破棄）"
-        )
-        return
-    if not draft_items:
-        return
-
-    groups: dict[str, list[dict[str, Any]]] = {}
-    empty_email_items: list[dict[str, Any]] = []
-    for item in draft_items:
-        email = item["email"]
-        if email:
-            groups.setdefault(email, []).append(item)
-        else:
-            empty_email_items.append(item)
-
-    logger.info(
-        f"Gmail下書き集約: メールあり{len(groups)}グループ "
-        f"({sum(len(v) for v in groups.values())}件分), "
-        f"メール空{len(empty_email_items)}件 → 計{len(groups) + len(empty_email_items)}通の下書きを作成"
-    )
-
-    for email, items in groups.items():
-        pdf_paths = [item["pdf_path"] for item in items]
-        unique_names = sorted({item["person_name"] for item in items})
-        if len(unique_names) == 1:
-            person_name = unique_names[0]
-        else:
-            # 同一メールに別人が紐づく場合（家族メール、医院共有メール等）、
-            # 件名・本文に複数名が含まれていることを示す形式に切り替える
-            # （F-06: 先頭1名だけ書くと受信者が混乱するため）
-            person_name = f"{unique_names[0]} ほか{len(unique_names) - 1}名"
-            logger.warning(
-                f"同一メール {email!r} に異なる個人名が紐づいています: "
-                f"{unique_names} → '{person_name}' で下書き作成"
-            )
-        try:
-            gmail_client.create_draft(
-                to_email=email,
-                person_name=person_name,
-                pdf_paths=pdf_paths,
-                cc_email=None,
-            )
-        except Exception as e:
-            logger.error(
-                f"Gmail下書き作成失敗（処理は続行）: {e}", exc_info=True
-            )
-
-    for item in empty_email_items:
-        try:
-            gmail_client.create_draft(
-                to_email="",
-                person_name=item["person_name"],
-                pdf_paths=[item["pdf_path"]],
-                cc_email=None,
-            )
-        except Exception as e:
-            logger.error(
-                f"Gmail下書き作成失敗（処理は続行）: {e}", exc_info=True
-            )
+    run_common.create_grouped_drafts(draft_items, gmail_client)
 
 
 def _process_attachments(
@@ -952,6 +803,16 @@ def _process_attachments(
         logger.info("添付資料 0 件")
         return
 
+    def _collect(clinic_number: str, person_name: str, pdf_path: Path) -> None:
+        """添付資料経路の下書き蓄積（``draft_items`` / ``master_records`` を束縛）。"""
+        _collect_draft_item_batch(
+            draft_items=draft_items,
+            master_records=master_records,
+            clinic_number=clinic_number,
+            person_name=person_name,
+            pdf_path=pdf_path,
+        )
+
     logger.info(f"--- 添付資料パススルー: {len(attachment_records)}件 ---")
     for record in attachment_records:
         file_id = record["file_id"]
@@ -978,55 +839,23 @@ def _process_attachments(
         clinic_name_authoritative = bool(
             sheets_client.lookup_clinic_name(master_records, clinic_number)
         )
-        try:
-            # 元 PDF のバイト列をそのまま再アップロード（マージ・コメント
-            # ページ生成はしない）。出力ファイル名は元のまま。session_outputs_dir
-            # に書いてループ終了後の集約下書き作成まで生存させる。
-            pdf_data = drive_client.download_pdf(file_id)
-            att_subdir = session_outputs_dir / f"attach_{file_id}"
-            att_subdir.mkdir(parents=True, exist_ok=True)
-            attachment_path = att_subdir / file_name
-            attachment_path.write_bytes(pdf_data)
-            upload_result = drive_client.upload_pdf_to_clinic_person(
-                file_path=attachment_path,
-                output_root_folder_id=profile.output_folder_id,
-                clinic_number=clinic_number,
-                clinic_name=clinic_name,
-                person_name=person_name,
-                file_name=file_name,
-                clinic_name_authoritative=clinic_name_authoritative,
-            )
-
-            sheets_client.append_output_record(
-                management_number=mgmt_num,
-                clinic_name=clinic_name,
-                person_name=person_name,
-                sample_name=f"【添付資料】{file_name}",
-                drive_url=upload_result["webViewLink"],
-                sheet_name=profile.output_sheet_name,
-            )
-
-            # 添付資料経路も Gmail 下書き用に蓄積する。同じ個人宛のメイン PDF
-            # と同じグループに集約され、1 通の下書きに複数添付される。
-            _collect_draft_item_batch(
-                draft_items=draft_items,
-                master_records=master_records,
-                clinic_number=clinic_number,
-                person_name=person_name,
-                pdf_path=attachment_path,
-            )
-
-            logger.info(
-                f"添付資料コピー完了: {mgmt_num} / {clinic_name} / "
-                f"{person_name} / {file_name}"
-            )
-            stats["success"] += 1
-
-        except Exception as e:
-            logger.error(
-                f"添付資料処理エラー: {file_name} - {e}", exc_info=True
-            )
-            stats["error"] += 1
+        run_common.passthrough_attachment(
+            drive_module=drive_client,
+            sheets_module=sheets_client,
+            logger=logger,
+            stats=stats,
+            collect_draft=_collect,
+            file_id=file_id,
+            file_name=file_name,
+            mgmt_num=mgmt_num,
+            clinic_number=clinic_number,
+            clinic_name=clinic_name,
+            person_name=person_name,
+            output_folder_id=profile.output_folder_id,
+            output_sheet_name=profile.output_sheet_name,
+            session_outputs_dir=session_outputs_dir,
+            clinic_name_authoritative=clinic_name_authoritative,
+        )
 
 
 def run(
