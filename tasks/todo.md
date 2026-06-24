@@ -1,5 +1,75 @@
 # じっせん君コメントシステム - Task Tracker
 
+## Phase 17: 蓄積した無駄の一掃リファクタリング（2026-06-11, A〜C 完了）
+
+### ゴール
+長年蓄積したデッドコード・二重実装・腐敗ドキュメントを段階的に除去する。
+**全フェーズで外部挙動は不変**（出力 PDF / Drive / Sheets / Gmail 下書きの内容・
+冪等性・エラー分類は一切変えない）。各フェーズ完了ごとに
+pytest 全パス + mypy clean を確認してから個別コミットする。
+
+### ベースライン（着手前に確定済み）
+- pytest: **652 passed**（+22 subtests）
+- mypy: **Success: no issues found in 15 source files**
+- 本番経路: GitHub Actions `generate_comments.yml` → `python -m src.batch_main` / `src.main`
+
+### 調査で確定した「無駄」の全量
+1. **TypeScript スキャフォールド一式（完全デッドコード）**
+   - `src/index.ts` / `src/ai/*.ts` / `src/workflow/*.ts` / `src/types/workflow.ts`
+     / `tests/*.test.ts` / `tsconfig.json` / `package.json` / `package-lock.json`
+   - 実装はインターフェース＋モックのみ（実 API 呼び出しゼロ）。
+     2026-03-16 の初期スキャフォールド以降、一度も変更されていない。
+     本番ワークフローからの参照ゼロ。CI の `typescript-tests` ジョブだけが延命装置。
+2. **`src/matcher.py`（156 行、完全デッドコード）**
+   - 本体コード（src/ scripts/）から呼び出しゼロ。`tests/test_matcher.py` のみが参照。
+     AI 抽出（comment_generator）への置き換えで不要化した旧マッチングロジック。
+3. **main.py / batch_main.py の二重実装（約 395 行の重複）**
+   - 医院フォルダ URL 記録（完全一致 25 行 ×2）、PDF 分類、管理番号デデュープ、
+     Gmail 下書き蓄積/集約（`_create_grouped_drafts_for_run` vs `_for_batch`）、
+     完了マーカー追記、添付資料パススルー（約 80% 重複）
+4. **ドキュメント腐敗**
+   - CLAUDE.md の Project Overview / Build & Test が TS 用（npm run build 等）のまま
+   - package.json の description「AI-powered code comment generation」も初期スキャフォールドの名残
+5. **（低優先・要相談）設定 3 系統の整理 / プロンプト共通化**
+   - ProfileConfig / RunConfig の重複フィールド（約 80 行）
+   - テーマ別プロンプトの共通括り出し（約 60 行、ただし出力品質に直結）
+
+### フェーズ計画
+- **Phase 17-A: TS スキャフォールド全削除（純削除・低リスク）**
+  - [x] TS ソース・テスト・tsconfig・package.json・package-lock.json を削除
+  - [x] `.github/workflows/ci.yml` から `typescript-tests` ジョブを削除
+  - [x] CLAUDE.md の Project Overview / Build & Test を実態（pytest / mypy）に更新
+  - [x] `.gitignore` の node 系エントリ整理
+  - [x] pytest + mypy 全パス確認 → コミット
+- **Phase 17-B: matcher.py 削除（純削除・低リスク）**
+  - [x] `src/matcher.py` + `tests/test_matcher.py` を削除
+  - [x] 横断 grep で参照ゼロを最終確認（README 構成図の 1 行のみ → 更新）
+  - [x] pytest + mypy 全パス確認 → コミット
+- **Phase 17-C: main / batch_main の共通処理抽出（挙動不変リファクタ）**
+  - [x] 共有モジュール（`src/run_common.py`）を新設し、共通ブロックを移管:
+        PDF 分類 / デデュープ / 医院名標準化 / 医院フォルダ記録（Recorder 化）
+        / 下書き蓄積・集約 / 完了マーカー / 添付資料パススルー
+  - [x] 微差（run_halted の「中止」分岐、skip manifest、authoritative 再判定、
+        テスト注入用 gmail_module 引数）は引数・呼び出し側に残す（挙動不変）
+  - [x] 依存モジュール（sheets/drive/gmail）は注入方式にして既存テストの
+        モジュール属性パッチ（`patch("src.main.sheets_client")` 等）を維持
+  - [x] main / batch_main の統合はしない（通常 / Batch の設計思想が異なるため）
+  - [x] pytest + mypy 全パス確認 → コミット
+- **Phase 17-D（未実施・要承認）: 設定層の整理** — ユーザー判断で今回スコープ外
+- **Phase 17-E（未実施・推奨保留）: プロンプト共通括り出し** — 同上
+
+### 結果サマリ
+- スコープ: ユーザー承認により A〜C を実施（D/E は見送り）
+- コミット: 3 件（17-A: 55e64eb / 17-B: b9a40e9 / 17-C: d7c5a5f）
+- 削減量:
+  - TS 一式: 13 ファイル・約 1,150 行 + CI 1 ジョブ（npm install 含む延命コスト）
+  - matcher.py + テスト: 332 行
+  - main.py 652 → 475 行 / batch_main.py 1165 → 994 行（重複 476 行を削除、
+    新規 run_common.py 393 行に単一実装として集約）
+- 検証: pytest 629 passed（652 から減少した 23 件は削除した matcher テストのみ、
+  既存テストは無修正で全パス）/ mypy Success
+- 外部挙動: 不変（ログ文言・統計カウンタ・Sheets/Drive/Gmail 呼び出し順を維持）
+
 ## Phase 12: 参加者マスターシート統合リファクタ（2026-05-26）
 
 ### ゴール

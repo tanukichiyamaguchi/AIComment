@@ -441,8 +441,10 @@ python -m src.batch_main --batch-id msgbatch_xxx --step results
 ├── src/
 │   ├── main.py              # 通常モード エントリポイント
 │   ├── batch_main.py         # Batchモード エントリポイント
+│   ├── run_common.py         # 両モード共通の後段処理（分類・デデュープ・下書き集約等）
 │   ├── config.py             # 設定値管理
 │   ├── profile.py            # プロファイル loader / resolver
+│   ├── discover.py           # フォルダ自動検出モード（INPUT_ROOT 配下から実行設定を派生）
 │   ├── utils.py              # ログ設定・フォントダウンロード・ファイル名整形
 │   ├── pdf_reader.py         # PDFテキスト抽出
 │   ├── comment_generator.py  # Claude API（構造化出力で医院名/氏名/タイトル/コメント取得）
@@ -450,9 +452,9 @@ python -m src.batch_main --batch-id msgbatch_xxx --step results
 │   ├── pdf_merger.py         # PDF結合
 │   ├── drive_client.py       # Google Drive API（階層フォルダ作成 + アップロード）
 │   ├── sheets_client.py      # Google Sheets API（出力一覧シート追記 + 参加者マスター読み取り）
-│   ├── gmail_client.py       # Gmail API（コメント付き PDF を添付した下書きを作成）
-│   └── matcher.py            # 旧マッチング（v2では未使用）
+│   └── gmail_client.py       # Gmail API（コメント付き PDF を添付した下書きを作成）
 ├── profiles/                 # プロファイル YAML（document_type × period の組み合わせ）
+├── scripts/                  # 運用チェックスクリプト（PDF triage / 冪等性監査 / 出力検証 / OAuth トークン生成）
 ├── tests/                    # テストコード
 ├── notebooks/                # Google Colabノートブック
 ├── assets/                   # フォント・画像

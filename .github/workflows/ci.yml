@@ -43,24 +43,3 @@ jobs:
 
       - name: mypy 型チェック実行
         run: python -m mypy src/ --ignore-missing-imports
-
-  # TypeScript テスト - Node.js テストランナーで実行
-  typescript-tests:
-    name: TypeScript テスト
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: 'npm'
-
-      - name: 依存関係のインストール
-        run: npm install
-
-      - name: テスト実行
-        run: npm test
-
-      - name: 型チェック実行
-        run: npm run lint
