@@ -22,6 +22,47 @@ from src import config
 from src.utils import extract_management_number, is_attachment_filename, setup_logging
 
 
+class MasterSheetEmptyError(RuntimeError):
+    """target_folder モードで参加者マスタータブが不在 / 0 件のとき送出する。
+
+    自動検出モード（``RunConfig.master_sheet_strict=True``）は「セミナーごとに
+    1 タブ」を前提とするため、対象セミナーのマスタータブが未準備のままだと
+    Gmail 下書きが全件宛先空・医院名フォルダが AI 抽出値で作成、といった
+    リカバリ困難な事故になる（2026-05-29 撤回の F-09 と同じ症状）。空タブの
+    まま処理を進めないよう、PDF 処理ループに入る前に即停止する。
+
+    呼び出し側（main.run / batch_main.step1_prepare_items /
+    batch_main._process_results_and_create_pdfs）は本例外を捕捉して
+    「中止」マーカーを追記してから再送出し、GHA ジョブを非ゼロ終了させる。
+    """
+
+
+def require_non_empty_master(
+    records: list[Any],
+    sheet_name: str,
+    strict: bool,
+    logger: logging.Logger,
+) -> None:
+    """target_folder モードでマスターが空ならログ + 例外。それ以外は何もしない。
+
+    ``strict`` が False（プロファイルモード）のときは、過去通り空でも処理を
+    続行する（WARNING は ``sheets_client._ensure_master_sheet`` が出す）。
+    """
+    if not strict:
+        return
+    if records:
+        return
+    logger.error(
+        f"参加者マスタータブ '{sheet_name}' が不在または 0 件です。"
+        f"セミナー名（= 入力フォルダ名）と一致するタブを準備して再実行して"
+        f"ください（例: 入力フォルダ '新人育成塾' なら "
+        f"タブ '参加者マスター(新人育成塾)' に参加者行を投入）。"
+        f"準備しないまま実行すると Gmail 下書きが全件宛先空になり、"
+        f"医院名フォルダも AI 抽出値で作成されてしまうため即停止します。"
+    )
+    raise MasterSheetEmptyError(sheet_name)
+
+
 def split_main_and_attachments(
     pdf_files: list[dict],
     logger: logging.Logger | None = None,

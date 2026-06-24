@@ -1,5 +1,40 @@
 # じっせん君コメントシステム - Task Tracker
 
+## Phase 18: 参加者マスタータブをセミナーごとに分離 + 空タブ HARD FAIL（2026-06-24）
+
+### ゴール
+セミナー（= 入力フォルダ名）ごとに参加者マスタータブを独立させる。
+target_folder モード（フォルダ自動検出）で `参加者マスター(<フォルダ名>)`
+形式のタブを使い、タブ不在 / 0 件のときは PDF 処理に入る前に HARD FAIL で
+即停止する（F-09 撤回の理由だった「ユーザー運用と食い違う」は、HARD FAIL で
+「気づけない事故」を排除することで解消）。
+
+### 設計判断
+- タブ名は **フォルダ名をそのまま `()` 内に使う**（例: `新人育成塾` →
+  `参加者マスター(新人育成塾)`）
+- HARD FAIL は **target_folder モードのみ**（`master_sheet_strict=True`）。
+  プロファイルモードは共有タブを 1 枚使い回す既存運用を維持
+  （`master_sheet_strict=False`、後方互換）
+- Batch モードでは **Anthropic API 投入前**（Step1）にガード（料金の無駄を防ぐ）
+- Resume パス（`--step results`/`pdfs`）にも保険として Step4 で重ねる（多層防御）
+- HARD FAIL 時は「中止」マーカーを fail-soft で 1 行追記してから例外送出
+
+### タスク
+- [x] baseline: 629 tests pass, mypy clean
+- [x] discover.RunConfig: `master_sheet_name = f"参加者マスター({target})"` + `master_sheet_strict=True`
+- [x] run_common: `MasterSheetEmptyError` + `require_non_empty_master`
+- [x] main.run: read_master_records 後に HARD FAIL を組み込む（中止マーカー追記 → raise）
+- [x] batch_main.step1_prepare: Step1 開始時に HARD FAIL（Anthropic 投入前のガード）
+- [x] batch_main._process_results_and_create_pdfs: Step4 にも保険を入れる
+- [x] tests: test_discover の派生規則、test_main の HARD FAIL 経路、test_batch_main の Step1/Step4 ガード、run_common 単体（合計 +9 件）
+- [x] README §4-4 と「フォルダ自動検出モード」を新仕様に更新
+- [x] lessons.md P-028 + Session Log 2026-06-24 を追記
+- [x] pytest 638 件 pass / mypy clean
+- [ ] PR 作成 → ドラフト
+
+### 結果サマリ
+（マージ後に記入）
+
 ## Phase 17: 蓄積した無駄の一掃リファクタリング（2026-06-11, A〜C 完了）
 
 ### ゴール

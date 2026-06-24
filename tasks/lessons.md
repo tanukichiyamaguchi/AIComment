@@ -226,6 +226,31 @@ break して残り item を処理しない、(3) 成功済みの成果物 flush 
 `src/batch_main.step3_wait_and_get_results` のループ内 try/except、
 `src/batch_main.step2_submit_batch` の `batch_id.txt` atomic write。
 
+### P-028: 「安全のための分離」を再導入するときは、その分離を破る空状態を HARD FAIL で必ず可視化する
+F-09（per-folder マスタータブ）は 2026-05-29 に「ユーザーの共有タブ運用と
+食い違う」という理由で撤回したが、その後のセミナー数増加で「セミナーごとに
+独立した参加者管理」要求が再浮上した。再導入時に同じ事故（タブ未準備のまま
+実行 → 医院名フォルダが AI 抽出値・Gmail 下書きが全件宛先空）を防ぐため、
+**タブ不在 / 0 件を WARNING で済ませず HARD FAIL（``MasterSheetEmptyError``）
+で即停止** にした（自動検出モードは ``master_sheet_strict=True``、プロファイル
+モードは ``False`` で後方互換）。**Rule**: 「安全のための分離」（per-seminar /
+per-customer 等の物理分離）を導入・再導入するとき、分離先のリソースが
+未準備のままで実行できてしまう経路は「サイレント空動作」の温床になる。
+最初から HARD FAIL で気づかせる設計にする（WARNING ログは本番運用で
+見落とされる、F-05/F-11 補強を経ても見落とされた実績がある）。Batch モードでは
+**Anthropic API 投入前**（Step1）にガードして料金の無駄も同時に防ぐ。
+Resume パス（``--step results``/``pdfs``）にも保険として同じガードを Step4 で
+重ねる（多層防御、P-025 と同じ思想）。``master_sheet_strict`` は
+``RunConfig`` のフィールドで、``ProfileConfig`` には無いので ``getattr(profile,
+"master_sheet_strict", False)`` の fallback で両モード共存する（後方互換）。
+HARD FAIL 時は出力一覧シートに「中止（参加者マスタータブ未準備）」マーカーを
+fail-soft で 1 行追記してから例外を送出する（GHA を非ゼロ終了 + シートでも
+停止が分かる）。実装例: `src/discover.RunConfig.from_discovered` の
+``master_sheet_name=f"参加者マスター({ctx.target_folder_name})"`` /
+``master_sheet_strict=True``、`src/run_common.MasterSheetEmptyError` /
+``require_non_empty_master``、`src/main.run` と `src/batch_main.step1_prepare` /
+``_process_results_and_create_pdfs`` の HARD FAIL 経路。
+
 ### P-027: .gitignore からエントリを外す変更と `git add -A` を同時に行わない
 Phase 17-A で `.gitignore` から `node_modules/` / `dist/` を外した直後に
 `git add -A` でコミットしたところ、ディスク上に残っていた node_modules と
@@ -238,6 +263,7 @@ dist（約 50 万行）がコミットに混入した（amend で即修正）。
 意図したファイル数か検算する習慣も有効（今回 357 files changed で気づけた）。
 
 ## Session Log
+- **2026-06-24**: 参加者マスタータブをセミナーごとに分離 + 空タブ HARD FAIL（P-028）。target_folder モード（フォルダ自動検出）で ``RunConfig.from_discovered`` の ``master_sheet_name`` 派生を共有 ``参加者マスター`` から ``f"参加者マスター({target_folder_name})"`` に変更し（例: 入力フォルダ ``新人育成塾`` → タブ ``参加者マスター(新人育成塾)``）、セミナーごとに独立した参加者管理を実現。同時に ``RunConfig`` に ``master_sheet_strict: bool`` フィールドを追加し自動検出モードでは ``True``、プロファイルモードでは ``False`` で後方互換。``src/run_common.MasterSheetEmptyError`` + ``require_non_empty_master`` ヘルパーを新設し、target_folder モードでタブ不在 / 0 件のとき PDF 処理ループに入る前に HARD FAIL → 出力一覧シートに「中止（参加者マスタータブ未準備）」マーカーを fail-soft で追記 → 例外再送出で GHA 非ゼロ終了。Batch モードは Step1 開始時に Anthropic API 投入前のガードを入れ、Step4 にも resume パスの保険として重ねる（多層防御、P-025 同思想）。pytest 629 → 638 件（HARD FAIL 検証 4 件 + 後方互換検証 1 件 + run_common 単体 3 件 + smoke 修正 1 件）、mypy clean。F-09 撤回（2026-05-29）の理由「ユーザー運用と食い違う」は HARD FAIL で「気づけない事故」を排除することで解消。
 - **2026-06-11**: Phase 17 一掃リファクタリング（A〜C）。(A) 初期スキャフォールド由来の TypeScript 一式（src/*.ts, tests/*.test.ts, tsconfig, package.json, CI の typescript-tests ジョブ）を削除。本番経路（python -m src.batch_main / src.main）からの参照ゼロ・実装はモックのみであることを調査で確定してから削除し、CLAUDE.md の Project Overview / Build & Test を Python 実態に更新。(B) 完全デッドコードの src/matcher.py + test_matcher.py を削除（本体コードから呼び出しゼロ、AI 抽出への置き換えで不要化済み）。(C) main / batch_main の二重実装（PDF 分類 / デデュープ / 医院名標準化 / 医院フォルダ記録 / 下書き蓄積・集約 / 完了マーカー / 添付資料パススルー、計 476 行）を src/run_common.py へ単一実装として集約。依存モジュールは注入方式にして既存テストのモジュール属性パッチを維持し、629 テスト無修正で全パス。外部挙動不変。P-027 を追加。
 - **2026-03-16**: Project initialized with workflow orchestration architecture.
 - **2026-05-01**: Added 5-agent team and 3 deterministic check scripts to handle 1000+ PDF scale. Each agent owns one of the failure modes in P-001 through P-005. See `tasks/todo.md` Phase 6 for the standard operating sequence.
@@ -279,4 +305,5 @@ dist（約 50 万行）がコミットに混入した（amend で即修正）。
 - **2026-05-29**: 自動検出モードの参加者マスター参照先を共有「参加者マスター」へ変更（F-09 を撤回）。ユーザー報告「フォルダ名の医院名がスプレッドシートの医院名と一致しない」の根本原因。自動検出モード（`--target-folder テストN`）は F-09（P-022）で `master_sheet_name = f"{target_folder_name}_参加者マスター"`（例 `テスト9_参加者マスター`）を読んでいたが、ユーザーは実データを共有の `参加者マスター` タブに入力していた。システムは空の per-folder タブ（`read_master_records` がヘッダーのみで自動作成）を読み → `lookup_clinic_name` が "" を返し → 医院名が AI 抽出値にフォールバック → フォルダ名がマスター医院名と不一致、かつ Gmail 下書きも宛先空、という事故が起きていた。対応: `discover.RunConfig.from_discovered` の `master_sheet_name` を `MASTER_SHEET_NAME`（共有 `参加者マスター`）に変更。これでプロファイルモード・自動検出モードの両方が同じ共有タブを読む。トレードオフ: F-09 が防いでいた「全セミナー共有タブによるセミナー取り違え」リスクは運用規律に委ねる（実行前に `参加者マスター` の中身を対象セミナーのデータへ差し替える＝ユーザーの既存運用、2026-05-26 エントリと整合）。下書きは自動送信されない（レビュー前提）ため、誤タブのままでも送信事故には直結しない。test_discover の F-09 回帰テスト 2 件を「共有タブを読む」検証に置換（511 件維持）。README の医院フォルダ命名記述も PR #41 のリネーム挙動に合わせて正確化。教訓: (1) **「安全のための分離」と「ユーザーの実運用」が食い違うと、分離はサイレントな空読みを生む**。F-09 は誤送信を防ぐ意図だったが、ユーザーが共有タブ運用だったため逆に「マスター未参照」を量産した。安全機構は実運用フローに沿わせる（沿わせられないなら空タブ実行時に明示警告/HARD FAIL で気づかせる — `read_master_records` の 0 件 WARNING は既にあるが運用者の目に入っていなかった）。(2) **同一論点で過去に相反する判断（2026-05-26 の単一タブ運用 vs F-09 の per-folder 分離）が残っていると事故になる**。最新のユーザー意図を確認して一方に寄せ、矛盾を残さない。
 - **2026-05-29**: CI「Python テスト」の transient 失敗を root-cause 修正（フォント DL リトライ）。PR #42 で CI のみ失敗（ローカル / clean worktree / 最新依存 venv の全てで 511 passed のため再現せず）。原因: `test_pdf_creator` / `test_pdf_merger` が実 `ensure_fonts()` を呼び、`assets/*.ttf`（.gitignore で fresh checkout に不在）を GitHub raw から都度ダウンロードしていた。リトライ無しのため一時的ネットワーク障害（5xx / タイムアウト）で即 `RuntimeError` → テスト失敗。ローカルはフォントがキャッシュ済みで早期 return するため再現しない（＝CI 限定 flaky の典型）。修正: `ensure_fonts()` を指数バックオフ（2/4/8 秒）最大 4 回リトライ化（P-017 と同思想、本番 1000 件実行の CDN 一時障害耐性も向上）。未使用の `fonts` dict / `base_url` を削除。pytest 511 → 514 件。教訓: (1) **テストが実ネットワーク I/O に依存すると CI 限定 flaky になる**。ローカルはキャッシュ / 既存ファイルで隠れて気づけない。CI-only 失敗は「fresh checkout で初めて走る I/O（DL・ファイル生成）」をまず疑う。(2) **切り分けは CI 環境に寄せる**（clean worktree + 最新依存 venv）。それでも再現しなければ「外部依存 × 実行タイミング」を疑う。(3) **外部取得は最初からリトライ前提で書く**（quota 用 throttle とは別に、一過性エラー用のバックオフ retry）。
 - **2026-06-02**: 本番ラン途中のクレジット切れに fail-fast 停止を導入（reproduce-first、P-024）。本番 GHA ラン 164 件中 49 件が同一エラー `BadRequestError: credit balance is too low` で失敗（88 件成功 → 残高ゼロ → 残り全件失敗）。真因は請求側（残高切れ）で、本 PR はそれを早期検知して停止する**堅牢化**（49 件の実消去にはクレジット追加が必要）。RCA: `main.run` / `batch_main` が per-PDF 例外を一律 `except Exception: continue` で握りつぶし、「以降のどの API 呼び出しも必ず失敗する恒久条件」と「1 件固有の失敗」を区別していなかったため、残高切れ後も 49 回無駄に API を叩きエラーログを乱立させた。reproduce-first で先に失敗テスト（残高切れ 400 / 認証エラーをモックし「ランが即停止し残り PDF を処理しない／無駄に API を叩かない」を検証）を書いて red を確認 → 実装で green。修正: `comment_generator` に `PermanentRunFailureError` + `is_permanent_run_failure`（型 = AuthenticationError/PermissionDeniedError、汎用 400 は message の billing 文言で判定）+ `permanent_failure_message` を追加。`generate_comment_with_metadata` は恒久エラーをリトライせず即 `PermanentRunFailureError` へ変換送出（一過性リトライ tuple と分離）、request-specific 400（プロンプト過大等）は従来通り即 raise（per-PDF fail-soft）。`main.run` は `except PermanentRunFailureError` で break → 添付資料パススルーもスキップ → 成功済みの下書き flush + 一時ファイル削除 → 「中止」マーカー追記 → 例外再送出で GHA 非ゼロ終了。Batch は `submit_batch`/`get_batch_status`/`get_batch_results` の 3 Anthropic 呼び出しで変換し、`step2`/`step3` 経由で `run` 外へ自然伝播（握りつぶす except なしを確認）。横展開 grep: Anthropic 呼び出しは `comment_generator` の 4 箇所のみで全て対処済み、永続エラーを握りつぶして無駄継続する箇所は他に無し。落とし穴: `except comment_generator.PermanentRunFailureError`（モジュール経由参照）は `comment_generator` 全体をモックする既存テストで `except <MagicMock>` → `TypeError` を誘発し integration smoke 3 件を巻き込んだため、例外クラスを `main.py` へ直接 import して解消。pytest 568 → 583 件（+15: classifier 8 / 即送出 3 / main halt 2 / batch halt 2）、mypy Success 維持。reporter: 本番ログ全件解析（ユーザー報告）。
+
 - **2026-06-02**: Batch 回収パス（`--step results --batch-id`）が出力 0 件で終わる no-op を根本修正（P-026）。本番で Batch 投入後、別 GHA ランで `--step results --batch-id <id>` を実行しても PDF/Drive/シートが一切生成されなかった。RCA は 3 層: (1) `run()` の step4 が `step in ("all","pdfs")` ゲートにあり `results` から呼ばれない（結果取得して即終了。README は `--step results` を回収コマンドと記載していたが no-op）。(2) 仮に step4 に入っても items を `batch_prep.json` から読むが、別ジョブで死んだ回収ランには同ファイルが無い（`logs/` は gitignore・artifact も復元されない）→ 空ループで「成功 0 件」の無言失敗。(3) `custom_id` が位置依存（`item_0001`…、シート dedup 後の Drive 走査順で連番付与）で、Drive を再走査しても並び・dedup がずれて Anthropic 結果（`batch_results.json` の key）と突合できない＝「ただ再走査」では不十分。修正: (D1) `custom_id` を Drive file id 由来の安定 ID（`_custom_id_for_file`、Anthropic 制約 `^[A-Za-z0-9_-]{1,64}$` を超える/異文字は SHA-256 fallback）にし step1 で付与 → 再走査で同一 ID を再現でき結果と確実に突合。(D2) `reconstruct_items_from_drive` 新設（`list_pdfs` + ファイル名分類のみ、本文 DL/抽出なしの軽量再構築。添付資料 `batch_attachments.json` も再構築）。(D3) `_resolve_items_for_step4`（`batch_prep.json` 優先＝旧 positional バッチも復元、無ければ Drive 再走査）。(D4) ルーティングは `is_recovery = step=="results" and batch_id is not None`（`batch_id.txt` 補完前に確定）で「明示 batch_id の results のみ step4 完走」。discrete `results`（batch-orchestrator の分割運用）は従来通り結果取得のみ＝長時間ポーリング直後の PDF 生成で GHA 6h 超過を防ぐ。(D5) `results` 非空 & items 空は `RuntimeError` で loud 停止（無言 0 件撲滅）。横展開: `custom_id` は `comment_generator.create_batch_requests` が pass-through なので step1 の付与変更だけで全段に波及。E2E smoke 6 件が旧 positional key をハードコードしていたため file id 由来 key へ更新。pytest 646 → 652 件（+12: custom_id 安定性 2 / Drive 再構築 2 / items 解決 3 / loud guard 1 / 回収 E2E 2 / discrete 非実行 1、＋ smoke 6 件修正）、mypy は既存の yaml/requests stub 警告のみ（無関係）。教訓: (1) **「ステップ分割で再開可能」を謳う設計は、各 step が前段の永続物に依存する箇所を列挙し、永続物が無い経路（＝本当の障害時）を実際に通せるか検証する**。今回 step4 は `batch_prep.json` 前提で、それが無い「真の回収シナリオ」が未検証だった。(2) **再構築のキーは位置でなく内容で**。連番 custom_id は「同じ入力集合・同じ順序」を暗黙の前提にしており再走査・dedup 変動で壊れる。冪等な突合には content-addressed ID を使う。(3) **無言の 0 件成功は最悪の失敗**。回収が空振りしても完了マーカーは「成功 0 件」を書くため、loud fail を入れて運用者が気づけるようにする。reporter: ユーザー（本番 67 件の回収不能報告）。

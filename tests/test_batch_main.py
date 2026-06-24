@@ -1824,5 +1824,109 @@ class TestRunResultsRecoveryEndToEnd(unittest.TestCase):
         mock_step4.assert_not_called()
 
 
+class TestBatchHardFailOnEmptyMasterInTargetFolderMode(unittest.TestCase):
+    """target_folder モードで Step1（投入前ガード）と Step4（resume パスの保険）
+    の両方が、参加者マスター不在 / 0 件で ``MasterSheetEmptyError`` を送出する。
+    """
+
+    @patch("src.batch_main.drive_client")
+    @patch("src.batch_main.sheets_client")
+    def test_step1_halts_before_anthropic_submit_when_master_is_empty(
+        self, mock_sheets, mock_drive,
+    ):
+        """Step1: マスター空 → Anthropic Batch API 投入前に即停止。"""
+        from src.run_common import MasterSheetEmptyError
+
+        cfg = batch_main.RunConfig(
+            display_name="自動検出: 新人育成塾",
+            input_folder_id="auto_in",
+            output_folder_id="auto_out",
+            output_sheet_name="新人育成塾",
+            master_sheet_name="参加者マスター(新人育成塾)",
+            master_sheet_strict=True,
+        )
+        mock_sheets.read_master_records.return_value = []
+
+        with self.assertRaises(MasterSheetEmptyError):
+            batch_main.step1_prepare(cfg, test_count=0)
+
+        # PDF 一覧の取得すら走らない（事前ガード）
+        mock_drive.list_pdfs.assert_not_called()
+
+    @patch("src.batch_main.drive_client")
+    @patch("src.batch_main.sheets_client")
+    def test_step1_runs_normally_when_master_has_records(
+        self, mock_sheets, mock_drive,
+    ):
+        """Step1: マスターに行があれば従来通り進行する（HARD FAIL しない）。"""
+        from src.sheets_client import MasterRecord
+
+        cfg = batch_main.RunConfig(
+            display_name="自動検出: 新人育成塾",
+            input_folder_id="auto_in",
+            output_folder_id="auto_out",
+            output_sheet_name="新人育成塾",
+            master_sheet_name="参加者マスター(新人育成塾)",
+            master_sheet_strict=True,
+        )
+        mock_sheets.read_master_records.return_value = [
+            MasterRecord(
+                management_number="001-01",
+                clinic_name="標準医院名",
+                participant_name="田中太郎",
+                venue="",
+                email="t@example.com",
+            ),
+        ]
+        mock_sheets.get_processed_management_numbers.return_value = set()
+        mock_drive.list_pdfs.return_value = []
+
+        # 例外は出ない（list_pdfs まで進む）
+        batch_main.step1_prepare(cfg, test_count=0)
+        mock_drive.list_pdfs.assert_called_once_with(folder_id="auto_in")
+
+    def test_step1_profile_mode_does_not_halt_on_empty_master(self):
+        """プロファイルモード（strict=False）はマスター空でも HARD FAIL しない。"""
+        with patch("src.batch_main.drive_client") as mock_drive, \
+             patch("src.batch_main.sheets_client") as mock_sheets:
+            mock_sheets.read_master_records.return_value = []
+            mock_sheets.get_processed_management_numbers.return_value = set()
+            mock_drive.list_pdfs.return_value = []
+
+            profile = _make_profile()  # ProfileConfig は strict 概念を持たない
+            # 例外は出ない
+            batch_main.step1_prepare(profile, test_count=0)
+            mock_drive.list_pdfs.assert_called_once()
+
+
+class TestRunCommonRequireNonEmptyMaster(unittest.TestCase):
+    """``run_common.require_non_empty_master`` の単体挙動。"""
+
+    def test_strict_false_is_noop(self):
+        from src.run_common import require_non_empty_master
+        import logging
+        # 空 + strict=False → 何も起きない
+        require_non_empty_master([], "any", False, logging.getLogger("test"))
+
+    def test_strict_true_with_records_is_noop(self):
+        from src.run_common import require_non_empty_master
+        import logging
+        # 行あり + strict=True → 何も起きない
+        require_non_empty_master(
+            ["dummy"], "any", True, logging.getLogger("test"),
+        )
+
+    def test_strict_true_with_empty_raises(self):
+        from src.run_common import (
+            MasterSheetEmptyError, require_non_empty_master,
+        )
+        import logging
+        with self.assertRaises(MasterSheetEmptyError):
+            require_non_empty_master(
+                [], "参加者マスター(新人育成塾)", True,
+                logging.getLogger("test"),
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

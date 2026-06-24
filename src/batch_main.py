@@ -237,6 +237,27 @@ def step1_prepare(
     logger = setup_logging()
     logger.info("=== Step 1: 準備 ===")
 
+    # target_folder モード（``master_sheet_strict=True``）では、参加者マスター
+    # タブの不在 / 0 件を Anthropic Batch API への投入前に検知して即停止する。
+    # 投入後に Step4 で気付いた場合、submit 済み分の Anthropic 利用料金は無駄
+    # になるため、可能な限り早期に弾く。``ProfileConfig`` は ``master_sheet_strict``
+    # を持たないので getattr で fallback（後方互換）。
+    if getattr(profile, "master_sheet_strict", False):
+        master_records = sheets_client.read_master_records(
+            sheet_name=profile.master_sheet_name,
+        )
+        try:
+            run_common.require_non_empty_master(
+                master_records, profile.master_sheet_name, True, logger,
+            )
+        except run_common.MasterSheetEmptyError:
+            run_common.append_completion_marker_safe(
+                sheets_client, profile.output_sheet_name,
+                f"中止（参加者マスタータブ未準備: '{profile.master_sheet_name}'）",
+                logger,
+            )
+            raise
+
     pdf_files = drive_client.list_pdfs(folder_id=profile.input_folder_id)
     logger.info(f"PDF一覧: {len(pdf_files)}件")
 
@@ -554,6 +575,21 @@ def step4_generate_pdfs(
     master_records: list[MasterRecord] = sheets_client.read_master_records(
         sheet_name=profile.master_sheet_name,
     )
+    # target_folder モード（``master_sheet_strict=True``）で空マスターなら
+    # HARD FAIL（``--step results``/``pdfs`` だけ実行する resume パスで
+    # Step1 の事前チェックを通っていないケースの保険）。
+    if getattr(profile, "master_sheet_strict", False):
+        try:
+            run_common.require_non_empty_master(
+                master_records, profile.master_sheet_name, True, logger,
+            )
+        except run_common.MasterSheetEmptyError:
+            run_common.append_completion_marker_safe(
+                sheets_client, profile.output_sheet_name,
+                f"中止（参加者マスタータブ未準備: '{profile.master_sheet_name}'）",
+                logger,
+            )
+            raise
 
     # Gmail 下書きは Step4 末尾でまとめて作成する（同じメールアドレスを持つ
     # 複数 PDF を 1 通に集約するため）。ループ中は draft_items に蓄積するだけ。
