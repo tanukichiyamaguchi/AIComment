@@ -372,20 +372,20 @@ class TestRunConfigFromDiscovered(unittest.TestCase):
     事故を解消。経緯は lessons.md 2026-05-29 エントリ）。
     """
 
-    def test_master_sheet_name_uses_shared_default(self):
+    def test_master_sheet_name_is_derived_from_target_folder(self):
+        """target_folder='新人育成塾' → '参加者マスター(新人育成塾)'。"""
         ctx = discover.DiscoveredContext(
-            target_folder_name="テスト5",
+            target_folder_name="新人育成塾",
             input_folder_id="in_id",
             output_folder_id="out_id",
-            output_sheet_name="テスト5",
+            output_sheet_name="新人育成塾",
         )
         cfg = discover.RunConfig.from_discovered(ctx)
-        # 共有の既定タブを使う（フォルダ名派生にしない＝旧 F-09 挙動の回帰防止）
-        self.assertEqual(cfg.master_sheet_name, discover.MASTER_SHEET_NAME)
-        self.assertNotIn("テスト5", cfg.master_sheet_name)
+        self.assertEqual(cfg.master_sheet_name, "参加者マスター(新人育成塾)")
+        self.assertTrue(cfg.master_sheet_strict)
 
-    def test_different_target_folders_share_same_master_tab(self):
-        """別フォルダでも同じ共有タブ ``参加者マスター`` を読む。"""
+    def test_different_target_folders_get_independent_master_tabs(self):
+        """別フォルダなら別タブ（セミナーごとに独立した参加者管理）。"""
         ctx_a = discover.DiscoveredContext(
             target_folder_name="セミナーA",
             input_folder_id="a_in",
@@ -400,9 +400,26 @@ class TestRunConfigFromDiscovered(unittest.TestCase):
         )
         cfg_a = discover.RunConfig.from_discovered(ctx_a)
         cfg_b = discover.RunConfig.from_discovered(ctx_b)
-        self.assertEqual(cfg_a.master_sheet_name, discover.MASTER_SHEET_NAME)
-        self.assertEqual(cfg_b.master_sheet_name, discover.MASTER_SHEET_NAME)
-        self.assertEqual(cfg_a.master_sheet_name, cfg_b.master_sheet_name)
+        self.assertEqual(cfg_a.master_sheet_name, "参加者マスター(セミナーA)")
+        self.assertEqual(cfg_b.master_sheet_name, "参加者マスター(セミナーB)")
+        self.assertNotEqual(cfg_a.master_sheet_name, cfg_b.master_sheet_name)
+
+    def test_from_profile_keeps_strict_false_for_backward_compat(self):
+        """プロファイルモードは strict=False（共有タブの 1 枚使い回し運用を維持）。"""
+        from src.profile import ProfileConfig
+        profile = ProfileConfig(
+            name="jissen_default",
+            display_name="既定",
+            document_type="jissen_practice_case",
+            period="default",
+            input_folder_id="in",
+            output_folder_id="out",
+            output_sheet_name="出力一覧",
+            master_sheet_name=discover.MASTER_SHEET_NAME,
+            prompt_template="jissen_practice_case",
+        )
+        cfg = discover.RunConfig.from_profile(profile)
+        self.assertFalse(cfg.master_sheet_strict)
 
 
 if __name__ == "__main__":

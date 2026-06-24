@@ -1437,6 +1437,19 @@ class TestRunUsesTargetFolder(unittest.TestCase):
             mock_sheets_client=mock_sheets_client,
             pdf_files=[{"id": "id_1", "name": "007-08-9実践事例.pdf"}],
         )
+        # target_folder モードは master_sheet_strict=True なので、空マスターだと
+        # HARD FAIL する。本テストは context 解決の伝搬を見るのが目的なので
+        # ダミー 1 行で HARD FAIL を回避する。
+        from src.sheets_client import MasterRecord
+        mock_sheets_client.read_master_records.return_value = [
+            MasterRecord(
+                management_number="007-08",
+                clinic_name="標準医院名",
+                participant_name="田中太郎",
+                venue="",
+                email="t@example.com",
+            ),
+        ]
 
         with patch("src.config.DRIVE_INPUT_ROOT", "input_root"), \
              patch("src.config.DRIVE_OUTPUT_ROOT", "output_root"), \
@@ -1750,6 +1763,143 @@ class TestRunFailFastOnPermanentError(unittest.TestCase):
         self.assertEqual(mock_drive_client.download_pdf.call_count, 3)
         # 成功した 2 件（1・3 件目）がシートに記録される。
         self.assertEqual(mock_sheets_client.append_output_record.call_count, 2)
+
+
+class TestRunHardFailOnEmptyMasterInTargetFolderMode(unittest.TestCase):
+    """target_folder モードで参加者マスタータブが不在 / 0 件のとき、PDF 処理
+    ループに入る前に ``MasterSheetEmptyError`` で即停止し、出力一覧シートに
+    「中止」マーカーを 1 行追記する。
+
+    プロファイルモード（共有 ``参加者マスター`` を 1 枚使い回す既存運用）は
+    ``master_sheet_strict=False`` なので、空マスターでも停止しない（既存挙動）。
+    """
+
+    def _master_record(
+        self,
+        management_number: str,
+        clinic_name: str = "標準医院名",
+        participant_name: str = "田中太郎",
+        venue: str = "",
+        email: str = "",
+    ):
+        from src.sheets_client import MasterRecord
+        return MasterRecord(
+            management_number=management_number,
+            clinic_name=clinic_name,
+            participant_name=participant_name,
+            venue=venue,
+            email=email,
+        )
+
+    @patch("src.main.ensure_fonts")
+    @patch("src.main.pdf_merger")
+    @patch("src.main.pdf_creator")
+    @patch("src.main.pdf_reader")
+    @patch("src.main.comment_generator")
+    @patch("src.main.sheets_client")
+    @patch("src.main.drive_client")
+    @patch("src.discover.resolve_context")
+    def test_target_folder_mode_halts_when_master_is_empty(
+        self,
+        mock_resolve_context,
+        mock_drive_client,
+        mock_sheets_client,
+        mock_gen,
+        mock_reader,
+        mock_creator,
+        mock_merger,
+        mock_ensure_fonts,
+    ):
+        from src.discover import DiscoveredContext
+        from src.run_common import MasterSheetEmptyError
+        import src.main as main_module
+
+        mock_resolve_context.return_value = DiscoveredContext(
+            target_folder_name="新人育成塾",
+            input_folder_id="auto_in",
+            output_folder_id="auto_out",
+            output_sheet_name="新人育成塾",
+        )
+        _install_run_mocks(
+            mock_drive_client, mock_gen, mock_reader, mock_creator, mock_merger,
+            mock_sheets_client=mock_sheets_client,
+            pdf_files=[{"id": "id_1", "name": "007-08-9実践事例.pdf"}],
+        )
+        # マスターは空（タブ未準備の状態を模擬）
+        mock_sheets_client.read_master_records.return_value = []
+
+        with patch("src.config.DRIVE_INPUT_ROOT", "input_root"), \
+             patch("src.config.DRIVE_OUTPUT_ROOT", "output_root"), \
+             patch("src.config.SPREADSHEET_ID", "sheet_xxx"):
+            with self.assertRaises(MasterSheetEmptyError):
+                main_module.run(test_count=0, target_folder="新人育成塾")
+
+        # PDF download も Claude 呼び出しも append_output_record も
+        # 一度も起きない（ループ前に止まる）
+        mock_drive_client.download_pdf.assert_not_called()
+        mock_gen.generate_comment_with_metadata.assert_not_called()
+        mock_sheets_client.append_output_record.assert_not_called()
+        # 「中止」マーカーを 1 行追記（fail-soft、運用者が気づけるように）
+        marker_calls = [
+            c for c in mock_sheets_client.append_output_record.mock_calls
+        ]
+        # append_completion_marker_safe が内部で別 API を叩く実装の可能性に
+        # 備えて、HARD FAIL ログそのものではなくマーカー追記を間接検証する。
+        # ここでは「append_completion_marker_safe」相当の呼び出しが行われた
+        # ことを検出するため、_marker_record 系の helper を持たない代わりに
+        # sheets_client モジュール属性で append_output_record が呼ばれていない
+        # ことを上で確認 + マーカー本体のテストは run_common 単体で別途行う。
+        del marker_calls  # 明示的に未使用（コメント目的）
+
+    @patch("src.main.ensure_fonts")
+    @patch("src.main.pdf_merger")
+    @patch("src.main.pdf_creator")
+    @patch("src.main.pdf_reader")
+    @patch("src.main.comment_generator")
+    @patch("src.main.sheets_client")
+    @patch("src.main.drive_client")
+    @patch("src.discover.load_profile")
+    def test_profile_mode_does_not_halt_on_empty_master(
+        self,
+        mock_load_profile,
+        mock_drive_client,
+        mock_sheets_client,
+        mock_gen,
+        mock_reader,
+        mock_creator,
+        mock_merger,
+        mock_ensure_fonts,
+    ):
+        """プロファイルモード（``master_sheet_strict=False``）はマスター空でも
+        従来通り処理続行する（既存運用の後方互換性を維持）。
+        """
+        from src.profile import ProfileConfig
+        import src.main as main_module
+
+        mock_load_profile.return_value = ProfileConfig(
+            name="jissen_default",
+            display_name="既定",
+            document_type="jissen_practice_case",
+            period="default",
+            input_folder_id="in_id",
+            output_folder_id="out_id",
+            output_sheet_name="出力一覧",
+            master_sheet_name="参加者マスター",
+            prompt_template="jissen_practice_case",
+        )
+        _install_run_mocks(
+            mock_drive_client, mock_gen, mock_reader, mock_creator, mock_merger,
+            mock_sheets_client=mock_sheets_client,
+            pdf_files=[{"id": "id_1", "name": "007-08-9実践事例.pdf"}],
+        )
+        # マスターは空。だが strict=False なので停止しない。
+        mock_sheets_client.read_master_records.return_value = []
+
+        main_module.run(test_count=0, profile_name="jissen_default")
+
+        # 通常通り Claude が呼ばれ、シートに 1 行追記される
+        self.assertEqual(mock_gen.generate_comment_with_metadata.call_count, 1)
+        self.assertEqual(mock_sheets_client.append_output_record.call_count, 1)
 
 
 if __name__ == "__main__":

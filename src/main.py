@@ -127,6 +127,21 @@ def run(
     master_records: list[MasterRecord] = sheets_client.read_master_records(
         sheet_name=cfg.master_sheet_name,
     )
+    # target_folder モード（``master_sheet_strict=True``）でタブ不在 / 0 件なら
+    # PDF 処理ループに入る前に HARD FAIL（``MasterSheetEmptyError``）。
+    # 「中止」マーカーを追記して GHA を非ゼロ終了させる。
+    try:
+        run_common.require_non_empty_master(
+            master_records, cfg.master_sheet_name,
+            cfg.master_sheet_strict, logger,
+        )
+    except run_common.MasterSheetEmptyError as e:
+        run_common.append_completion_marker_safe(
+            sheets_client, cfg.output_sheet_name,
+            f"中止（参加者マスタータブ未準備: '{cfg.master_sheet_name}'）",
+            logger,
+        )
+        raise
 
     targets, skip_no_number, skip_processed = run_common.select_new_targets(
         main_files, processed, logger,

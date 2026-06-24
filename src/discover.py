@@ -67,17 +67,21 @@ class RunConfig:
     インターフェースだけに依存することで、分岐コードを最小化する。
 
     ``master_sheet_name`` は参加者マスターシート名（医院名標準化 + Gmail
-    下書きの TO ルックアップ用）。自動検出モードでも共有の既定タブ
-    ``参加者マスター``（``MASTER_SHEET_NAME``）を読む。運用者が 1 枚の
-    ``参加者マスター`` を実行ごとに対象セミナーの内容へ差し替える運用に合わせる
-    （F-09 の ``<フォルダ名>_参加者マスター`` 派生は廃止。経緯は lessons.md
-    2026-05-29 エントリ参照）。
+    下書きの TO ルックアップ用）。自動検出モードでは
+    ``参加者マスター(<target_folder_name>)`` を派生する。セミナーごとに 1 タブ
+    で運用する想定で、対象セミナーの参加者を独立したタブで保持する。
+
+    ``master_sheet_strict`` は「タブ不在 / 0 件」を HARD FAIL にする運用フラグ。
+    自動検出モードでは ``True``（マスタータブ準備漏れを即停止で検知する）、
+    プロファイルモードでは ``False``（共有 ``参加者マスター`` を 1 枚で
+    使い回す既存運用の互換性維持）。
     """
     display_name: str
     input_folder_id: str
     output_folder_id: str
     output_sheet_name: str
     master_sheet_name: str = MASTER_SHEET_NAME
+    master_sheet_strict: bool = False
 
     @classmethod
     def from_profile(cls, profile: ProfileConfig) -> "RunConfig":
@@ -90,23 +94,24 @@ class RunConfig:
             output_folder_id=profile.output_folder_id,
             output_sheet_name=profile.output_sheet_name,
             master_sheet_name=profile.master_sheet_name,
+            master_sheet_strict=False,
         )
 
     @classmethod
     def from_discovered(cls, ctx: DiscoveredContext) -> "RunConfig":
-        # 自動検出モードでも共有の既定タブ ``参加者マスター`` を読む。
-        # ユーザーは 1 枚の ``参加者マスター`` を実行ごとに対象セミナーの内容へ
-        # 差し替える運用のため（F-09 の per-folder タブ派生 ``<フォルダ名>_参加者
-        # マスター`` は廃止。空タブを読んで医院名が引けずフォルダ名が
-        # AI 抽出名になる事故を解消する）。
-        # 前提: 実行前にこのタブが対象セミナーのデータになっていること
-        # （医院名・Gmail 下書き宛先の両方をここから引くため）。
+        # セミナー名（= 入力フォルダ名）から参加者マスタータブ名を派生する。
+        # 例: target_folder='新人育成塾' → master_sheet_name='参加者マスター(新人育成塾)'。
+        # セミナーごとに独立したタブで参加者を管理する運用に合わせる。
+        # 共有 ``参加者マスター`` を 1 枚で使い回す方式（2026-05-29 撤回）の
+        # 「タブ空のままで気づかず実行 → 全件宛先空」事故は、空タブを HARD FAIL
+        # で即停止することで再発を防ぐ（``master_sheet_strict=True``）。
         return cls(
             display_name=f"自動検出: {ctx.target_folder_name}",
             input_folder_id=ctx.input_folder_id,
             output_folder_id=ctx.output_folder_id,
             output_sheet_name=ctx.output_sheet_name,
-            master_sheet_name=MASTER_SHEET_NAME,
+            master_sheet_name=f"参加者マスター({ctx.target_folder_name})",
+            master_sheet_strict=True,
         )
 
 

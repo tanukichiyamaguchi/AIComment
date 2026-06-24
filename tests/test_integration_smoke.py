@@ -1177,6 +1177,19 @@ class TestTargetFolderE2E(unittest.TestCase):
             mock_creator, mock_merger, mock_fonts,
         )
         self._install_discovery_mocks(mock_resolve_context)
+        # target_folder モードは master_sheet_strict=True なので、空マスターだと
+        # HARD FAIL する。本スモークはタブ準備済みのハッピーパスを検証する目的
+        # なのでダミー 1 行を返す。
+        from src.sheets_client import MasterRecord
+        mock_sheets.read_master_records.return_value = [
+            MasterRecord(
+                management_number="007-08",
+                clinic_name="標準医院名",
+                participant_name="田中太郎",
+                venue="",
+                email="t@example.com",
+            ),
+        ]
 
         main.run(test_count=0, target_folder="2024_Q1_実践事例")
 
