@@ -251,6 +251,27 @@ fail-soft で 1 行追記してから例外を送出する（GHA を非ゼロ終
 ``require_non_empty_master``、`src/main.run` と `src/batch_main.step1_prepare` /
 ``_process_results_and_create_pdfs`` の HARD FAIL 経路。
 
+### P-029: `max_tokens` は「全フィールド合計の最悪ケース × 言語のトークン密度」で決める（特に可変長フィールドが最後にあるとき）
+本番 PDF のコメントが文の途中（「…前頭葉がまだ育っていないから」）で
+切れていた。RCA: 1 回の構造化出力（json_schema）で
+``clinic_name / person_name / sample_title / comment`` の 4 フィールドを
+まとめて生成しており、``CLAUDE_MAX_TOKENS = 1024`` が小さすぎた。``comment``
+はスキーマの**最後**のフィールド（プロンプト指定で 200〜350 字）なので、
+上限到達時に真っ先に切れる。日本語は 1 文字 ≈ 1〜1.5 トークンと重く、
+医院名・氏名・長いタイトル + 350 字のコメントで容易に 1024 を超える。
+さらに悪いことに、構造化出力の制約デコードは打ち切られても JSON を閉じる
+ため ``_parse_extraction`` は成功し、**半端なコメントが "succeeded" 扱いで
+そのまま PDF 化**されていた（``result.result.type`` しか見ておらず
+``stop_reason`` を見ていない）。**Rule**: ``max_tokens`` は「出力する全
+フィールドを合計した最悪ケースの文字数 × 対象言語のトークン密度」に
+**数倍のヘッドルーム**を掛けて決める。可変長フィールド（自由記述コメント等）が
+スキーマの最後にあると、上限到達時に最も重要な内容が黙って欠落する。
+英語感覚の ``1024`` を日本語の長文生成に流用しない。今回は ``4096``（最悪
+ケース ~900 トークンに対し ~4.5 倍）へ引き上げて、正常出力では上限に
+当たらないようにした。実装: `src/config.py` の ``CLAUDE_MAX_TOKENS``
+（``_build_extraction_request_params`` と ``create_batch_requests`` の
+両方が単一定数を参照しているため 1 箇所の変更で通常・Batch 両モードに波及）。
+
 ### P-027: .gitignore からエントリを外す変更と `git add -A` を同時に行わない
 Phase 17-A で `.gitignore` から `node_modules/` / `dist/` を外した直後に
 `git add -A` でコミットしたところ、ディスク上に残っていた node_modules と
@@ -263,6 +284,8 @@ dist（約 50 万行）がコミットに混入した（amend で即修正）。
 意図したファイル数か検算する習慣も有効（今回 357 files changed で気づけた）。
 
 ## Session Log
+- **2026-06-26**: テーマ別プロンプトの分岐を撤廃し、じっせん実践事例プロンプト（``SYSTEM_PROMPT``）に統一。ユーザー方針「じっせんのプロンプトを共通とし、その他に分岐する設定はなしにする」。``src/comment_generator.py`` から ``extract_theme`` / ``get_system_prompt`` / ``READING_SYSTEM_PROMPT`` / ``LIG_REPORT_SYSTEM_PROMPT`` / ``PARTNER_SYSTEM_PROMPT`` / ``TEAM_MTG_SYSTEM_PROMPT`` / ``_KNOWN_THEMES`` / ``_THEME_PROMPTS`` / ``_PRACTICE_PRAISE_HEAD/TAIL`` / 各テーマ別 ``_EXAMPLES`` を削除（約 100 行のプロンプト定数 + 50 行のロジック削減）。通常モード（``generate_comment_with_metadata``）と Batch モード（``create_batch_requests``）の両方で system プロンプトを ``SYSTEM_PROMPT`` 固定。「テーマ判定」ログも削除。テスト側は 6 テーマ判定クラス（``TestExtractTheme`` / ``TestGetSystemPrompt`` / ``TestReadingSystemPrompt`` / ``TestPracticePraisePrompts`` / ``TestExtractionRequestParamsUsesProvidedPrompt`` / ``TestCreateBatchRequestsPicksThemePerItem``）を削除し、「ファイル名に関わらず常に SYSTEM_PROMPT が使われる」検証 1 クラス（2 ケース）に置換。pytest 638 → 610 件 / mypy clean。Phase 17-E（プロンプト共通化の保留事項）も同時に解消（分岐自体を撤廃したので共通化問題が消滅）。
+- **2026-06-24**: 本番コメントが文の途中で切れる事象を修正（P-029）。出力 PDF のコメントが「…前頭葉がまだ育っていないから」で途切れていた。RCA: 構造化出力 4 フィールド（clinic_name / person_name / sample_title / comment）を 1 回で生成する設計で ``CLAUDE_MAX_TOKENS = 1024`` が小さく、スキーマ最後の comment（200〜350 字）が日本語のトークン密度で上限に当たり切れていた。制約デコードが JSON を閉じるため "succeeded" のまま半端コメントが PDF 化されていた。レンダリング側（``pdf_creator`` の改ページ break）は、テキストがページ上部で終わり下に余白が残る＝ループが ``wrapped_lines`` を使い切って終了しており無関係と切り分け。対応はユーザー要望により「そもそも上限に当たらないようにする」一点に絞り、``CLAUDE_MAX_TOKENS`` を 1024 → 4096 へ引き上げ（``stop_reason == "max_tokens"`` ガードは付けない方針）。単一定数を通常モード（``_build_extraction_request_params``）と Batch モード（``create_batch_requests``）の両方が参照しているため 1 箇所の変更で両経路に波及。既存テストは max_tokens 値をハードコードしていないため 638 件維持・mypy clean。reporter: ユーザー（本番 PDF のスクショ）。
 - **2026-06-24**: 参加者マスタータブをセミナーごとに分離 + 空タブ HARD FAIL（P-028）。target_folder モード（フォルダ自動検出）で ``RunConfig.from_discovered`` の ``master_sheet_name`` 派生を共有 ``参加者マスター`` から ``f"参加者マスター({target_folder_name})"`` に変更し（例: 入力フォルダ ``新人育成塾`` → タブ ``参加者マスター(新人育成塾)``）、セミナーごとに独立した参加者管理を実現。同時に ``RunConfig`` に ``master_sheet_strict: bool`` フィールドを追加し自動検出モードでは ``True``、プロファイルモードでは ``False`` で後方互換。``src/run_common.MasterSheetEmptyError`` + ``require_non_empty_master`` ヘルパーを新設し、target_folder モードでタブ不在 / 0 件のとき PDF 処理ループに入る前に HARD FAIL → 出力一覧シートに「中止（参加者マスタータブ未準備）」マーカーを fail-soft で追記 → 例外再送出で GHA 非ゼロ終了。Batch モードは Step1 開始時に Anthropic API 投入前のガードを入れ、Step4 にも resume パスの保険として重ねる（多層防御、P-025 同思想）。pytest 629 → 638 件（HARD FAIL 検証 4 件 + 後方互換検証 1 件 + run_common 単体 3 件 + smoke 修正 1 件）、mypy clean。F-09 撤回（2026-05-29）の理由「ユーザー運用と食い違う」は HARD FAIL で「気づけない事故」を排除することで解消。
 - **2026-06-11**: Phase 17 一掃リファクタリング（A〜C）。(A) 初期スキャフォールド由来の TypeScript 一式（src/*.ts, tests/*.test.ts, tsconfig, package.json, CI の typescript-tests ジョブ）を削除。本番経路（python -m src.batch_main / src.main）からの参照ゼロ・実装はモックのみであることを調査で確定してから削除し、CLAUDE.md の Project Overview / Build & Test を Python 実態に更新。(B) 完全デッドコードの src/matcher.py + test_matcher.py を削除（本体コードから呼び出しゼロ、AI 抽出への置き換えで不要化済み）。(C) main / batch_main の二重実装（PDF 分類 / デデュープ / 医院名標準化 / 医院フォルダ記録 / 下書き蓄積・集約 / 完了マーカー / 添付資料パススルー、計 476 行）を src/run_common.py へ単一実装として集約。依存モジュールは注入方式にして既存テストのモジュール属性パッチを維持し、629 テスト無修正で全パス。外部挙動不変。P-027 を追加。
 - **2026-03-16**: Project initialized with workflow orchestration architecture.

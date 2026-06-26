@@ -39,7 +39,13 @@ LOGS_DIR = PROJECT_ROOT / "logs"
 # ── API設定 ──
 ANTHROPIC_API_KEY = _get_secret("ANTHROPIC_API_KEY")
 CLAUDE_MODEL = "claude-sonnet-4-6"
-CLAUDE_MAX_TOKENS = 1024
+# 1 回の構造化出力で clinic_name / person_name / sample_title / comment の
+# 4 フィールドをまとめて生成する。comment はスキーマの最後（最長 200〜350 字）
+# なので、上限に当たると comment が文の途中で切れる（PDF にも半端なまま載る）。
+# 日本語は 1 文字 ≈ 1〜1.5 トークンと重く、4 フィールド合計の最悪ケース
+# （約 500 字 ≈ 750〜900 トークン）に対して十分な余裕を持たせ、正常出力では
+# 上限に当たらないようにする（旧値 1024 では comment 切れが発生していた）。
+CLAUDE_MAX_TOKENS = 4096
 CLAUDE_TEMPERATURE = 0.9
 
 # ── Google設定 ──
