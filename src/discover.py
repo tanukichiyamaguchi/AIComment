@@ -36,7 +36,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
-from src import drive_client
+from src import drive_client, sheets_client
 from src.config import GOOGLE_API_NUM_RETRIES, MASTER_SHEET_NAME
 from src.profile import ProfileConfig, load_profile
 from src.utils import normalize_name_for_match
@@ -53,11 +53,14 @@ class DiscoveredContext:
         input_folder_id: 入力サブフォルダの Drive ID。
         output_folder_id: 出力サブフォルダの Drive ID（自動作成済み）。
         output_sheet_name: スプレッドシートのタブ名。
+        master_sheet_name: 参照すべき参加者マスタータブ名。``resolve_context`` が
+            既存タブの名寄せ（``resolve_master_sheet_name``）で決定する。
     """
     target_folder_name: str
     input_folder_id: str
     output_folder_id: str
     output_sheet_name: str
+    master_sheet_name: str = ""
 
 
 @dataclass(frozen=True)
@@ -99,18 +102,21 @@ class RunConfig:
 
     @classmethod
     def from_discovered(cls, ctx: DiscoveredContext) -> "RunConfig":
-        # セミナー名（= 入力フォルダ名）から参加者マスタータブ名を派生する。
-        # 例: target_folder='新人育成塾' → master_sheet_name='参加者マスター(新人育成塾)'。
-        # セミナーごとに独立したタブで参加者を管理する運用に合わせる。
-        # 共有 ``参加者マスター`` を 1 枚で使い回す方式（2026-05-29 撤回）の
-        # 「タブ空のままで気づかず実行 → 全件宛先空」事故は、空タブを HARD FAIL
-        # で即停止することで再発を防ぐ（``master_sheet_strict=True``）。
+        # 参加者マスタータブ名は ``resolve_context`` 内で
+        # ``resolve_master_sheet_name`` により既存タブの名寄せ（フォルダ名が
+        # セミナー名を含むかの部分一致 + 最長一致）で決定済み。マッチしない
+        # ときは ``参加者マスター(<target_folder_name>)`` が入る（その場合
+        # タブが実在しなければ ``master_sheet_strict=True`` で HARD FAIL）。
+        master_sheet_name = (
+            ctx.master_sheet_name
+            or f"参加者マスター({ctx.target_folder_name})"
+        )
         return cls(
             display_name=f"自動検出: {ctx.target_folder_name}",
             input_folder_id=ctx.input_folder_id,
             output_folder_id=ctx.output_folder_id,
             output_sheet_name=ctx.output_sheet_name,
-            master_sheet_name=f"参加者マスター({ctx.target_folder_name})",
+            master_sheet_name=master_sheet_name,
             master_sheet_strict=True,
         )
 
@@ -285,18 +291,86 @@ def resolve_context(
     #    sheets_client._ensure_output_sheet が append 時に冪等実行する。
     output_sheet_name = actual_name
 
+    # 4. 参加者マスタータブ名の名寄せ。スプレッドシートに既存の
+    #    ``参加者マスター(<セミナー名>)`` 形式タブを列挙し、入力フォルダ名が
+    #    そのセミナー名を含むなら対応するマスタータブを使う（最長一致）。
+    #    マッチしないときは ``参加者マスター(<actual_name>)`` を返し、後段の
+    #    HARD FAIL ガード（``master_sheet_strict=True``）で運用者に通知する。
+    try:
+        available_master_tabs = sheets_client.list_master_sheet_tabs(spreadsheet_id)
+    except Exception as e:
+        # タブ列挙の失敗は名寄せをスキップして fallback に倒す（致命扱いしない）。
+        # 後段で空マスター判定の HARD FAIL に至るので silent miss にはならない。
+        logger.warning(
+            f"参加者マスタータブの列挙に失敗（名寄せスキップ・fallback 動作）: {e}"
+        )
+        available_master_tabs = []
+    master_sheet_name = resolve_master_sheet_name(actual_name, available_master_tabs)
+
     ctx = DiscoveredContext(
         target_folder_name=actual_name,
         input_folder_id=input_folder_id,
         output_folder_id=output_folder_id,
         output_sheet_name=output_sheet_name,
+        master_sheet_name=master_sheet_name,
     )
     logger.info(
         f"フォルダ自動検出: target='{actual_name}' "
         f"input={input_folder_id} output={output_folder_id} "
-        f"sheet='{output_sheet_name}'"
+        f"sheet='{output_sheet_name}' master='{master_sheet_name}'"
     )
     return ctx
+
+
+def resolve_master_sheet_name(
+    target_folder_name: str,
+    available_master_tabs: list[str],
+) -> str:
+    """target_folder 名から、参照すべき参加者マスタータブ名を解決する。
+
+    スプレッドシート上に既存の ``参加者マスター(<セミナー名>)`` 形式タブが
+    複数ある運用で、入力フォルダ名がそのセミナー名を**含む**場合に対応する
+    マスタータブへ自動的に振り向ける（ユーザー方針: 例えばタブ
+    ``参加者マスター(新人育成塾)`` があり、Drive 入力フォルダが
+    ``新人育成塾_2026_Q1`` のように同じセミナー名を含む全フォルダで
+    そのマスタータブを参照する）。
+
+    Args:
+        target_folder_name: Drive 上の入力フォルダ名（``DiscoveredContext.target_folder_name``）。
+        available_master_tabs: スプレッドシートに既存の ``参加者マスター(...)``
+            形式のタブ名リスト（``sheets_client.list_master_sheet_tabs`` の戻り値）。
+
+    Returns:
+        マッチしたマスタータブ名。マッチしなければ
+        ``参加者マスター(<target_folder_name>)`` を返す（既存挙動と同じ。
+        この場合タブが実在しなければ ``run_common.require_non_empty_master`` の
+        ``master_sheet_strict=True`` で HARD FAIL する）。
+
+    マッチ判定:
+        - ``参加者マスター(`` と ``)`` を取り除いた中身（セミナー名）が
+          ``target_folder_name`` に部分一致する。
+        - 複数マッチした場合は **最長一致** を採用（より具体的なセミナー名を優先）。
+        - 順序の安定性のため、長さが同じならアルファベット順で最後のものを返す
+          （決定論的、再走でも同じ結果になる）。
+    """
+    seminar_to_tab: dict[str, str] = {}
+    for tab in available_master_tabs:
+        if not (tab.startswith("参加者マスター(") and tab.endswith(")")):
+            continue
+        seminar_name = tab[len("参加者マスター("):-len(")")].strip()
+        if seminar_name:
+            seminar_to_tab[seminar_name] = tab
+
+    matched = [
+        name for name in seminar_to_tab
+        if name in target_folder_name
+    ]
+    if not matched:
+        return f"参加者マスター({target_folder_name})"
+
+    # 最長一致を採用。同長は文字列順で安定化。
+    best = max(matched, key=lambda n: (len(n), n))
+    return seminar_to_tab[best]
 
 
 def list_target_folder_names(
