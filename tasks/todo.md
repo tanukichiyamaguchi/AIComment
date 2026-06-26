@@ -1,5 +1,43 @@
 # じっせん君コメントシステム - Task Tracker
 
+## Phase 21: 参加者マスタータブの「セミナー名 substring」名寄せ（2026-06-26）
+
+### ゴール
+target_folder モードで「**入力フォルダ名がセミナー名を含む**全フォルダ」が
+同じ参加者マスタータブを参照するようにする。年度・期ごとにフォルダを
+分けつつ、マスタータブはセミナー単位 1 枚で運用したい（ユーザー要望）。
+
+例:
+- タブ ``参加者マスター(新人育成塾)`` を 1 枚作っておく
+- フォルダ ``新人育成塾`` / ``新人育成塾_2026_Q1`` / ``2026_新人育成塾_実践事例``
+  のいずれからの実行でも同じタブを参照
+
+### 設計判断
+- **複数マッチ時**: 最長一致を採用（より具体的なセミナー名を優先）
+- **マッチなし時**: ``参加者マスター(<folder>)`` を fallback として返し、
+  HARD FAIL (Phase 18 / ``master_sheet_strict=True``) で停止
+- **タブ列挙失敗時**: 致命扱いせず fallback に倒す（後段の HARD FAIL に任せる）
+- **純関数化**: 名寄せロジック ``resolve_master_sheet_name`` は API 非依存
+  の純関数として実装し、ユニットテスト容易性を確保
+
+### タスク
+- [x] baseline: 617 tests pass, mypy clean
+- [x] ``sheets_client.list_master_sheet_tabs`` を新設
+- [x] ``discover.resolve_master_sheet_name`` (純関数) を新設、
+      部分一致 + 最長一致のロジック
+- [x] ``DiscoveredContext.master_sheet_name`` を追加
+- [x] ``resolve_context`` で ``list_master_sheet_tabs`` を呼び、
+      解決結果を ``master_sheet_name`` に格納
+- [x] ``RunConfig.from_discovered`` を ``ctx.master_sheet_name`` 採用に
+- [x] tests: 名寄せロジック 8 件 / resolve_context 結合 4 件 /
+      list_master_sheet_tabs 4 件
+- [x] README §4-4 と「命名規約と派生ルール」を新仕様に更新
+- [x] pytest 633 件 pass / mypy clean
+- [ ] PR 作成 → ドラフト
+
+### 結果サマリ
+（マージ後に記入）
+
 ## Phase 20: コメント PDF の改行を「文脈の切れ目」で入れる（2026-06-26）
 
 ### ゴール

@@ -422,5 +422,191 @@ class TestRunConfigFromDiscovered(unittest.TestCase):
         self.assertFalse(cfg.master_sheet_strict)
 
 
+class TestResolveMasterSheetName(unittest.TestCase):
+    """``resolve_master_sheet_name``: フォルダ名 → 既存タブ名の名寄せ。
+
+    フォルダ名が既存タブ ``参加者マスター(<セミナー名>)`` のセミナー名を
+    含む場合、対応するタブを返す。複数マッチは最長一致、マッチなしは
+    ``参加者マスター(<folder>)`` を返す（後段の HARD FAIL に倒す）。
+    """
+
+    def test_returns_matching_tab_when_folder_contains_seminar_name(self):
+        result = discover.resolve_master_sheet_name(
+            target_folder_name="新人育成塾_2026_Q1",
+            available_master_tabs=["参加者マスター(新人育成塾)"],
+        )
+        self.assertEqual(result, "参加者マスター(新人育成塾)")
+
+    def test_exact_folder_name_match(self):
+        """フォルダ名がセミナー名と完全一致するケース（既存挙動の互換）。"""
+        result = discover.resolve_master_sheet_name(
+            target_folder_name="新人育成塾",
+            available_master_tabs=["参加者マスター(新人育成塾)"],
+        )
+        self.assertEqual(result, "参加者マスター(新人育成塾)")
+
+    def test_picks_longest_match_when_multiple_seminars_match(self):
+        """複数のセミナー名がフォルダ名に含まれるとき、最長一致を採用する。"""
+        result = discover.resolve_master_sheet_name(
+            target_folder_name="新人育成塾2026_Q1",
+            available_master_tabs=[
+                "参加者マスター(新人育成塾)",
+                "参加者マスター(新人育成塾2026)",  # より具体的
+            ],
+        )
+        self.assertEqual(result, "参加者マスター(新人育成塾2026)")
+
+    def test_same_length_matches_are_deterministic(self):
+        """同長マッチは文字列順で最大のものを採用（再走で同じ結果）。"""
+        result = discover.resolve_master_sheet_name(
+            target_folder_name="AB_資料",  # "A"・"B" のどちらも含む
+            available_master_tabs=[
+                "参加者マスター(A)",
+                "参加者マスター(B)",
+            ],
+        )
+        # "A" と "B" は同じ長さなので、文字列順で大きい "B" を採用
+        self.assertEqual(result, "参加者マスター(B)")
+
+    def test_no_match_returns_fallback(self):
+        """マッチしないときは ``参加者マスター(<folder>)`` を返す（HARD FAIL 経路へ）。"""
+        result = discover.resolve_master_sheet_name(
+            target_folder_name="未登録セミナー_Q1",
+            available_master_tabs=[
+                "参加者マスター(新人育成塾)",
+                "参加者マスター(経営塾ベーシック)",
+            ],
+        )
+        self.assertEqual(result, "参加者マスター(未登録セミナー_Q1)")
+
+    def test_empty_master_tabs_returns_fallback(self):
+        """既存タブが 1 つも無いときも fallback（後段で HARD FAIL）。"""
+        result = discover.resolve_master_sheet_name(
+            target_folder_name="新人育成塾",
+            available_master_tabs=[],
+        )
+        self.assertEqual(result, "参加者マスター(新人育成塾)")
+
+    def test_ignores_non_master_format_tabs(self):
+        """``参加者マスター(...)`` 形式でない混入タブは無視する。"""
+        result = discover.resolve_master_sheet_name(
+            target_folder_name="新人育成塾_Q1",
+            available_master_tabs=[
+                "シート1",
+                "出力一覧",
+                "参加者マスター(新人育成塾)",
+                "参加者マスター",  # 括弧なし → 形式不一致
+            ],
+        )
+        self.assertEqual(result, "参加者マスター(新人育成塾)")
+
+    def test_ignores_empty_seminar_name_in_tab(self):
+        """``参加者マスター()`` のような空セミナー名タブは無視する（誤マッチ防止）。"""
+        result = discover.resolve_master_sheet_name(
+            target_folder_name="新人育成塾_Q1",
+            available_master_tabs=[
+                "参加者マスター()",
+                "参加者マスター(新人育成塾)",
+            ],
+        )
+        self.assertEqual(result, "参加者マスター(新人育成塾)")
+
+
+class TestResolveContextUsesMasterTabNameResolver(unittest.TestCase):
+    """``resolve_context`` が既存マスタータブを列挙し、名寄せ結果を
+    ``DiscoveredContext.master_sheet_name`` に格納する。
+    """
+
+    def _service_with_folders(self, folders: list[dict]) -> MagicMock:
+        service = MagicMock()
+        service.files.return_value.list.return_value.execute.return_value = {
+            "files": folders
+        }
+        service.files.return_value.create.return_value.execute.return_value = {
+            "id": "created_output_id"
+        }
+        return service
+
+    @patch("src.discover.sheets_client.list_master_sheet_tabs")
+    def test_uses_resolved_master_tab_when_folder_contains_seminar_name(
+        self, mock_list_tabs,
+    ):
+        """フォルダ名 ``新人育成塾_2026_Q1`` + タブ ``参加者マスター(新人育成塾)``
+        → ``master_sheet_name = '参加者マスター(新人育成塾)'``。
+        """
+        mock_list_tabs.return_value = ["参加者マスター(新人育成塾)"]
+        service = self._service_with_folders([
+            {"id": "input_id", "name": "新人育成塾_2026_Q1"},
+        ])
+
+        ctx = discover.resolve_context(
+            target_folder="新人育成塾_2026_Q1",
+            input_root_id="input_root",
+            output_root_id="output_root",
+            spreadsheet_id="ssid",
+            service_drive=service,
+        )
+
+        self.assertEqual(ctx.master_sheet_name, "参加者マスター(新人育成塾)")
+        mock_list_tabs.assert_called_once_with("ssid")
+
+    @patch("src.discover.sheets_client.list_master_sheet_tabs")
+    def test_falls_back_when_no_seminar_matches(self, mock_list_tabs):
+        """マッチなしのとき ``参加者マスター(<folder>)`` が入る（HARD FAIL 経路）。"""
+        mock_list_tabs.return_value = ["参加者マスター(経営塾)"]
+        service = self._service_with_folders([
+            {"id": "input_id", "name": "新規セミナー"},
+        ])
+
+        ctx = discover.resolve_context(
+            target_folder="新規セミナー",
+            input_root_id="input_root",
+            output_root_id="output_root",
+            spreadsheet_id="ssid",
+            service_drive=service,
+        )
+
+        self.assertEqual(ctx.master_sheet_name, "参加者マスター(新規セミナー)")
+
+    @patch("src.discover.sheets_client.list_master_sheet_tabs")
+    def test_tab_listing_failure_falls_back_to_default(self, mock_list_tabs):
+        """タブ列挙が失敗しても致命扱いせず fallback で続行する。"""
+        mock_list_tabs.side_effect = RuntimeError("Sheets API unavailable")
+        service = self._service_with_folders([
+            {"id": "input_id", "name": "新人育成塾_Q1"},
+        ])
+
+        ctx = discover.resolve_context(
+            target_folder="新人育成塾_Q1",
+            input_root_id="input_root",
+            output_root_id="output_root",
+            spreadsheet_id="ssid",
+            service_drive=service,
+        )
+
+        # 列挙失敗 → fallback で folder 名そのままを括弧内に入れる
+        self.assertEqual(ctx.master_sheet_name, "参加者マスター(新人育成塾_Q1)")
+
+    @patch("src.discover.sheets_client.list_master_sheet_tabs")
+    def test_run_config_uses_resolved_master_sheet_name(self, mock_list_tabs):
+        """``RunConfig.from_discovered`` が ``ctx.master_sheet_name`` を採用する。"""
+        mock_list_tabs.return_value = ["参加者マスター(新人育成塾)"]
+        service = self._service_with_folders([
+            {"id": "input_id", "name": "新人育成塾_2026_Q1"},
+        ])
+
+        ctx = discover.resolve_context(
+            target_folder="新人育成塾_2026_Q1",
+            input_root_id="input_root",
+            output_root_id="output_root",
+            spreadsheet_id="ssid",
+            service_drive=service,
+        )
+        cfg = discover.RunConfig.from_discovered(ctx)
+
+        self.assertEqual(cfg.master_sheet_name, "参加者マスター(新人育成塾)")
+        self.assertTrue(cfg.master_sheet_strict)
+
+
 if __name__ == "__main__":
     unittest.main()

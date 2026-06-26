@@ -685,6 +685,39 @@ def _levenshtein_distance(a: str, a_other: str) -> int:
     return previous[-1]
 
 
+def list_master_sheet_tabs(
+    spreadsheet_id: str | None = None,
+) -> list[str]:
+    """スプレッドシートのタブ名から ``参加者マスター(...)`` 形式のものを全列挙する。
+
+    target_folder モードでセミナー名の名寄せ（フォルダ名がセミナー名を含む場合に
+    対応するマスタータブを参照する）に使う。タブ名の一致判定は呼び出し側で行うため、
+    本関数は形式マッチした生のタブ名リストを返すだけ。
+
+    Returns:
+        ``"参加者マスター("`` で始まり ``")"`` で終わるタブ名のリスト（API 戻り順）。
+        該当タブが無ければ空リスト。
+    """
+    spreadsheet_id = spreadsheet_id or SPREADSHEET_ID
+    if not spreadsheet_id:
+        raise ValueError("SPREADSHEET_IDが設定されていません")
+
+    service = get_sheets_service()
+    meta = service.spreadsheets().get(
+        spreadsheetId=spreadsheet_id,
+    ).execute(num_retries=GOOGLE_API_NUM_RETRIES)
+    titles = [s["properties"]["title"] for s in meta.get("sheets", [])]
+    matched = [
+        t for t in titles
+        if t.startswith("参加者マスター(") and t.endswith(")")
+    ]
+    logger.info(
+        f"Sheets: 参加者マスタータブ候補 {len(matched)} 件を検出 "
+        f"(spreadsheet={spreadsheet_id})"
+    )
+    return matched
+
+
 def _ensure_master_sheet(
     service: Any,
     spreadsheet_id: str,

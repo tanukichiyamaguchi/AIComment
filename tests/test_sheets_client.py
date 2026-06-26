@@ -1541,5 +1541,56 @@ class TestAppendCompletionMarker(unittest.TestCase):
                 sheets_client.append_completion_marker(sheet_name="出力一覧")
 
 
+class TestListMasterSheetTabs(unittest.TestCase):
+    """``list_master_sheet_tabs``: ``参加者マスター(...)`` 形式のタブ名を列挙。"""
+
+    def _service_with_titles(self, titles: list[str]) -> MagicMock:
+        service = MagicMock()
+        service.spreadsheets.return_value.get.return_value.execute.return_value = {
+            "sheets": [
+                {"properties": {"title": t}} for t in titles
+            ]
+        }
+        return service
+
+    @patch("src.sheets_client.get_sheets_service")
+    def test_returns_only_master_format_tabs(self, mock_get_service):
+        mock_get_service.return_value = self._service_with_titles([
+            "シート1",
+            "出力一覧",
+            "参加者マスター(新人育成塾)",
+            "参加者マスター(経営塾ベーシック)",
+            "参加者マスター",  # 括弧なし → 除外
+            "メールアドレス一覧",
+        ])
+        result = sheets_client.list_master_sheet_tabs("ssid")
+        self.assertEqual(
+            sorted(result),
+            sorted(["参加者マスター(新人育成塾)", "参加者マスター(経営塾ベーシック)"]),
+        )
+
+    @patch("src.sheets_client.get_sheets_service")
+    def test_returns_empty_when_no_master_tabs(self, mock_get_service):
+        mock_get_service.return_value = self._service_with_titles([
+            "シート1", "出力一覧",
+        ])
+        self.assertEqual(sheets_client.list_master_sheet_tabs("ssid"), [])
+
+    @patch("src.sheets_client.get_sheets_service")
+    def test_uses_num_retries_on_metadata_call(self, mock_get_service):
+        """Sheets metadata 取得も他の API 同様に一過性エラーをリトライする。"""
+        service = self._service_with_titles([])
+        mock_get_service.return_value = service
+        sheets_client.list_master_sheet_tabs("ssid")
+        execute_call = service.spreadsheets.return_value.get.return_value.execute
+        self.assertEqual(execute_call.call_args.kwargs["num_retries"], 5)
+
+    @patch("src.sheets_client.get_sheets_service")
+    def test_raises_when_spreadsheet_id_missing(self, mock_get_service):
+        with patch("src.sheets_client.SPREADSHEET_ID", ""):
+            with self.assertRaises(ValueError):
+                sheets_client.list_master_sheet_tabs()
+
+
 if __name__ == "__main__":
     unittest.main()
