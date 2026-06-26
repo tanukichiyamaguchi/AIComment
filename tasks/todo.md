@@ -1,5 +1,29 @@
 # じっせん君コメントシステム - Task Tracker
 
+## Phase 19: テーマ別プロンプト分岐の撤廃（2026-06-26）
+
+### ゴール
+ファイル名のテーマ（読書 / LIGレポート / パートナー / チームMTG 等）による
+プロンプト振り分けを廃止し、**じっせん実践事例プロンプト（``SYSTEM_PROMPT``）に
+全件統一**する（ユーザー方針）。
+
+### タスク
+- [x] baseline: 638 tests pass, mypy clean
+- [x] comment_generator から ``extract_theme`` / ``get_system_prompt`` /
+      テーマ別プロンプト定数（READING / LIG / PARTNER / TEAM_MTG /
+      _PRACTICE_PRAISE_HEAD・TAIL / 各 _EXAMPLES）/ ``_KNOWN_THEMES`` /
+      ``_THEME_PROMPTS`` を削除
+- [x] 通常モード（``generate_comment_with_metadata``）と Batch モード
+      （``create_batch_requests``）の system を ``SYSTEM_PROMPT`` 固定
+- [x] 「テーマ判定」ログも削除（不要な情報）
+- [x] テスト: 6 つのテーマ関連クラスを削除し、「常に SYSTEM_PROMPT が
+      使われる」検証クラス（2 ケース）に置換
+- [x] pytest 610 件 pass / mypy clean
+- [ ] PR 作成 → ドラフト
+
+### 結果サマリ
+（マージ後に記入）
+
 ## Phase 18: 参加者マスタータブをセミナーごとに分離 + 空タブ HARD FAIL（2026-06-24）
 
 ### ゴール
