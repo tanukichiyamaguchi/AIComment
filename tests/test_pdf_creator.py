@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pdfplumber
 
-from src.pdf_creator import create_comment_page
+from src.pdf_creator import _wrap_text, create_comment_page
 from src.utils import ensure_fonts
 
 
@@ -149,6 +149,97 @@ class TestPdfCreator(unittest.TestCase):
         self.assertNotIn("白川 蓮", page_text)
         self.assertNotIn("白川", page_text)
         self.assertNotIn("様", page_text)
+
+
+class TestWrapTextRespectsParagraphsAndKinsoku(unittest.TestCase):
+    """``_wrap_text`` は ``\\n`` を段落区切りとして尊重し、
+    行頭禁則（「、」「。」等が行頭に来ない）を適用する。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        # _wrap_text は pdfmetrics でフォントを参照するため、create_comment_page と
+        # 同様にフォント登録を済ませる。
+        from src.pdf_creator import _register_fonts
+        _register_fonts()
+
+    def test_explicit_newline_creates_paragraph_break(self):
+        """``\\n`` が独立した行（段落区切り）として尊重される。"""
+        text = "前段の文章です。\n次の段落です。"
+        # 各段落は十分短いので幅オーバー折り返しは発生しない
+        lines = _wrap_text(text, "NotoSansJP", 11, max_width=1000.0)
+        self.assertEqual(lines, ["前段の文章です。", "次の段落です。"])
+
+    def test_multiple_newlines_yield_blank_lines(self):
+        """``\\n\\n`` のような連続改行は空行として残す（段落間の余白）。"""
+        text = "段落A。\n\n段落B。"
+        lines = _wrap_text(text, "NotoSansJP", 11, max_width=1000.0)
+        self.assertEqual(lines, ["段落A。", "", "段落B。"])
+
+    def test_period_does_not_appear_at_line_start(self):
+        """折り返しで「。」が次行頭に来そうなとき、前行末尾にぶら下げる。"""
+        # ちょうど 1 文字あふれて「。」が次行先頭になるよう max_width を調整する。
+        # NotoSansJP 11pt で「abc」を測ってから「。」分の余裕を確保しないギリギリ幅で発火させる。
+        from reportlab.pdfbase import pdfmetrics
+        base = "あいうえおかきくけこ"
+        base_w = pdfmetrics.stringWidth(base, "NotoSansJP", 11)
+        # base + 「。」 を入れると max_width を超えるが、base 単独では収まる幅にする。
+        max_width = base_w + pdfmetrics.stringWidth("。", "NotoSansJP", 11) - 1.0
+        lines = _wrap_text(base + "。続き", "NotoSansJP", 11, max_width)
+        # 「。」が単独で行頭に来ていないこと（ぶら下げで前行末尾に残っている）
+        for line in lines:
+            self.assertFalse(line.startswith("。"), f"行頭に句点が来ている: {lines}")
+
+    def test_comma_does_not_appear_at_line_start(self):
+        """折り返しで「、」が行頭に来ないこと。"""
+        from reportlab.pdfbase import pdfmetrics
+        base = "あいうえおかきくけこ"
+        base_w = pdfmetrics.stringWidth(base, "NotoSansJP", 11)
+        max_width = base_w + pdfmetrics.stringWidth("、", "NotoSansJP", 11) - 1.0
+        lines = _wrap_text(base + "、続き", "NotoSansJP", 11, max_width)
+        for line in lines:
+            self.assertFalse(line.startswith("、"), f"行頭に読点が来ている: {lines}")
+
+    def test_closing_paren_does_not_appear_at_line_start(self):
+        """閉じ括弧「）」「」」「』」なども行頭に来ない。"""
+        from reportlab.pdfbase import pdfmetrics
+        base = "あいうえおかきくけこ"
+        base_w = pdfmetrics.stringWidth(base, "NotoSansJP", 11)
+        max_width = base_w + pdfmetrics.stringWidth("）", "NotoSansJP", 11) - 1.0
+        lines = _wrap_text(base + "）の続き", "NotoSansJP", 11, max_width)
+        for line in lines:
+            self.assertFalse(line.startswith("）"), f"行頭に閉じ括弧が来ている: {lines}")
+
+    def test_normal_character_at_line_start_is_fine(self):
+        """禁則対象外の通常文字は普通に行頭に置かれる（過剰なぶら下げは起きない）。"""
+        from reportlab.pdfbase import pdfmetrics
+        base = "あいうえおかきくけこ"
+        base_w = pdfmetrics.stringWidth(base, "NotoSansJP", 11)
+        max_width = base_w + pdfmetrics.stringWidth("さ", "NotoSansJP", 11) - 1.0
+        lines = _wrap_text(base + "さしすせそ", "NotoSansJP", 11, max_width)
+        # 「さ」が次行先頭に来ているのが正常
+        self.assertEqual(lines[0], base)
+        self.assertTrue(lines[1].startswith("さ"))
+
+
+class TestSystemPromptHasNewlineGuidance(unittest.TestCase):
+    """生成プロンプトに「文脈の切れ目で改行を入れる」指示が含まれていること。
+
+    PDF 描画側は ``\\n`` を段落区切りとして尊重するだけなので、実際に段落分け
+    するのは Claude の生成段階。プロンプトから指示が消えると改行されない
+    1 段落のべた書きに退行する。
+    """
+
+    def test_prompt_instructs_paragraph_break_on_newline(self):
+        from src.comment_generator import SYSTEM_PROMPT
+        self.assertIn("改行ルール", SYSTEM_PROMPT)
+        # \n 挿入の明示
+        self.assertIn("\\n", SYSTEM_PROMPT)
+        # 「文脈」「段落」のいずれかが含まれる
+        self.assertTrue(
+            "文脈" in SYSTEM_PROMPT or "段落" in SYSTEM_PROMPT,
+            "段落分けの指示が欠落している",
+        )
 
 
 if __name__ == "__main__":
