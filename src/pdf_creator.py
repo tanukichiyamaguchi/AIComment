@@ -43,8 +43,24 @@ def _register_fonts() -> None:
     _fonts_registered = True
 
 
+# 行頭禁則文字（行頭に来てはいけない文字）。これらの文字が次の行の先頭に
+# 来そうになったとき、1 文字ぶら下げて前の行末尾に残す（はみ出しを許容する
+# 簡易禁則）。コメント末尾の「。」や読点「、」が単独で行頭に来る不自然さ
+# （日本語組版の基本ルール違反）を防ぐ。
+_GYOTOU_KINSOKU: frozenset[str] = frozenset(
+    "、。，．・：；！？）］｝」』〕〉》】〙〗"
+    ",.!?)]}"
+)
+
+
 def _wrap_text(text: str, font_name: str, font_size: float, max_width: float) -> list[str]:
-    """テキストを指定幅で折り返す。日本語文字幅を考慮。"""
+    """テキストを指定幅で折り返す。日本語文字幅 + 行頭禁則を考慮。
+
+    ``text`` に含まれる ``\\n`` は段落区切りとして扱い、段落ごとに独立して
+    折り返す（Claude が文脈の切れ目で挿入した改行をそのまま尊重する）。
+    各段落内では、行頭禁則文字（「、」「。」「！」「？」「)」など）が次行の
+    先頭に来そうな場合、その 1 文字を前行末尾にぶら下げて簡易禁則を実現する。
+    """
     lines: list[str] = []
     for paragraph in text.split("\n"):
         if not paragraph.strip():
@@ -56,8 +72,15 @@ def _wrap_text(text: str, font_name: str, font_size: float, max_width: float) ->
             test_line = current_line + char
             width = pdfmetrics.stringWidth(test_line, font_name, font_size)
             if width > max_width:
-                lines.append(current_line)
-                current_line = char
+                # 行頭禁則: 改行直後の先頭になる ``char`` が禁則文字なら、
+                # 前行末尾にぶら下げて改行する（はみ出しを許容）。前行が
+                # 空（=1文字目から幅超過の異常系）の場合はぶら下げない。
+                if char in _GYOTOU_KINSOKU and current_line:
+                    lines.append(current_line + char)
+                    current_line = ""
+                else:
+                    lines.append(current_line)
+                    current_line = char
             else:
                 current_line = test_line
         if current_line:
