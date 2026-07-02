@@ -1,11 +1,13 @@
 """pdf_creator モジュールのテスト。"""
 
 import tempfile
+import logging
 import unittest
 from pathlib import Path
 
 import pdfplumber
 
+from src import pdf_creator
 from src.pdf_creator import _wrap_text, create_comment_page
 from src.utils import ensure_fonts
 
@@ -240,6 +242,53 @@ class TestSystemPromptHasNewlineGuidance(unittest.TestCase):
             "文脈" in SYSTEM_PROMPT or "段落" in SYSTEM_PROMPT,
             "段落分けの指示が欠落している",
         )
+
+
+class TestTruncationWarning(unittest.TestCase):
+    """描画領域に収まらないコメントの切り捨てを loud に警告する（P-001）。"""
+
+    def test_oversized_comment_warns(self):
+        long_comment = "\n".join(
+            f"段落{i}: " + "あ" * 60 for i in range(60)
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "warn.pdf"
+            with self.assertLogs("jissen_comment", level="WARNING") as log_ctx:
+                pdf_creator.create_comment_page(
+                    comment=long_comment,
+                    clinic_name="山田歯科",
+                    person_name="田中太郎",
+                    output_path=output,
+                )
+            self.assertTrue(output.exists())
+        joined = "\n".join(log_ctx.output)
+        self.assertIn("切り捨て", joined)
+        self.assertIn("warn.pdf", joined)
+
+    def test_normal_comment_does_not_warn(self):
+        """通常サイズ（350 文字 + 段落改行）は警告なしで全行描画される。"""
+        comment = "\n".join("あ" * 70 for _ in range(5))  # 350 文字・5 段落
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "ok.pdf"
+            logger = logging.getLogger("jissen_comment")
+            records: list[logging.LogRecord] = []
+            handler = logging.Handler()
+            handler.emit = records.append  # type: ignore[assignment]
+            logger.addHandler(handler)
+            try:
+                pdf_creator.create_comment_page(
+                    comment=comment,
+                    clinic_name="山田歯科",
+                    person_name="田中太郎",
+                    output_path=output,
+                )
+            finally:
+                logger.removeHandler(handler)
+        truncation_warnings = [
+            r for r in records
+            if r.levelno >= logging.WARNING and "切り捨て" in r.getMessage()
+        ]
+        self.assertEqual(truncation_warnings, [])
 
 
 if __name__ == "__main__":

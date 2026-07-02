@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import time
 from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -14,6 +15,7 @@ from typing import Any
 from googleapiclient.discovery import build
 
 from src.config import (
+    GOOGLE_API_NUM_RETRIES,
     GOOGLE_CREDENTIALS_JSON,
     GOOGLE_OAUTH_TOKEN_JSON,
     GOOGLE_SCOPES,
@@ -92,9 +94,18 @@ def create_draft(
     person_name: str,
     pdf_paths: list[Path] | list[str] | str | Path,
     cc_email: str | None = None,
-    max_retries: int = 1,
+    max_retries: int = 4,
 ) -> str:
     """Gmail下書きを作成する。PDF添付付き。
+
+    リトライ設計:
+        呼び出し側（``run_common.create_grouped_drafts``）はランの **最後に**
+        まとめて下書きを作成するため、ここで失敗した下書きはそのラン内で二度と
+        再試行されず恒久ロストになる（PDF 処理自体は完了しているので再ランでも
+        スキップされ、下書きだけが欠ける）。一過性エラー（429/5xx）で失わない
+        よう、指数バックオフ付きの手動リトライ（既定 4 回）に加えて、
+        ``execute(num_retries=...)`` の googleapiclient 内蔵リトライも重ねる
+        （多層防御、step3 ポーリングと同じ方針）。
 
     Args:
         to_email: 送信先メールアドレス（TO）。空文字なら宛先空で作成（手動補完用）。
@@ -104,7 +115,7 @@ def create_draft(
         cc_email: CC のメールアドレス。``None`` または空文字列なら CC ヘッダー
             を付けない。現在は CC を使っていない（参加者マスター統合後の運用は
             TO のみ）。将来必要になったら呼び出し側で値を渡す。
-        max_retries: リトライ回数
+        max_retries: 手動リトライ回数（指数バックオフ付き）
 
     Returns:
         作成された下書きのID
@@ -143,14 +154,14 @@ def create_draft(
     # Base64エンコード
     raw = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
 
-    # 下書き作成（リトライ付き）
+    # 下書き作成（指数バックオフ付きリトライ + googleapiclient 内蔵リトライ）
     last_error = None
     for attempt in range(max_retries + 1):
         try:
             draft = service.users().drafts().create(
                 userId="me",
                 body={"message": {"raw": raw}},
-            ).execute()
+            ).execute(num_retries=GOOGLE_API_NUM_RETRIES)
 
             draft_id = draft["id"]
             cc_log = f", CC={mask_email(cc_email)}" if cc_email else ""
@@ -167,7 +178,12 @@ def create_draft(
         except Exception as e:
             last_error = e
             if attempt < max_retries:
-                logger.warning(f"Gmail下書き作成失敗 (試行{attempt + 1}): {e}")
+                wait = min(2.0 ** (attempt + 1), 30.0)
+                logger.warning(
+                    f"Gmail下書き作成失敗 (試行{attempt + 1}/{max_retries + 1}): "
+                    f"{e}. {wait:.0f}秒後にリトライ..."
+                )
+                time.sleep(wait)
             else:
                 logger.error(f"Gmail下書き作成失敗（リトライ上限）: {e}")
 

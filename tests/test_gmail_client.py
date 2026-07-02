@@ -7,6 +7,7 @@ Gmail API 呼び出しを mock し、``create_draft`` が指定の TO/CC/件名/
 from __future__ import annotations
 
 import base64
+import tempfile
 import unittest
 from email import message_from_bytes
 from email.header import decode_header, make_header
@@ -213,6 +214,62 @@ class TestCreateDraftLogging(unittest.TestCase):
 
         joined = "\n".join(log_ctx.output)
         self.assertNotIn("CC=", joined)
+
+
+class TestCreateDraftRetry(unittest.TestCase):
+    """``create_draft`` の指数バックオフリトライ + num_retries（下書きロスト防止）。"""
+
+    def _make_service(self):
+        service = MagicMock()
+        return service, service.users.return_value.drafts.return_value.create
+
+    @patch("src.gmail_client.time.sleep")
+    @patch("src.gmail_client.get_gmail_service")
+    def test_transient_failure_then_success(self, mock_get_service, mock_sleep):
+        """1 回目の一過性失敗 → バックオフして 2 回目で成功する。"""
+        service, create = self._make_service()
+        mock_get_service.return_value = service
+        create.return_value.execute.side_effect = [
+            ConnectionError("503"),
+            {"id": "draft_ok"},
+        ]
+        with tempfile.NamedTemporaryFile(suffix=".pdf") as f:
+            draft_id = gmail_client.create_draft(
+                to_email="a@example.com", person_name="田中太郎",
+                pdf_paths=[f.name],
+            )
+        self.assertEqual(draft_id, "draft_ok")
+        mock_sleep.assert_called_once()
+
+    @patch("src.gmail_client.time.sleep")
+    @patch("src.gmail_client.get_gmail_service")
+    def test_retry_limit_raises_last_error(self, mock_get_service, mock_sleep):
+        service, create = self._make_service()
+        mock_get_service.return_value = service
+        create.return_value.execute.side_effect = ConnectionError("down")
+        with tempfile.NamedTemporaryFile(suffix=".pdf") as f:
+            with self.assertRaises(ConnectionError):
+                gmail_client.create_draft(
+                    to_email="a@example.com", person_name="田中太郎",
+                    pdf_paths=[f.name], max_retries=2,
+                )
+        # 初回 + リトライ 2 回 = 3 回試行
+        self.assertEqual(create.return_value.execute.call_count, 3)
+
+    @patch("src.gmail_client.get_gmail_service")
+    def test_execute_uses_googleapiclient_num_retries(self, mock_get_service):
+        """execute に num_retries を渡し、5xx/429 の内蔵リトライも効かせる。"""
+        service, create = self._make_service()
+        mock_get_service.return_value = service
+        create.return_value.execute.return_value = {"id": "draft_ok"}
+        with tempfile.NamedTemporaryFile(suffix=".pdf") as f:
+            gmail_client.create_draft(
+                to_email="a@example.com", person_name="田中太郎",
+                pdf_paths=[f.name],
+            )
+        self.assertEqual(
+            create.return_value.execute.call_args.kwargs["num_retries"], 5,
+        )
 
 
 if __name__ == "__main__":

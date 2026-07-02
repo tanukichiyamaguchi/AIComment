@@ -31,10 +31,15 @@ logger = logging.getLogger("jissen_comment")
 # Google Sheets API は **1 ユーザーあたり 60 write requests/min** が
 # ハード上限。1000 PDF 規模の連続実行で append_output_record / append_clinic_*
 # が短時間に集中して 429 quota_exceeded を踏むと、batch_main の Step4 が
-# 途中失敗 → 半端に処理済み行が残るリスクがある。安全マージンを取って
-# 50 writes / 60 sec に抑える（理論最大の 83%、本番運用で観測した quota も
-# このあたりが安定する）。
-_SHEETS_MAX_WRITES_PER_60S = 50
+# 途中失敗 → 半端に処理済み行が残るリスクがある。
+#
+# 28 writes / 60 sec に抑える理由: GHA の concurrency group は target_folder
+# 単位のため、**異なるフォルダの 2 ランが同時実行** されると同一ユーザー
+# quota を分け合う。28/分 × 2 ラン = 56/分 < 60/分 で、2 ラン同時でも
+# ハード上限を超えない（3 ラン以上の同時実行は 429 リトライ頼みになるため
+# 運用上避けること）。1000 行の書き込みでも約 36 分であり、PDF 生成時間
+# （数時間）に比べ十分小さい。
+_SHEETS_MAX_WRITES_PER_60S = 28
 _SHEETS_WRITE_TIMES: collections.deque[float] = collections.deque()
 _SHEETS_WRITE_LOCK = threading.Lock()
 
@@ -245,7 +250,19 @@ def _ensure_sheet_with_header(
         本呼び出しでタブを **新規作成** したなら True、既存タブを再利用したなら
         False。呼び出し側が「初回作成かどうか」で警告レベルを切り替えるために使う
         （参加者マスターのサイレント空読み事故対策、P-022）。
+
+    プロセス内キャッシュ:
+        一度 ensure に成功した (spreadsheet_id, sheet_name) は
+        ``_ENSURED_SHEETS`` に記録し、以後の呼び出しは API を叩かず即 False を
+        返す。``append_output_record`` が 1 行ごとに本関数を呼ぶ設計のため、
+        キャッシュが無いと 1000 行の書き込みで **2000 回超の read リクエスト**
+        が発生し、Sheets の read quota（60/分/ユーザー、throttle 対象外）を
+        確実に食い潰して 429 ストームになる。
     """
+    cache_key = (spreadsheet_id, sheet_name)
+    if cache_key in _ENSURED_SHEETS:
+        return False
+
     meta = service.spreadsheets().get(
         spreadsheetId=spreadsheet_id
     ).execute(num_retries=GOOGLE_API_NUM_RETRIES)
@@ -279,7 +296,19 @@ def _ensure_sheet_with_header(
         ).execute(num_retries=GOOGLE_API_NUM_RETRIES)
         logger.info(f"Sheets: シートのヘッダーを書き込み ({sheet_name})")
 
+    _ENSURED_SHEETS.add(cache_key)
     return was_created
+
+
+# ensure 済みシートのプロセス内キャッシュ（(spreadsheet_id, sheet_name)）。
+# ``_ensure_sheet_with_header`` の docstring 参照。テストでは
+# ``_reset_ensured_sheets_cache()`` でクリアする。
+_ENSURED_SHEETS: set[tuple[str, str]] = set()
+
+
+def _reset_ensured_sheets_cache() -> None:
+    """ensure 済みシートキャッシュをクリアする（テスト用）。"""
+    _ENSURED_SHEETS.clear()
 
 
 def _ensure_output_sheet(
@@ -357,6 +386,51 @@ def get_processed_management_numbers(
         f"Sheets: 処理済み管理番号 {len(processed)}件を取得 ({sheet_name})"
     )
     return processed
+
+
+def get_recorded_attachment_names(
+    spreadsheet_id: str | None = None,
+    sheet_name: str | None = None,
+) -> set[str]:
+    """出力一覧シートの D列（実践事例名）から記録済み添付資料マーカーの集合を返す。
+
+    添付資料は出力一覧シートに ``【添付資料】<元ファイル名>`` の形式で記録される
+    （``run_common.passthrough_attachment``）。添付資料の重複判定を「メインの
+    管理番号が処理済みか」ではなく「その添付資料自体が記録済みか」で行うための
+    スナップショット。メイン処理後に添付資料だけ後から Drive へ追加されるケース
+    や、メイン記録後・添付コピー前にクラッシュしたケースでも、添付資料を
+    取りこぼさない（管理番号共有 dedup による恒久ロストの防止）。
+
+    Returns:
+        ``【添付資料】`` で始まる D 列値の集合。シート未作成なら空集合。
+    """
+    spreadsheet_id = spreadsheet_id or SPREADSHEET_ID
+    if not spreadsheet_id:
+        raise ValueError("SPREADSHEET_IDが設定されていません")
+    sheet_name = sheet_name or OUTPUT_SHEET_NAME
+
+    service = get_sheets_service()
+    meta = service.spreadsheets().get(
+        spreadsheetId=spreadsheet_id
+    ).execute(num_retries=GOOGLE_API_NUM_RETRIES)
+    existing_titles = [s["properties"]["title"] for s in meta.get("sheets", [])]
+    if sheet_name not in existing_titles:
+        return set()
+
+    result = service.spreadsheets().values().get(
+        spreadsheetId=spreadsheet_id,
+        range=f"{sheet_name}!D2:D",
+    ).execute(num_retries=GOOGLE_API_NUM_RETRIES)
+    rows = result.get("values", [])
+    recorded = {
+        row[0].strip()
+        for row in rows
+        if row and row[0] and row[0].strip().startswith("【添付資料】")
+    }
+    logger.info(
+        f"Sheets: 記録済み添付資料 {len(recorded)}件を取得 ({sheet_name})"
+    )
+    return recorded
 
 
 def append_output_record(
@@ -457,6 +531,112 @@ def append_completion_marker(
     logger.info(
         f"Sheets: 完了マーカーを追記 ({sheet_name}, {completed_at}, {summary})"
     )
+
+
+# ── バッチ状態管理シート（未回収バッチの検知 / 二重投入・二重課金防止） ──
+# Anthropic Batch は投入後 24h 以内に処理され、結果は 29 日保持される。
+# GHA ランが step3（ポーリング）/ step4（PDF生成）の途中で kill されると、
+# 次の ``step=all`` 再実行は「何も記録されていない」ため全件を **再投入** して
+# しまい、課金が倍増する（GHA ランナーは ephemeral で logs/batch_id.txt が
+# 残らない）。バッチ ID をスプレッドシート（このシステム唯一の永続ストア）
+# に記録し、再実行時に未回収バッチを検知して回収から自動再開する。
+BATCH_STATE_SHEET_NAME = "_バッチ管理"
+_BATCH_STATE_HEADER = ["記録日時", "対象シート", "バッチID", "状態"]
+BATCH_STATE_SUBMITTED = "投入済み"
+BATCH_STATE_DONE = "回収完了"
+BATCH_STATE_EXPIRED = "期限切れ(結果喪失)"
+
+
+def append_batch_record(
+    target_sheet_name: str,
+    batch_id: str,
+    status: str,
+    spreadsheet_id: str | None = None,
+) -> None:
+    """バッチ状態管理シートに 1 行追記する（append-only の状態遷移ログ）。
+
+    Args:
+        target_sheet_name: このバッチが紐づく出力一覧シート名（target_folder
+            単位の識別キー）
+        batch_id: Anthropic バッチ ID（``msgbatch_...``）
+        status: ``BATCH_STATE_SUBMITTED`` / ``BATCH_STATE_DONE`` /
+            ``BATCH_STATE_EXPIRED``
+    """
+    spreadsheet_id = spreadsheet_id or SPREADSHEET_ID
+    if not spreadsheet_id:
+        raise ValueError("SPREADSHEET_IDが設定されていません")
+
+    service = get_sheets_service()
+    _ensure_sheet_with_header(
+        service, spreadsheet_id, BATCH_STATE_SHEET_NAME, _BATCH_STATE_HEADER
+    )
+
+    recorded_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    _throttle_sheets_write()
+    service.spreadsheets().values().append(
+        spreadsheetId=spreadsheet_id,
+        range=f"{BATCH_STATE_SHEET_NAME}!A:D",
+        valueInputOption="RAW",
+        insertDataOption="INSERT_ROWS",
+        body={"values": [[recorded_at, target_sheet_name, batch_id, status]]},
+    ).execute(num_retries=GOOGLE_API_NUM_RETRIES)
+    logger.info(
+        f"Sheets: バッチ状態を記録 ({target_sheet_name} / {batch_id} / {status})"
+    )
+
+
+def get_open_batch_ids(
+    target_sheet_name: str,
+    spreadsheet_id: str | None = None,
+) -> list[str]:
+    """未回収（投入済みだが回収完了/期限切れ記録が無い）バッチ ID を返す。
+
+    ``step=all`` 実行の冒頭で呼び、未回収バッチがあれば **再投入せず** 結果
+    回収から再開する（二重課金防止）。判定は append-only ログの集約:
+    同じバッチ ID に ``回収完了`` / ``期限切れ`` 行が 1 つでもあれば closed。
+
+    Returns:
+        未回収バッチ ID のリスト（投入記録の出現順）。シート未作成なら空。
+    """
+    spreadsheet_id = spreadsheet_id or SPREADSHEET_ID
+    if not spreadsheet_id:
+        raise ValueError("SPREADSHEET_IDが設定されていません")
+
+    service = get_sheets_service()
+    meta = service.spreadsheets().get(
+        spreadsheetId=spreadsheet_id
+    ).execute(num_retries=GOOGLE_API_NUM_RETRIES)
+    existing_titles = [s["properties"]["title"] for s in meta.get("sheets", [])]
+    if BATCH_STATE_SHEET_NAME not in existing_titles:
+        return []
+
+    result = service.spreadsheets().values().get(
+        spreadsheetId=spreadsheet_id,
+        range=f"{BATCH_STATE_SHEET_NAME}!A2:D",
+    ).execute(num_retries=GOOGLE_API_NUM_RETRIES)
+    rows = result.get("values", [])
+
+    submitted_order: list[str] = []
+    closed: set[str] = set()
+    for row in rows:
+        # 列: [記録日時, 対象シート, バッチID, 状態]
+        if len(row) < 4:
+            continue
+        target, batch_id, status = row[1].strip(), row[2].strip(), row[3].strip()
+        if target != target_sheet_name or not batch_id:
+            continue
+        if status == BATCH_STATE_SUBMITTED:
+            if batch_id not in submitted_order:
+                submitted_order.append(batch_id)
+        elif status in (BATCH_STATE_DONE, BATCH_STATE_EXPIRED):
+            closed.add(batch_id)
+
+    open_ids = [b for b in submitted_order if b not in closed]
+    if open_ids:
+        logger.warning(
+            f"Sheets: 未回収バッチを検出 ({target_sheet_name}): {open_ids}"
+        )
+    return open_ids
 
 
 def get_recorded_clinic_numbers(
@@ -881,6 +1061,40 @@ def lookup_clinic_name(
         ):
             return r.clinic_name
     return ""
+
+
+def lookup_participant_by_management_number(
+    records: list[MasterRecord],
+    pdf_management_number: str,
+) -> MasterRecord | None:
+    """PDF の管理番号（``NNN-NN-N``）から参加者マスターの行を引く。
+
+    マスターの管理番号は個人単位の ``NNN-NN``（2 セグメント）、PDF の管理番号
+    は提出単位の ``NNN-NN-N``（3 セグメント）。前方一致
+    （``pdf_mgmt == master_mgmt`` または ``pdf_mgmt.startswith(master_mgmt + "-")``）
+    で個人行を特定する。添付資料のメイン非依存ルーティング（対応するメイン PDF
+    が同一ラン内で処理されない場合でも、マスターだけで
+    ``(医院番号, 医院名, 個人名)`` を解決する）に使う。
+
+    Returns:
+        マッチした ``MasterRecord``。複数マッチ時は管理番号が最長の行
+        （最も具体的な行）。マッチ無しなら None。
+    """
+    if not pdf_management_number:
+        return None
+    pdf_mgmt = pdf_management_number.strip()
+
+    best: MasterRecord | None = None
+    for r in records:
+        master_mgmt = (r.management_number or "").strip()
+        if not master_mgmt:
+            continue
+        if pdf_mgmt == master_mgmt or pdf_mgmt.startswith(master_mgmt + "-"):
+            if best is None or len(master_mgmt) > len(
+                (best.management_number or "").strip()
+            ):
+                best = r
+    return best
 
 
 def lookup_email_by_clinic_and_person(

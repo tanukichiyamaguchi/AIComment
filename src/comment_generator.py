@@ -351,12 +351,37 @@ SYSTEM_PROMPT = """\
 # ``extract_theme`` / ``get_system_prompt`` / テーマ別プロンプト定数は削除済み。
 
 
+# PDF テキストの上限（文字数）。超過分は切り詰めて投入する。
+# 巨大 PDF（数百ページのスキャン OCR 等）のテキストをそのまま投入すると
+# (1) Claude の 200k トークンコンテキスト超過で per-item 恒久失敗になり、
+#     失敗 item は出力シートに記録されないため **毎ランで再投入 → 再失敗** を
+#     永久に繰り返す（Batch モードでは毎回課金だけ発生する）、
+# (2) Batch API の 256MB/バッチ上限を 1 item で大きく食い潰す、
+# の 2 つの事故につながる。実践事例の本文は先頭 10 万文字あれば十分
+# コメント生成できるため、超過分は警告ログ付きで切り詰める。
+_MAX_PDF_TEXT_CHARS = 100_000
+
+
 def _build_user_prompt(pdf_text: str, pdf_filename: str = "") -> str:
     """ユーザープロンプトを構築する（抽出フィールドは全件共通）。
 
     ファイル種別の断定は避けて中立的に書く。書き方の指示は単一の system
     プロンプト（``SYSTEM_PROMPT``）に統一されている（テーマ分岐は廃止）。
+
+    ``pdf_text`` が ``_MAX_PDF_TEXT_CHARS`` を超える場合は切り詰める
+    （200k トークンコンテキスト超過による恒久 per-item 失敗の予防）。
     """
+    if len(pdf_text) > _MAX_PDF_TEXT_CHARS:
+        logger.warning(
+            f"PDFテキストが長すぎるため切り詰めます "
+            f"({len(pdf_text)}文字 → {_MAX_PDF_TEXT_CHARS}文字, "
+            f"file={pdf_filename or '(不明)'})。"
+            f"コンテキスト上限超過による恒久失敗を防ぐための保護です。"
+        )
+        pdf_text = (
+            pdf_text[:_MAX_PDF_TEXT_CHARS]
+            + "\n（※本文が長大なため以降を省略しています）"
+        )
     file_note = f"\nファイル名: {pdf_filename}\n" if pdf_filename else ""
     return (
         "以下は歯科医院スタッフから提出された報告ファイルです。"
@@ -628,6 +653,76 @@ def create_batch_requests(
         )
         requests.append(Request(custom_id=item["custom_id"], params=params))
     return requests
+
+
+# ── Batch チャンク分割（256MB / 100k リクエスト上限対策） ──
+# Anthropic Batch API の上限は「100,000 リクエスト / リクエスト総サイズ 256MB
+# / バッチ」。バッチの HTTP ボディは JSON で、httpx は既定 ``ensure_ascii=True``
+# で日本語 1 文字が ``\\uXXXX``（6 バイト）に展開されるため、日本語主体の
+# システムプロンプト（全リクエストに複製される）+ pdf_text は文字数の約 6 倍
+# のボディサイズになる。2000〜3000 件規模で実際に 256MB に到達し、**step1 の
+# 数時間分の作業のあとで送信が丸ごと失敗** する。上限にマージンを取った
+# チャンクに分割し、複数バッチとして送信する。
+_BATCH_MAX_REQUESTS_PER_BATCH = 20_000
+_BATCH_MAX_BYTES_PER_BATCH = 150 * 1024 * 1024  # 256MB 上限に対し 40% マージン
+
+# リクエスト 1 件あたりの固定オーバーヘッド（システムプロンプト + スキーマ +
+# その他パラメータの JSON エスケープ後サイズ）。システムプロンプトは全リクエスト
+# に複製されるため、これを見込まないと見積りが大幅に甘くなる。
+_PER_REQUEST_OVERHEAD_BYTES = (
+    len(json.dumps(SYSTEM_PROMPT))          # ensure_ascii=True でエスケープ後
+    + len(json.dumps(EXTRACTION_SCHEMA))
+    + 2048                                   # model / custom_id / その他 params
+)
+
+
+def estimate_request_bytes(item: dict) -> int:
+    """Batch リクエスト 1 件の HTTP ボディ上のサイズ（バイト）を見積もる。
+
+    ``json.dumps``（既定 ``ensure_ascii=True``）で実際のエスケープ後サイズを
+    測る。httpx が同じ既定でシリアライズするため、実サイズとほぼ一致する
+    （こちらの方がわずかに大きめ = 安全側）。
+    """
+    user_prompt = _build_user_prompt(
+        pdf_text=item.get("pdf_text", ""),
+        pdf_filename=item.get("pdf_file_name", ""),
+    )
+    return len(json.dumps(user_prompt)) + _PER_REQUEST_OVERHEAD_BYTES
+
+
+def plan_batch_chunks(items: list[dict]) -> list[list[dict]]:
+    """items を Batch API の上限内に収まるチャンク列に分割する（純関数）。
+
+    件数（``_BATCH_MAX_REQUESTS_PER_BATCH``）とサイズ見積り
+    （``_BATCH_MAX_BYTES_PER_BATCH``）の両方でチャンク境界を決める。
+    順序は保存される。空リストなら空リストを返す。
+
+    Returns:
+        チャンクのリスト。すべて連結すると元の ``items`` と一致する。
+    """
+    chunks: list[list[dict]] = []
+    current: list[dict] = []
+    current_bytes = 0
+    for item in items:
+        item_bytes = estimate_request_bytes(item)
+        if current and (
+            len(current) >= _BATCH_MAX_REQUESTS_PER_BATCH
+            or current_bytes + item_bytes > _BATCH_MAX_BYTES_PER_BATCH
+        ):
+            chunks.append(current)
+            current = []
+            current_bytes = 0
+        current.append(item)
+        current_bytes += item_bytes
+    if current:
+        chunks.append(current)
+    if len(chunks) > 1:
+        logger.info(
+            f"Batch サイズ上限のため {len(items)} 件を {len(chunks)} バッチに分割 "
+            f"(上限: {_BATCH_MAX_REQUESTS_PER_BATCH}件 / "
+            f"{_BATCH_MAX_BYTES_PER_BATCH // (1024 * 1024)}MB per バッチ)"
+        )
+    return chunks
 
 
 def submit_batch(items: list[dict]) -> str:

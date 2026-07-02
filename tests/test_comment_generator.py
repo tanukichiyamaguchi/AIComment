@@ -7,6 +7,8 @@ from unittest.mock import MagicMock, patch
 import anthropic
 from anthropic.types import TextBlock
 
+from src import comment_generator
+
 from src.comment_generator import (
     EXTRACTION_SCHEMA,
     SYSTEM_PROMPT,
@@ -801,6 +803,101 @@ class TestBatchApiRetriesOnTransientErrors(unittest.TestCase):
         batch_id = submit_batch(items)
         self.assertEqual(batch_id, "batch_ok3")
         self.assertEqual(mock_sleep.call_count, 1)
+
+
+class TestPdfTextTruncation(unittest.TestCase):
+    """``_build_user_prompt``: 巨大 PDF テキストの切り詰めガード。
+
+    200k トークンコンテキスト超過 → per-item 恒久失敗 → 毎ラン再投入・再失敗
+    ループ（課金だけ発生）を防ぐ。
+    """
+
+    def test_short_text_passes_through_unchanged(self):
+        prompt = comment_generator._build_user_prompt("短いテキスト", "a.pdf")
+        self.assertIn("短いテキスト", prompt)
+        self.assertNotIn("以降を省略", prompt)
+
+    def test_oversized_text_truncated_with_warning(self):
+        huge = "あ" * (comment_generator._MAX_PDF_TEXT_CHARS + 1000)
+        with self.assertLogs("jissen_comment", level="WARNING") as log_ctx:
+            prompt = comment_generator._build_user_prompt(huge, "huge.pdf")
+        self.assertIn("以降を省略", prompt)
+        # 切り詰め後の本文は上限 + マーカー程度に収まる
+        self.assertLess(
+            len(prompt),
+            comment_generator._MAX_PDF_TEXT_CHARS + 500,
+        )
+        joined = "\n".join(log_ctx.output)
+        self.assertIn("huge.pdf", joined)
+        self.assertIn("切り詰め", joined)
+
+    def test_boundary_exact_limit_not_truncated(self):
+        text = "あ" * comment_generator._MAX_PDF_TEXT_CHARS
+        prompt = comment_generator._build_user_prompt(text, "b.pdf")
+        self.assertNotIn("以降を省略", prompt)
+
+
+class TestPlanBatchChunks(unittest.TestCase):
+    """``plan_batch_chunks``: 256MB / 100k リクエスト上限のチャンク分割。"""
+
+    def _item(self, custom_id: str, text_len: int = 10) -> dict:
+        return {
+            "custom_id": custom_id,
+            "pdf_text": "あ" * text_len,
+            "pdf_file_name": f"{custom_id}.pdf",
+        }
+
+    def test_empty_items_returns_empty(self):
+        self.assertEqual(comment_generator.plan_batch_chunks([]), [])
+
+    def test_small_items_single_chunk(self):
+        items = [self._item(f"id_{i}") for i in range(10)]
+        chunks = comment_generator.plan_batch_chunks(items)
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(chunks[0], items)
+
+    def test_splits_by_request_count(self):
+        items = [self._item(f"id_{i}", text_len=1) for i in range(5)]
+        with patch.object(
+            comment_generator, "_BATCH_MAX_REQUESTS_PER_BATCH", 2,
+        ):
+            chunks = comment_generator.plan_batch_chunks(items)
+        self.assertEqual([len(c) for c in chunks], [2, 2, 1])
+        # 順序が保存され、結合すると元と一致する
+        flattened = [i for c in chunks for i in c]
+        self.assertEqual(flattened, items)
+
+    def test_splits_by_byte_size(self):
+        # 1 item あたりのサイズ見積りを実測し、2 item でちょうど超える上限を設定
+        items = [self._item(f"id_{i}", text_len=1000) for i in range(4)]
+        per_item = comment_generator.estimate_request_bytes(items[0])
+        with patch.object(
+            comment_generator, "_BATCH_MAX_BYTES_PER_BATCH",
+            int(per_item * 2.5),
+        ):
+            chunks = comment_generator.plan_batch_chunks(items)
+        self.assertEqual([len(c) for c in chunks], [2, 2])
+
+    def test_estimate_includes_system_prompt_overhead(self):
+        """見積りは全リクエストに複製されるシステムプロンプト分を含む。"""
+        item = self._item("id_x", text_len=0)
+        estimated = comment_generator.estimate_request_bytes(item)
+        # SYSTEM_PROMPT の JSON エスケープ後サイズより必ず大きい
+        self.assertGreater(
+            estimated,
+            len(json.dumps(comment_generator.SYSTEM_PROMPT)),
+        )
+
+    def test_single_oversized_item_still_gets_own_chunk(self):
+        """上限超の単一 item も落とさず単独チャンクにする（送信で判定させる）。"""
+        items = [self._item("big", text_len=5000), self._item("small")]
+        per_item = comment_generator.estimate_request_bytes(items[0])
+        with patch.object(
+            comment_generator, "_BATCH_MAX_BYTES_PER_BATCH",
+            per_item - 1,
+        ):
+            chunks = comment_generator.plan_batch_chunks(items)
+        self.assertEqual([len(c) for c in chunks], [1, 1])
 
 
 if __name__ == "__main__":

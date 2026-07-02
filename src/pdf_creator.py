@@ -152,11 +152,23 @@ def create_comment_page(
 
     wrapped_lines = _wrap_text(comment, "NotoSansJP", BODY_FONT_SIZE, content_w)
 
+    drawn_lines = 0
     for line in wrapped_lines:
         if y < box_y + 40 * mm:  # じっせん君画像分の余白を確保
             break
         c.drawString(content_x, y, line)
         y -= LINE_HEIGHT
+        drawn_lines += 1
+
+    # 描画領域に収まらず切り捨てた行があれば loud に警告する（P-001: 無言の
+    # 欠落は事故）。通常のコメント（200〜350 文字 + 段落改行）は収まる設計
+    # だが、想定超の長文・多段落で本文が黙って欠けたまま出荷されるのを防ぐ。
+    if drawn_lines < len(wrapped_lines):
+        logger.warning(
+            f"コメントが描画領域に収まらず {len(wrapped_lines) - drawn_lines} 行"
+            f"切り捨てました（全 {len(wrapped_lines)} 行, {len(comment)} 文字）。"
+            f"PDF 上でコメント末尾が欠けています: {output_path.name}"
+        )
 
     # ── じっせん君画像（右下） ──
     if JISSEN_KUN_IMAGE.exists():

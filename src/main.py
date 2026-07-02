@@ -23,8 +23,11 @@ from __future__ import annotations
 import argparse
 import shutil
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
+
+from google.auth.exceptions import RefreshError
 
 from src.utils import (
     setup_logging,
@@ -45,6 +48,7 @@ def run(
     test_count: int = 0,
     profile_name: str | None = None,
     target_folder: str | None = None,
+    max_runtime_minutes: int = 320,
 ) -> None:
     """通常モードのメイン処理。
 
@@ -75,6 +79,13 @@ def run(
             省略時かつ ``target_folder`` も無指定なら ``jissen_default``。
         target_folder: フォルダ自動検出モードのフォルダ名。
             ``__list__`` 指定時は候補列挙のみ行い即 return。
+        max_runtime_minutes: 実行時間バジェット（分、0=無制限）。通常モードは
+            1 件ずつ逐次処理のため、1000 件規模では GHA の 6h ジョブ上限
+            （timeout-minutes: 360）を超えてジョブ kill され、**下書き作成前の
+            成果物が失われる**。バジェット到達でループを安全に打ち切り、
+            処理済み分の下書き作成・完了マーカーまで完走させる（未処理分は
+            出力一覧シート未記録のため、再実行の増分処理で自然に続きから
+            処理される）。既定 320 分 = GHA 上限に 40 分のマージン。
     """
     logger = setup_logging()
     logger.info("=== じっせん君コメントシステム（通常モード）開始 ===")
@@ -201,7 +212,24 @@ def run(
     # ``mkdtemp`` + 関数末尾の ``shutil.rmtree`` でクリーンアップする。
     session_outputs_dir = Path(tempfile.mkdtemp(prefix="aicomment_outputs_"))
 
+    # 実行時間バジェット（GHA 6h ジョブ kill による成果物ロスト防止）。
+    deadline = (
+        time.monotonic() + max_runtime_minutes * 60
+        if max_runtime_minutes > 0 else None
+    )
+    time_budget_hit = False
+
     for i, pdf_file in enumerate(targets, start=1):
+        if deadline is not None and time.monotonic() > deadline:
+            time_budget_hit = True
+            logger.warning(
+                f"実行時間バジェット（{max_runtime_minutes}分）に到達しました。"
+                f"残り {len(targets) - i + 1} 件はループを打ち切り、処理済み分の"
+                f"下書き作成・完了マーカーを完走させます。未処理分は再実行の"
+                f"増分処理で続きから処理されます。"
+            )
+            break
+
         file_id = pdf_file["id"]
         file_name = pdf_file["name"]
         logger.info(f"--- [{i}/{len(targets)}] {file_name} ---")
@@ -328,6 +356,17 @@ def run(
             )
             break
 
+        except RefreshError as e:
+            # Google 認証の恒久失敗（OAuth トークン失効/取り消し）。Anthropic の
+            # 恒久エラーと同様、以降の全 PDF も必ず失敗するため即停止する
+            # （per-item fail-soft で数百件のエラーログを乱立させない）。
+            run_halted = PermanentRunFailureError(
+                f"Google 認証エラー（OAuth トークン失効の可能性）: {e}。"
+                f"GOOGLE_OAUTH_TOKEN_JSON を再発行して再実行してください。"
+            )
+            logger.error(str(run_halted))
+            break
+
         except Exception as e:
             logger.error(f"処理エラー: {file_name} - {e}", exc_info=True)
             stats["error"] += 1
@@ -342,8 +381,16 @@ def run(
             "恒久エラーのためラン停止中: 添付資料パススルーをスキップします"
             f"（未処理 {len(attachment_files)}件）"
         )
+    # 添付資料の重複判定は「その添付資料自体が出力一覧シートに記録済みか」
+    # （``【添付資料】<元名>`` マーカー）で行う。以前の「メインの管理番号が
+    # 処理済みなら添付もスキップ」方式は、メイン処理後に添付だけ後から Drive
+    # に追加されたケース等で添付資料が恒久ロストする欠陥があった。
+    recorded_attachments: set[str] = set()
     if attachment_files and run_halted is None:
         logger.info(f"--- 添付資料パススルー: {len(attachment_files)}件 ---")
+        recorded_attachments = sheets_client.get_recorded_attachment_names(
+            sheet_name=cfg.output_sheet_name,
+        )
     for pdf_file in [] if run_halted is not None else attachment_files:
         file_id = pdf_file["id"]
         file_name = pdf_file["name"]
@@ -357,16 +404,25 @@ def run(
             stats["skip_no_number"] += 1
             continue
 
-        # 重複判定は実行開始時のスナップショット（前回実行でコピー済みか）。
-        if mgmt_num in processed:
-            logger.info(f"処理済みのため添付資料をスキップ: {mgmt_num} ({file_name})")
+        if f"【添付資料】{file_name}" in recorded_attachments:
+            logger.info(f"記録済みのため添付資料をスキップ: {mgmt_num} ({file_name})")
             stats["skip_processed"] += 1
             continue
 
+        # case_map（同一ラン内で処理されたメイン）を最優先。無ければ参加者
+        # マスターだけで出力先を解決するフォールバック（メインが過去ラン処理
+        # 済みで添付だけ後から追加されたケースの恒久ロスト防止）。
         case = case_map.get(mgmt_num)
+        case_from_master = False
+        if case is None:
+            case = run_common.resolve_case_via_master(
+                sheets_client, master_records, mgmt_num, logger,
+            )
+            case_from_master = case is not None
         if case is None:
             logger.warning(
-                f"対応するメイン実践事例 PDF がこの実行で処理されていないため"
+                f"対応するメイン実践事例 PDF がこの実行で処理されておらず、"
+                f"参加者マスターにも管理番号 {mgmt_num} が未登録のため"
                 f"スキップ: {file_name}"
             )
             stats["skip_attachment_orphan"] += 1
@@ -392,6 +448,8 @@ def run(
             output_folder_id=cfg.output_folder_id,
             output_sheet_name=cfg.output_sheet_name,
             session_outputs_dir=session_outputs_dir,
+            # マスター由来の確定名なら既存フォルダ名の同期を許可
+            clinic_name_authoritative=case_from_master,
         )
 
     # ── 集約下書き作成 ──
@@ -428,6 +486,11 @@ def run(
             f"中止（残高/認証/権限エラー） 成功 {stats['success']}件 / "
             f"未処理あり・再実行が必要"
         )
+    elif time_budget_hit:
+        marker_summary = (
+            f"時間切れ部分完了 成功 {stats['success']}件 / "
+            f"エラー {stats['error']}件 / 未処理あり・再実行で続きから処理"
+        )
     else:
         marker_summary = (
             f"成功 {stats['success']}件 / "
@@ -463,6 +526,13 @@ def main() -> None:
         "--test-count", type=int, default=0,
         help="テスト件数（0=全件処理）。重複・管理番号なしを除外した新規 PDF に適用",
     )
+    parser.add_argument(
+        "--max-runtime-minutes", type=int, default=320,
+        help=(
+            "実行時間バジェット（分、0=無制限）。到達でループを安全に打ち切り、"
+            "処理済み分の下書き・完了マーカーまで完走させる（GHA 6h kill 対策）"
+        ),
+    )
     group = parser.add_mutually_exclusive_group()
     group.add_argument(
         "--profile", type=str, default=None,
@@ -483,6 +553,7 @@ def main() -> None:
         test_count=args.test_count,
         profile_name=args.profile,
         target_folder=args.target_folder,
+        max_runtime_minutes=args.max_runtime_minutes,
     )
 
 

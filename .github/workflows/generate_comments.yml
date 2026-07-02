@@ -31,7 +31,7 @@ on:
           - all
           - results
       batch_id:
-        description: 'step=results 時のみ使用。回収したい完了済みバッチID（例 msgbatch_xxx）。'
+        description: 'step=results 時のみ使用。回収したい完了済みバッチID（例 msgbatch_xxx、カンマ区切りで複数可）。'
         type: string
         default: ''
 
@@ -142,6 +142,9 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: execution-logs
+          # run_attempt を含める: upload-artifact@v4 は同名 artifact の再アップ
+          # ロードを 409 で拒否するため、Re-run 時に batch_id.txt 含む logs/ の
+          # 保全が失敗しないようにする。
+          name: execution-logs-attempt-${{ github.run_attempt }}
           path: logs/
           retention-days: 30

@@ -157,6 +157,24 @@ def download_pdf(file_id: str) -> bytes:
     return data
 
 
+# ── フォルダ解決のプロセス内キャッシュ ──
+# ``find_or_create_folder`` / ``find_or_create_clinic_folder`` は 1 回の解決
+# ごとに親フォルダ配下の **全サブフォルダを走査** する（表記揺れ照合のため
+# Drive クエリで絞り込めない）。1000 PDF 規模では 1 件ごとに医院フォルダ +
+# 個人フォルダの 2 走査 = 数千回の冗長 list API 呼び出しになり、実行時間を
+# 数十分〜時間単位で浪費する。同一ラン内で解決済みのフォルダ ID をキャッシュ
+# して再走査を省く（フォルダ ID はリネームでも不変なので、authoritative
+# リネーム後もキャッシュは有効）。
+_FOLDER_CACHE: dict[tuple[str, str], str] = {}
+_CLINIC_FOLDER_CACHE: dict[tuple[str, str], str] = {}
+
+
+def reset_folder_caches() -> None:
+    """フォルダ解決キャッシュをクリアする（テスト用 / 長寿命プロセス用）。"""
+    _FOLDER_CACHE.clear()
+    _CLINIC_FOLDER_CACHE.clear()
+
+
 def find_or_create_folder(
     folder_name: str,
     parent_id: str,
@@ -177,6 +195,11 @@ def find_or_create_folder(
         raise ValueError("folder_name が空です")
     if not parent_id:
         raise ValueError("parent_id が空です")
+
+    cache_key = (parent_id, normalize_name_for_match(folder_name))
+    cached = _FOLDER_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
 
     service = service or get_drive_service()
 
@@ -219,6 +242,7 @@ def find_or_create_folder(
                         f"Drive: 表記揺れを検知して既存フォルダを再利用 "
                         f"(要求='{folder_name}', 既存='{existing_name}', ID: {folder_id})"
                     )
+                _FOLDER_CACHE[cache_key] = folder_id
                 return folder_id
 
         page_token = response.get("nextPageToken")
@@ -237,6 +261,7 @@ def find_or_create_folder(
     ).execute(num_retries=GOOGLE_API_NUM_RETRIES)
     new_id: str = created["id"]
     logger.info(f"Drive: フォルダ新規作成 ({folder_name}, ID: {new_id})")
+    _FOLDER_CACHE[cache_key] = new_id
     return new_id
 
 
@@ -385,6 +410,14 @@ def find_or_create_clinic_folder(
             raise ValueError("clinic_number と clinic_name の両方が空です")
         return find_or_create_folder(clinic_name, parent_id, service=service)
 
+    # 同一ラン内で解決済みの医院フォルダは再走査しない。authoritative リネームは
+    # 初回解決時に実施済み（同一ラン内はマスタースナップショットが不変のため、
+    # 2 回目以降の再判定は同じ結果になる）。
+    clinic_cache_key = (parent_id, clinic_number)
+    cached_clinic = _CLINIC_FOLDER_CACHE.get(clinic_cache_key)
+    if cached_clinic is not None:
+        return cached_clinic
+
     service = service or get_drive_service()
 
     # 親フォルダ配下のサブフォルダ一覧を取得（P-010、pageToken ループ必須。
@@ -475,6 +508,7 @@ def find_or_create_clinic_folder(
                         f"(医院番号={clinic_number}, 目標名='{desired_name}', "
                         f"ID: {folder_id}): {e}"
                     )
+        _CLINIC_FOLDER_CACHE[clinic_cache_key] = folder_id
         return folder_id
 
     # マッチ無し → 新規作成。フォルダ名は今回の AI 抽出値を使った
@@ -494,6 +528,7 @@ def find_or_create_clinic_folder(
     logger.info(
         f"Drive: 医院フォルダ新規作成 ({new_folder_name}, ID: {new_id})"
     )
+    _CLINIC_FOLDER_CACHE[clinic_cache_key] = new_id
     return new_id
 
 
