@@ -698,6 +698,27 @@ class TestBatchE2E(unittest.TestCase):
             "clinic_folder_id": "clinic_folder_fake",
         }
         mock_reader.extract_text.return_value = "PDFテキスト"
+        # バッチ状態管理（自動レジューム）: 未回収バッチなし
+        mock_sheets.get_open_batch_ids.return_value = []
+        mock_sheets.BATCH_STATE_SHEET_NAME = "_バッチ管理"
+        mock_sheets.BATCH_STATE_SUBMITTED = "投入済み"
+        mock_sheets.BATCH_STATE_DONE = "回収完了"
+        # 添付資料の記録済みマーカー: なし
+        mock_sheets.get_recorded_attachment_names.return_value = set()
+        # マスター単独の添付ルーティング: 未登録
+        mock_sheets.lookup_participant_by_management_number.return_value = None
+        # チャンク分割: 実物同様に「1 チャンク」を返す
+        mock_gen.plan_batch_chunks.side_effect = (
+            lambda items: [items] if items else []
+        )
+        # 新 API のモック設定（自動レジューム/添付記録/チャンク分割）
+        mock_sheets.get_open_batch_ids.return_value = []
+        mock_sheets.BATCH_STATE_SHEET_NAME = "_バッチ管理"
+        mock_sheets.get_recorded_attachment_names.return_value = set()
+        mock_sheets.lookup_participant_by_management_number.return_value = None
+        mock_gen.plan_batch_chunks.side_effect = (
+            lambda items: [items] if items else []
+        )
         mock_gen.submit_batch.return_value = "batch_test_001"
         mock_gen.get_batch_status.return_value = {
             "status": "ended",
@@ -1229,6 +1250,14 @@ class TestTargetFolderE2E(unittest.TestCase):
             "clinic_folder_id": "clinic_folder_fake",
         }
         mock_reader.extract_text.return_value = "PDFテキスト"
+        # 新 API のモック設定（自動レジューム/添付記録/チャンク分割）
+        mock_sheets.get_open_batch_ids.return_value = []
+        mock_sheets.BATCH_STATE_SHEET_NAME = "_バッチ管理"
+        mock_sheets.get_recorded_attachment_names.return_value = set()
+        mock_sheets.lookup_participant_by_management_number.return_value = None
+        mock_gen.plan_batch_chunks.side_effect = (
+            lambda items: [items] if items else []
+        )
         mock_gen.submit_batch.return_value = "batch_test_001"
         mock_gen.get_batch_status.return_value = {
             "status": "ended",
@@ -1397,6 +1426,14 @@ class TestProfileModeRegressionAfterDiscoveryAdded(unittest.TestCase):
             "clinic_folder_id": "clinic_folder_fake",
         }
         mock_reader.extract_text.return_value = "テキスト"
+        # 新 API のモック設定（自動レジューム/添付記録/チャンク分割）
+        mock_sheets.get_open_batch_ids.return_value = []
+        mock_sheets.BATCH_STATE_SHEET_NAME = "_バッチ管理"
+        mock_sheets.get_recorded_attachment_names.return_value = set()
+        mock_sheets.lookup_participant_by_management_number.return_value = None
+        mock_gen.plan_batch_chunks.side_effect = (
+            lambda items: [items] if items else []
+        )
         mock_gen.submit_batch.return_value = "batch_001"
         mock_gen.get_batch_status.return_value = {
             "status": "ended",
@@ -1662,6 +1699,14 @@ class TestAttachmentPassthroughE2E(unittest.TestCase):
         }
         mock_sheets.get_processed_management_numbers.return_value = set()
         mock_reader.extract_text.return_value = "PDFテキスト"
+        # 新 API のモック設定（自動レジューム/添付記録/チャンク分割）
+        mock_sheets.get_open_batch_ids.return_value = []
+        mock_sheets.BATCH_STATE_SHEET_NAME = "_バッチ管理"
+        mock_sheets.get_recorded_attachment_names.return_value = set()
+        mock_sheets.lookup_participant_by_management_number.return_value = None
+        mock_gen.plan_batch_chunks.side_effect = (
+            lambda items: [items] if items else []
+        )
         mock_gen.submit_batch.return_value = "batch_att_001"
         mock_gen.get_batch_status.return_value = {
             "status": "ended",
@@ -1854,6 +1899,14 @@ class TestClinicNumberFolderE2E(unittest.TestCase):
         mock_sheets.lookup_clinic_name.return_value = ""
         mock_sheets.lookup_email_by_clinic_and_person.return_value = ""
         mock_reader.extract_text.return_value = "PDFテキスト"
+        # 新 API のモック設定（自動レジューム/添付記録/チャンク分割）
+        mock_sheets.get_open_batch_ids.return_value = []
+        mock_sheets.BATCH_STATE_SHEET_NAME = "_バッチ管理"
+        mock_sheets.get_recorded_attachment_names.return_value = set()
+        mock_sheets.lookup_participant_by_management_number.return_value = None
+        mock_gen.plan_batch_chunks.side_effect = (
+            lambda items: [items] if items else []
+        )
         mock_gen.submit_batch.return_value = "batch_clinic_001"
         mock_gen.get_batch_status.return_value = {
             "status": "ended",

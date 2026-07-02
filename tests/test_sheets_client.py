@@ -1592,5 +1592,249 @@ class TestListMasterSheetTabs(unittest.TestCase):
                 sheets_client.list_master_sheet_tabs()
 
 
+class TestBatchStateRecords(unittest.TestCase):
+    """``append_batch_record`` / ``get_open_batch_ids``: 未回収バッチの検知。
+
+    GHA ジョブ kill 後の ``step=all`` 再実行が投入済みバッチを再投入（二重
+    課金）しないための、スプレッドシート永続の状態遷移ログ。
+    """
+
+    def _service_with_state_rows(self, rows: list[list[str]]) -> MagicMock:
+        service = MagicMock()
+        service.spreadsheets.return_value.get.return_value.execute.return_value = {
+            "sheets": [{"properties": {"title": "_バッチ管理"}}]
+        }
+        service.spreadsheets.return_value.values.return_value.get.return_value \
+            .execute.return_value = {"values": rows}
+        return service
+
+    @patch("src.sheets_client.get_sheets_service")
+    def test_open_when_submitted_without_done(self, mock_get_service):
+        mock_get_service.return_value = self._service_with_state_rows([
+            ["2026-01-01 00:00:00", "出力A", "msgbatch_1", "投入済み"],
+        ])
+        self.assertEqual(
+            sheets_client.get_open_batch_ids("出力A", spreadsheet_id="ssid"),
+            ["msgbatch_1"],
+        )
+
+    @patch("src.sheets_client.get_sheets_service")
+    def test_closed_when_done_recorded(self, mock_get_service):
+        mock_get_service.return_value = self._service_with_state_rows([
+            ["t1", "出力A", "msgbatch_1", "投入済み"],
+            ["t2", "出力A", "msgbatch_1", "回収完了"],
+        ])
+        self.assertEqual(
+            sheets_client.get_open_batch_ids("出力A", spreadsheet_id="ssid"),
+            [],
+        )
+
+    @patch("src.sheets_client.get_sheets_service")
+    def test_closed_when_expired_recorded(self, mock_get_service):
+        mock_get_service.return_value = self._service_with_state_rows([
+            ["t1", "出力A", "msgbatch_1", "投入済み"],
+            ["t2", "出力A", "msgbatch_1", "期限切れ(結果喪失)"],
+        ])
+        self.assertEqual(
+            sheets_client.get_open_batch_ids("出力A", spreadsheet_id="ssid"),
+            [],
+        )
+
+    @patch("src.sheets_client.get_sheets_service")
+    def test_filters_by_target_sheet(self, mock_get_service):
+        """別フォルダ（別出力シート）のバッチは対象外。"""
+        mock_get_service.return_value = self._service_with_state_rows([
+            ["t1", "出力A", "msgbatch_a", "投入済み"],
+            ["t2", "出力B", "msgbatch_b", "投入済み"],
+        ])
+        self.assertEqual(
+            sheets_client.get_open_batch_ids("出力B", spreadsheet_id="ssid"),
+            ["msgbatch_b"],
+        )
+
+    @patch("src.sheets_client.get_sheets_service")
+    def test_multiple_open_batches_preserve_order(self, mock_get_service):
+        """チャンク分割で複数バッチが未回収の場合、投入順で返す。"""
+        mock_get_service.return_value = self._service_with_state_rows([
+            ["t1", "出力A", "msgbatch_1", "投入済み"],
+            ["t2", "出力A", "msgbatch_2", "投入済み"],
+            ["t3", "出力A", "msgbatch_3", "投入済み"],
+            ["t4", "出力A", "msgbatch_2", "回収完了"],
+        ])
+        self.assertEqual(
+            sheets_client.get_open_batch_ids("出力A", spreadsheet_id="ssid"),
+            ["msgbatch_1", "msgbatch_3"],
+        )
+
+    @patch("src.sheets_client.get_sheets_service")
+    def test_empty_when_state_sheet_missing(self, mock_get_service):
+        """``_バッチ管理`` タブ未作成（初回運用）なら空リスト。"""
+        service = MagicMock()
+        service.spreadsheets.return_value.get.return_value.execute.return_value = {
+            "sheets": [{"properties": {"title": "出力一覧"}}]
+        }
+        mock_get_service.return_value = service
+        self.assertEqual(
+            sheets_client.get_open_batch_ids("出力A", spreadsheet_id="ssid"),
+            [],
+        )
+
+    @patch("src.sheets_client._throttle_sheets_write")
+    @patch("src.sheets_client.get_sheets_service")
+    def test_append_batch_record_appends_row(
+        self, mock_get_service, mock_throttle,
+    ):
+        service = self._service_with_state_rows([])
+        mock_get_service.return_value = service
+        sheets_client.append_batch_record(
+            "出力A", "msgbatch_9", sheets_client.BATCH_STATE_SUBMITTED,
+            spreadsheet_id="ssid",
+        )
+        append_call = service.spreadsheets.return_value.values.return_value.append
+        row = append_call.call_args.kwargs["body"]["values"][0]
+        self.assertEqual(row[1], "出力A")
+        self.assertEqual(row[2], "msgbatch_9")
+        self.assertEqual(row[3], "投入済み")
+        mock_throttle.assert_called_once()
+
+
+class TestGetRecordedAttachmentNames(unittest.TestCase):
+    """``get_recorded_attachment_names``: 添付資料の記録済みマーカー取得。"""
+
+    def _service(self, d_values: list[list[str]], has_sheet: bool = True) -> MagicMock:
+        service = MagicMock()
+        titles = ["出力一覧"] if has_sheet else ["別シート"]
+        service.spreadsheets.return_value.get.return_value.execute.return_value = {
+            "sheets": [{"properties": {"title": t}} for t in titles]
+        }
+        service.spreadsheets.return_value.values.return_value.get.return_value \
+            .execute.return_value = {"values": d_values}
+        return service
+
+    @patch("src.sheets_client.get_sheets_service")
+    def test_returns_only_attachment_markers(self, mock_get_service):
+        mock_get_service.return_value = self._service([
+            ["実践事例タイトル"],
+            ["【添付資料】001-01-0補足.pdf"],
+            [""],
+            ["【添付資料】002-02-0資料.pdf"],
+        ])
+        result = sheets_client.get_recorded_attachment_names(
+            spreadsheet_id="ssid", sheet_name="出力一覧",
+        )
+        self.assertEqual(result, {
+            "【添付資料】001-01-0補足.pdf",
+            "【添付資料】002-02-0資料.pdf",
+        })
+
+    @patch("src.sheets_client.get_sheets_service")
+    def test_empty_when_sheet_missing(self, mock_get_service):
+        mock_get_service.return_value = self._service([], has_sheet=False)
+        result = sheets_client.get_recorded_attachment_names(
+            spreadsheet_id="ssid", sheet_name="出力一覧",
+        )
+        self.assertEqual(result, set())
+
+
+class TestLookupParticipantByManagementNumber(unittest.TestCase):
+    """``lookup_participant_by_management_number``: PDF 管理番号 → マスター行。"""
+
+    def _record(self, mgmt: str, clinic: str = "山田歯科", person: str = "田中太郎"):
+        return sheets_client.MasterRecord(
+            management_number=mgmt, clinic_name=clinic,
+            participant_name=person, venue="東京", email="a@example.com",
+        )
+
+    def test_prefix_match_pdf_mgmt_to_master_individual(self):
+        """PDF ``001-01-0``（3セグメント）→ マスター ``001-01``（個人単位）。"""
+        records = [self._record("001-01"), self._record("002-02", person="別人")]
+        found = sheets_client.lookup_participant_by_management_number(
+            records, "001-01-0",
+        )
+        assert found is not None
+        self.assertEqual(found.participant_name, "田中太郎")
+
+    def test_exact_match(self):
+        records = [self._record("001-01")]
+        found = sheets_client.lookup_participant_by_management_number(
+            records, "001-01",
+        )
+        assert found is not None
+        self.assertEqual(found.management_number, "001-01")
+
+    def test_longest_match_wins(self):
+        """``001`` と ``001-01`` の両方が前方一致するとき、より具体的な行を採用。"""
+        records = [
+            self._record("001", person="医院代表"),
+            self._record("001-01", person="田中太郎"),
+        ]
+        found = sheets_client.lookup_participant_by_management_number(
+            records, "001-01-0",
+        )
+        assert found is not None
+        self.assertEqual(found.participant_name, "田中太郎")
+
+    def test_no_false_prefix_match(self):
+        """``001-01`` は ``001-011-0`` にマッチしない（セグメント境界）。"""
+        records = [self._record("001-01")]
+        self.assertIsNone(
+            sheets_client.lookup_participant_by_management_number(
+                records, "001-011-0",
+            )
+        )
+
+    def test_none_when_not_found_or_empty(self):
+        records = [self._record("001-01")]
+        self.assertIsNone(
+            sheets_client.lookup_participant_by_management_number(records, "999-99-9")
+        )
+        self.assertIsNone(
+            sheets_client.lookup_participant_by_management_number(records, "")
+        )
+
+
+class TestEnsuredSheetsCache(unittest.TestCase):
+    """``_ensure_sheet_with_header`` のプロセス内キャッシュ。
+
+    1000 行の追記で 1 行ごとに read×2（メタ + ヘッダー）を発行すると Sheets の
+    read quota（60/分・throttle 対象外）を食い潰すため、ensure 済みシートは
+    2 回目以降 API を呼ばない。
+    """
+
+    def _service(self) -> MagicMock:
+        service = MagicMock()
+        service.spreadsheets.return_value.get.return_value.execute.return_value = {
+            "sheets": [{"properties": {"title": "出力一覧"}}]
+        }
+        service.spreadsheets.return_value.values.return_value.get.return_value \
+            .execute.return_value = {"values": [["ヘッダー"]]}
+        return service
+
+    def test_second_ensure_skips_api_calls(self):
+        service = self._service()
+        first = sheets_client._ensure_sheet_with_header(
+            service, "ssid", "出力一覧", ["A", "B"],
+        )
+        calls_after_first = service.spreadsheets.return_value.get.call_count
+        second = sheets_client._ensure_sheet_with_header(
+            service, "ssid", "出力一覧", ["A", "B"],
+        )
+        self.assertFalse(first)
+        self.assertFalse(second)
+        # 2 回目はメタ取得 API を一切呼ばない
+        self.assertEqual(
+            service.spreadsheets.return_value.get.call_count, calls_after_first,
+        )
+
+    def test_cache_is_per_sheet(self):
+        service = self._service()
+        sheets_client._ensure_sheet_with_header(service, "ssid", "出力一覧", ["A"])
+        calls_after_first = service.spreadsheets.return_value.get.call_count
+        sheets_client._ensure_sheet_with_header(service, "ssid", "別シート", ["A"])
+        self.assertGreater(
+            service.spreadsheets.return_value.get.call_count, calls_after_first,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -30,6 +30,9 @@ import time
 from pathlib import Path
 from typing import Any
 
+import anthropic
+from google.auth.exceptions import RefreshError
+
 from src.utils import (
     setup_logging,
     ensure_fonts,
@@ -289,8 +292,15 @@ def step1_prepare(
     )
 
     # 添付資料の情報を収集し batch_attachments.json に保存（Step4 で使用）。
-    # 重複判定（処理済みスキップ・管理番号なしスキップ）は添付資料にもこの
-    # 時点で適用し、スキップ対象は保存しない。
+    # 重複判定は「その添付資料自体が出力一覧シートに記録済みか」で行う
+    # （``【添付資料】<元名>`` マーカーの存在チェック）。以前の「メインの管理
+    # 番号が処理済みなら添付もスキップ」方式は、(1) メイン処理後に添付だけ
+    # 後から Drive に追加されたケース、(2) メイン記録後・添付コピー前の
+    # クラッシュ再実行、のどちらでも添付資料が **恒久ロスト** する欠陥があった。
+    # 管理番号なしスキップは従来通り（出力先を解決できないため）。
+    recorded_attachments = sheets_client.get_recorded_attachment_names(
+        sheet_name=profile.output_sheet_name,
+    )
     attachment_records: list[dict] = []
     for pdf_file in attachment_files:
         file_name = pdf_file["name"]
@@ -301,9 +311,9 @@ def step1_prepare(
                 f"（先頭が NNN-NN-N 形式でない）: {file_name}"
             )
             continue
-        if mgmt_num in processed:
+        if f"【添付資料】{file_name}" in recorded_attachments:
             logger.info(
-                f"処理済みのため添付資料をスキップ: {mgmt_num} ({file_name})"
+                f"記録済みのため添付資料をスキップ: {mgmt_num} ({file_name})"
             )
             continue
         attachment_records.append({
@@ -331,6 +341,15 @@ def step1_prepare(
                     "reason": "empty_text_extraction",
                 })
                 continue
+        except RefreshError:
+            # Google 認証の恒久失敗（トークン失効/取り消し）。以降の全 item も
+            # 必ず同じエラーになるため、per-item fail-soft で 1000 回失敗ログを
+            # 吐き続けず即停止する（fail-fast、P-024 の Anthropic 版と同方針）。
+            logger.error(
+                "Google 認証エラー（OAuth トークン失効の可能性）を検知。"
+                "GOOGLE_OAUTH_TOKEN_JSON を再発行して再実行してください。"
+            )
+            raise
         except Exception as e:
             logger.warning(f"PDF処理失敗: {file_name} - {e}")
             skip_download_error += 1
@@ -349,6 +368,17 @@ def step1_prepare(
             "pdf_file_name": file_name,
             "pdf_text": pdf_text,
         })
+
+    # 新規対象があるのに 1 件も準備できなかった場合は異常（ネットワーク断・
+    # 権限剥奪・全 PDF 破損など系統的な障害の兆候）。「0 件投入 → 成功 0 件で
+    # 緑終了」という無言の空振りを防ぎ、loud に停止する（P-001）。
+    if targets and not items:
+        raise RuntimeError(
+            f"Step 1: 新規対象 {len(targets)} 件すべての準備に失敗しました"
+            f"（取得エラー {skip_download_error} / 抽出失敗 {skip_extract_fail}）。"
+            f"ネットワーク・権限・PDF の破損を確認してください"
+            f"（詳細: logs/batch_step1_skips.json）。"
+        )
 
     logger.info(
         f"Step 1完了: メイン {len(items)}件が処理可能 / "
@@ -381,51 +411,117 @@ def step1_prepare(
     return items
 
 
-def step2_submit_batch(items: list[dict]) -> str:
-    """Step 2: Batch API送信。
+def _persist_batch_ids(batch_ids: list[str]) -> None:
+    """``logs/batch_id.txt`` にバッチ ID を 1 行 1 ID で atomic に書き出す。
+
+    書き込みは ``.tmp`` → ``rename`` の atomic write で、書き込み途中
+    クラッシュで空ファイル / 半端な内容を残さない（P-023 と同じ方針）。
+    """
+    batch_id_file = LOGS_DIR / "batch_id.txt"
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = batch_id_file.with_suffix(batch_id_file.suffix + ".tmp")
+    tmp.write_text("\n".join(batch_ids) + "\n")
+    tmp.replace(batch_id_file)
+
+
+def _load_batch_ids_from_disk() -> list[str]:
+    """``logs/batch_id.txt`` からバッチ ID リストを読む（1 行 1 ID）。"""
+    batch_id_file = LOGS_DIR / "batch_id.txt"
+    if not batch_id_file.exists():
+        raise FileNotFoundError(
+            f"{batch_id_file} がありません。--batch-id で回収対象のバッチ ID を"
+            f"明示指定するか、--step all で最初から実行してください"
+            f"（未回収バッチはスプレッドシートの "
+            f"'{sheets_client.BATCH_STATE_SHEET_NAME}' タブでも確認できます）。"
+        )
+    return [
+        line.strip()
+        for line in batch_id_file.read_text().splitlines()
+        if line.strip()
+    ]
+
+
+def step2_submit_batch(
+    items: list[dict],
+    state_target: str | None = None,
+) -> list[str]:
+    """Step 2: Batch API送信（サイズ上限に応じて複数バッチへ自動分割）。
+
+    チャンク分割:
+        Anthropic Batch API の上限（100k リクエスト / 256MB per バッチ）に
+        収まるよう ``comment_generator.plan_batch_chunks`` で分割し、チャンク
+        ごとに 1 バッチとして送信する（通常規模では 1 バッチのまま）。
 
     バッチID永続化（CB-2 / 再開可能性）:
         Anthropic Batch API は **29 日間** 結果を保持する。``step3`` 以降で
         一過性エラー / GHA タイムアウト / プロセス強制終了などで落ちても、
-        ``logs/batch_id.txt`` を読み戻して
-        ``python -m src.batch_main --step results --batch-id <id>`` で結果取得
-        フェーズから再開できる（無料 = 既にバッチは Anthropic 側で課金確定済み）。
+        ``logs/batch_id.txt``（1 行 1 ID）を読み戻して
+        ``python -m src.batch_main --step results --batch-id <id[,id2...]>`` で
+        結果取得フェーズから再開できる（既にバッチは Anthropic 側で課金確定済み）。
         GHA は ``logs/`` を ``actions/upload-artifact@v4`` で 30 日保管するため、
         Job が失敗してもアーティファクトから batch_id を取り出せる。
 
-        書き込みは ``.tmp`` → ``rename`` の atomic write で、書き込み途中
-        クラッシュで空ファイル / 半端な内容を残さない（P-023 と同じ方針）。
+    バッチ状態のスプレッドシート記録（二重課金防止）:
+        GHA ランナーは ephemeral のため、``batch_id.txt`` はジョブ kill 後の
+        再実行では存在しない。``state_target``（出力一覧シート名）を渡すと、
+        投入したバッチ ID をスプレッドシートの ``_バッチ管理`` タブにも記録し、
+        次回 ``step=all`` 実行が未回収バッチを検知して **再投入せず回収から
+        再開** できるようにする。記録失敗はランを止めない（fail-soft、
+        ``batch_id.txt`` + アーティファクトの復旧経路は残る）。
 
     Args:
         items: step1_prepareの戻り値
+        state_target: バッチ状態記録用の出力一覧シート名（None なら記録しない）
 
     Returns:
-        バッチID
+        バッチIDのリスト（分割なしなら 1 要素）
     """
     logger = setup_logging()
     logger.info("=== Step 2: Batch API送信 ===")
 
-    batch_id = comment_generator.submit_batch(items)
+    chunks = comment_generator.plan_batch_chunks(items)
+    batch_ids: list[str] = []
+    for idx, chunk in enumerate(chunks, start=1):
+        if len(chunks) > 1:
+            logger.info(f"--- バッチ {idx}/{len(chunks)} ({len(chunk)}件) ---")
+        batch_id = comment_generator.submit_batch(chunk)
+        batch_ids.append(batch_id)
 
-    batch_id_file = LOGS_DIR / "batch_id.txt"
-    LOGS_DIR.mkdir(parents=True, exist_ok=True)
-    # atomic write: tmp に書いて fsync 相当の rename で置換。書き込み途中で
-    # プロセスが死んでも、batch_id.txt は空 or 半端な値で残らない。
-    tmp = batch_id_file.with_suffix(batch_id_file.suffix + ".tmp")
-    tmp.write_text(batch_id)
-    tmp.replace(batch_id_file)
+        # 送信のたびに永続化する（後続チャンクの送信失敗時も、送信済み分の
+        # ID は disk / Sheets に残り回収可能にする）。
+        _persist_batch_ids(batch_ids)
+        if state_target:
+            try:
+                sheets_client.append_batch_record(
+                    state_target, batch_id, sheets_client.BATCH_STATE_SUBMITTED,
+                )
+            except Exception as e:
+                logger.warning(
+                    f"バッチ状態のスプレッドシート記録に失敗"
+                    f"（batch_id.txt とアーティファクトから復旧可能）: {e}"
+                )
+
     logger.info(
-        f"バッチID保存: {batch_id_file} → {batch_id} "
-        f"（29日間 Anthropic 側で保持。--step results --batch-id {batch_id} で再開可能）"
+        f"バッチID保存: {LOGS_DIR / 'batch_id.txt'} → {batch_ids} "
+        f"（29日間 Anthropic 側で保持。--step results --batch-id "
+        f"{','.join(batch_ids)} で再開可能）"
     )
+    return batch_ids
 
-    return batch_id
+
+# step3 の既定最大待機（秒）。Anthropic Batch の処理窓は最大 24h だが、GHA の
+# ジョブ上限は 6h（timeout-minutes: 360）のため、24h 待つ設定はジョブ kill
+# （ログ・アーティファクト保全はされるが exit 経路を通らない）で終わるだけ。
+# 5h で自発的にタイムアウトさせ、明確なメッセージと共に非ゼロ終了する。
+# 投入済みバッチは ``_バッチ管理`` タブに記録済みなので、次の ``step=all``
+# 再実行が自動で回収から再開する（再投入・二重課金なし）。
+_DEFAULT_POLL_MAX_WAIT_SECONDS = 5 * 60 * 60
 
 
 def step3_wait_and_get_results(
     batch_id: str,
     poll_interval: int = 60,
-    max_wait: int = 86400,
+    max_wait: int = _DEFAULT_POLL_MAX_WAIT_SECONDS,
 ) -> dict[str, dict[str, str]]:
     """Step 3: バッチ結果をポーリングで取得する（構造化出力をパース済み）。
 
@@ -482,7 +578,12 @@ def step3_wait_and_get_results(
         elapsed += poll_interval
 
     if elapsed >= max_wait:
-        logger.error(f"バッチ結果待機タイムアウト ({max_wait}秒)")
+        logger.error(
+            f"バッチ結果待機タイムアウト ({max_wait}秒)。バッチは Anthropic 側で"
+            f"処理継続中です（29日間保持・追加課金なし）。次回の step=all 実行が"
+            f"未回収バッチ ({batch_id}) を自動検知して回収から再開します"
+            f"（または --step results --batch-id {batch_id} で手動回収）。"
+        )
         raise TimeoutError("Batch API結果の取得がタイムアウトしました")
 
     results, failed_ids = comment_generator.get_batch_results(batch_id)
@@ -494,6 +595,36 @@ def step3_wait_and_get_results(
     _save_results_to_disk(results)
     logger.info(f"バッチ結果保存: {LOGS_DIR / _BATCH_RESULTS_FILE}")
     return results
+
+
+def _collect_results_for_batches(
+    batch_ids: list[str],
+    poll_max_seconds: int = _DEFAULT_POLL_MAX_WAIT_SECONDS,
+) -> dict[str, dict[str, str]]:
+    """複数バッチの結果を順に回収し、マージした results を返す。
+
+    チャンク分割送信（``step2_submit_batch``）に対応する回収側。custom_id は
+    Drive file id 由来でバッチ間で衝突しないため、単純マージでよい。マージ後の
+    全体を ``batch_results.json`` に保存し直す（step4 の disk 復元用）。
+
+    ``poll_max_seconds`` は **全体** の残り時間として扱う（バッチごとに満額
+    待つと GHA の 6h を超えるため）。
+    """
+    logger = setup_logging()
+    merged: dict[str, dict[str, str]] = {}
+    deadline = time.monotonic() + poll_max_seconds
+    for idx, batch_id in enumerate(batch_ids, start=1):
+        if len(batch_ids) > 1:
+            logger.info(f"--- バッチ回収 {idx}/{len(batch_ids)}: {batch_id} ---")
+        remaining = max(int(deadline - time.monotonic()), 60)
+        merged.update(step3_wait_and_get_results(batch_id, max_wait=remaining))
+    if len(batch_ids) > 1:
+        _save_results_to_disk(merged)
+        logger.info(
+            f"複数バッチの結果をマージして保存: {len(merged)}件 "
+            f"({len(batch_ids)}バッチ)"
+        )
+    return merged
 
 
 def step4_generate_pdfs(
@@ -627,14 +758,23 @@ def step4_generate_pdfs(
         # CB-3: Step4 開始時のスナップショットに mgmt_num が含まれていれば
         # 前回 Step4 で処理済み（Drive アップロード + Sheets 追記 + 下書き想定）。
         # 再処理すると Drive / Sheets / Gmail で重複が出るためスキップ。
-        # case_map（添付資料パススルー）の構築のため、メイン PDF の処理を
-        # スキップしても管理番号 → (医院番号, 医院名, 個人名) のマッピングは
-        # 残す必要があるが、Step4 単独再実行で添付資料の glue が無くなるのは
-        # 仕様上許容（添付資料は同じ Step4 内のメイン処理に依存する）。
+        # ただし case_map（添付資料パススルー用の対応表）には **登録する**。
+        # 前回ランが「メイン記録後・添付コピー前」でクラッシュした場合、この
+        # 登録が無いと添付資料が対応表を引けず恒久ロストになる（AI 抽出結果
+        # ``meta`` はバッチ結果に残っているため、アップロードなしで医院名解決
+        # だけ行える）。
         if mgmt_num and mgmt_num in step4_processed:
             logger.info(
                 f"Step4 スキップ（処理済み再実行検知）: {mgmt_num} "
                 f"({pdf_file_name})"
+            )
+            resolved_name, _ = run_common.resolve_clinic_name(
+                sheets_client, master_records,
+                extract_clinic_number(pdf_file_name), clinic_name_from_ai,
+                logger,
+            )
+            case_map[mgmt_num] = (
+                extract_clinic_number(pdf_file_name), resolved_name, person_name
             )
             stats["skip_already_processed"] += 1
             continue
@@ -857,8 +997,16 @@ def _process_attachments(
 
         case = case_map.get(mgmt_num)
         if case is None:
+            # メインが同一ラン内で処理されていない（過去ラン処理済み +
+            # 添付だけ後から追加、等）。参加者マスターだけで出力先を解決する
+            # フォールバック（メイン非依存・恒久ロスト防止）。
+            case = run_common.resolve_case_via_master(
+                sheets_client, master_records, mgmt_num, logger,
+            )
+        if case is None:
             logger.warning(
-                f"対応するメイン実践事例 PDF がこの実行で処理されていないため"
+                f"対応するメイン実践事例 PDF がこの実行で処理されておらず、"
+                f"参加者マスターにも管理番号 {mgmt_num} が未登録のため"
                 f"スキップ: {file_name}"
             )
             stats["error"] += 1
@@ -894,6 +1042,93 @@ def _process_attachments(
         )
 
 
+def _mark_batches_done(target_sheet_name: str, batch_ids: list[str]) -> None:
+    """回収が完了したバッチを ``_バッチ管理`` タブに記録する（fail-soft）。
+
+    記録に失敗しても、次回 ``step=all`` が同じバッチを再回収するだけで、
+    Step4 の CB-3 重複ガード（処理済み管理番号スキップ）により出力の重複は
+    起きない（安全側に倒れる）。
+    """
+    logger = setup_logging()
+    for bid in batch_ids:
+        try:
+            sheets_client.append_batch_record(
+                target_sheet_name, bid, sheets_client.BATCH_STATE_DONE,
+            )
+        except Exception as e:
+            logger.warning(
+                f"バッチ回収完了の記録に失敗（次回実行で再回収されるが、"
+                f"CB-3 重複ガードにより出力は重複しない）: {bid}: {e}"
+            )
+
+
+def _resume_open_batches(
+    profile: ProfileConfig | RunConfig,
+    poll_max_seconds: int = _DEFAULT_POLL_MAX_WAIT_SECONDS,
+) -> None:
+    """未回収バッチ（投入済み・回収未完了）を検知し、回収から再開する。
+
+    ``step=all`` の冒頭で呼ぶ。GHA ランが step3/step4 の途中で kill された後の
+    再実行は、GHA ランナーが ephemeral のため ``batch_id.txt`` を持たず、従来は
+    全件を **再投入**（＝Anthropic への二重課金）していた。スプレッドシートの
+    ``_バッチ管理`` タブから未回収バッチを検知し、再投入せず結果回収 → PDF 生成
+    を先に完走させる。回収後は通常フロー（step1〜）に続き、回収分は出力一覧
+    シート記録済みのため重複判定で自然にスキップされる。
+
+    - バッチがまだ処理中 → ``step3`` のポーリングで待つ（タイムアウト時は
+      非ゼロ終了し、次回実行が再び回収から再開する）
+    - バッチが Anthropic 側に存在しない（29 日保持期限切れ等）→ ``期限切れ``
+      として記録し、ブロックせず先へ進む（該当分は再投入対象に戻る）
+    - ``_バッチ管理`` タブの読み取り失敗 → 警告して新規実行として続行
+      （fail-soft。復旧経路より新規処理の継続を優先）
+    """
+    logger = setup_logging()
+    try:
+        open_ids = sheets_client.get_open_batch_ids(profile.output_sheet_name)
+    except Exception as e:
+        logger.warning(f"未回収バッチの確認に失敗（新規実行として続行）: {e}")
+        return
+    if not open_ids:
+        return
+
+    logger.warning(
+        f"未回収バッチ {len(open_ids)} 件を検出: {open_ids}。"
+        f"再投入せず結果回収から再開します（二重課金防止）。"
+    )
+    recovered: dict[str, dict[str, str]] = {}
+    consumed: list[str] = []
+    deadline = time.monotonic() + poll_max_seconds
+    for bid in open_ids:
+        remaining = max(int(deadline - time.monotonic()), 60)
+        try:
+            recovered.update(
+                step3_wait_and_get_results(bid, max_wait=remaining)
+            )
+            consumed.append(bid)
+        except anthropic.NotFoundError:
+            logger.error(
+                f"バッチ {bid} は Anthropic 側に存在しません（29 日の保持期限"
+                f"切れ等・結果は回収不能）。期限切れとして記録し先へ進みます。"
+                f"未処理分は出力一覧シート未記録のため、この後の通常フローで"
+                f"再投入されます。"
+            )
+            try:
+                sheets_client.append_batch_record(
+                    profile.output_sheet_name, bid,
+                    sheets_client.BATCH_STATE_EXPIRED,
+                )
+            except Exception as e:
+                logger.warning(f"期限切れバッチの記録に失敗: {bid}: {e}")
+
+    if recovered:
+        step4_generate_pdfs(profile, recovered, items=None)
+    _mark_batches_done(profile.output_sheet_name, consumed)
+    logger.info(
+        f"未回収バッチの回収が完了 ({len(consumed)}/{len(open_ids)}件)。"
+        f"通常フローに続きます。"
+    )
+
+
 def run(
     batch_mode: bool = True,
     test_count: int = 0,
@@ -901,6 +1136,7 @@ def run(
     step: str = "all",
     profile_name: str | None = None,
     target_folder: str | None = None,
+    poll_max_minutes: int = 300,
 ) -> None:
     """Batchモードのメイン処理。
 
@@ -908,12 +1144,15 @@ def run(
         batch_mode: Batch API使用（Falseなら通常モードにフォールバック）
         test_count: 新規 PDF を N 件まで処理（0=全件）。重複・管理番号なしを
             除外した「処理対象の新規 PDF」に対して適用される。
-        batch_id: 既存のバッチID（Step 3から再開する場合）
+        batch_id: 既存のバッチID（Step 3から再開する場合）。チャンク分割で
+            複数バッチになった場合はカンマ区切りで複数指定できる。
         step: 実行するステップ ("all", "prepare", "submit", "results", "pdfs")
         profile_name: プロファイル名（``profiles/<name>.yaml``）。
             省略時かつ ``target_folder`` も無指定なら ``jissen_default``。
         target_folder: フォルダ自動検出モードのフォルダ名。
             ``__list__`` 指定時は候補列挙のみ行い即 return。
+        poll_max_minutes: step3 ポーリングの最大待機（分）。GHA の 6h 上限内で
+            自発的にタイムアウトさせるための値（既定 300 分 = 5h）。
     """
     logger = setup_logging()
     logger.info("=== じっせん君コメントシステム（Batchモード）開始 ===")
@@ -936,17 +1175,37 @@ def run(
 
     items: list[dict] | None = None
     results: dict[str, dict[str, str]] | None = None
+    batch_ids: list[str] = (
+        [b.strip() for b in batch_id.split(",") if b.strip()]
+        if batch_id else []
+    )
+    poll_max_seconds = poll_max_minutes * 60
 
     # 回収判定: 明示的に ``--batch-id`` を渡した ``results`` 実行だけを「回収」と
     # みなし、step4 まで完走させる。``batch_id`` を ``batch_id.txt`` から補完する
     # discrete な ``results``（batch-orchestrator の 1000 件分割運用）では step4 を
     # 走らせない＝長時間ポーリング直後に PDF 生成を始めて GHA 6h を超える事故を
-    # 防ぐ。``batch_id`` はこの後の results ブロックで補完され得るため、補完前の
+    # 防ぐ。``batch_ids`` はこの後の results ブロックで補完され得るため、補完前の
     # 「明示指定だったか」をここで確定させる。
-    is_recovery = step == "results" and batch_id is not None
+    is_recovery = step == "results" and bool(batch_ids)
+
+    # 未回収バッチの自動レジューム（``step=all`` のみ）。ジョブ kill 後の
+    # 再実行で全件再投入 → 二重課金になるのを防ぐ。
+    if step == "all":
+        _resume_open_batches(cfg, poll_max_seconds)
 
     if step in ("all", "prepare"):
         items = step1_prepare(cfg, test_count=test_count)
+
+    # 新規 0 件（全 PDF 処理済み）は増分運用の定常状態。従来はこの後の
+    # results ブロックが ``batch_id.txt``（存在しない）を読もうとして
+    # FileNotFoundError で赤ランになっていた。正常終了する。
+    if step == "all" and items is not None and not items:
+        logger.info(
+            "新規処理対象が 0 件のため、以降のステップをスキップして正常終了"
+            "します（入力フォルダの全 PDF が処理済み）"
+        )
+        return
 
     if step in ("all", "submit"):
         # CB-2: step=submit を別 GHA 実行から呼ぶケース。in-memory items が
@@ -957,13 +1216,14 @@ def run(
         if not items:
             logger.info("処理対象が0件のため、バッチ送信をスキップします")
         else:
-            batch_id = step2_submit_batch(items)
+            batch_ids = step2_submit_batch(
+                items, state_target=cfg.output_sheet_name,
+            )
 
     if step in ("all", "results"):
-        if batch_id is None:
-            batch_id_file = LOGS_DIR / "batch_id.txt"
-            batch_id = batch_id_file.read_text().strip()
-        results = step3_wait_and_get_results(batch_id)
+        if not batch_ids:
+            batch_ids = _load_batch_ids_from_disk()
+        results = _collect_results_for_batches(batch_ids, poll_max_seconds)
 
     if step in ("all", "pdfs") or is_recovery:
         # CB-2: step=pdfs / 回収を別 GHA 実行から呼ぶケース。in-memory results が
@@ -976,6 +1236,9 @@ def run(
             results = _load_results_from_disk()
             logger.info(f"results を batch_results.json からロード ({len(results)}件)")
         step4_generate_pdfs(cfg, results, items=items)
+        # 回収完了をバッチ状態管理タブに記録（fail-soft）。step=pdfs 単独実行
+        # では batch_ids が空のため no-op。
+        _mark_batches_done(cfg.output_sheet_name, batch_ids)
 
     logger.info("=== Batchモード処理完了 ===")
 
@@ -992,12 +1255,20 @@ def main() -> None:
     )
     parser.add_argument(
         "--batch-id", type=str, default=None,
-        help="既存バッチID（結果取得から再開）",
+        help="既存バッチID（結果取得から再開）。複数はカンマ区切り",
     )
     parser.add_argument(
         "--step", type=str, default="all",
         choices=["all", "prepare", "submit", "results", "pdfs"],
         help="実行するステップ",
+    )
+    parser.add_argument(
+        "--poll-max-minutes", type=int, default=300,
+        help=(
+            "step3 ポーリングの最大待機（分）。GHA の 6h 上限内で自発的に"
+            "タイムアウトさせる（既定 300 分）。タイムアウトしても投入済み"
+            "バッチは次回 step=all 実行が自動回収する"
+        ),
     )
     group = parser.add_mutually_exclusive_group()
     group.add_argument(
@@ -1023,6 +1294,7 @@ def main() -> None:
         step=args.step,
         profile_name=args.profile,
         target_folder=args.target_folder,
+        poll_max_minutes=args.poll_max_minutes,
     )
 
 

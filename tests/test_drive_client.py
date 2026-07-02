@@ -896,5 +896,86 @@ class TestCredentialPriority(unittest.TestCase):
             mock_sa_creds.assert_called_once()
 
 
+class TestFolderResolutionCache(unittest.TestCase):
+    """フォルダ解決のプロセス内キャッシュ（1000 件規模の冗長走査削減）。"""
+
+    def _service_with_folders(self, folders: list[dict]) -> MagicMock:
+        service = MagicMock()
+        service.files.return_value.list.return_value.execute.return_value = {
+            "files": folders
+        }
+        service.files.return_value.create.return_value.execute.return_value = {
+            "id": "created_id"
+        }
+        return service
+
+    def test_find_or_create_folder_second_call_uses_cache(self):
+        service = self._service_with_folders(
+            [{"id": "folder_1", "name": "田中太郎"}]
+        )
+        first = drive_client.find_or_create_folder("田中太郎", "parent_x", service=service)
+        list_calls_after_first = service.files.return_value.list.call_count
+        second = drive_client.find_or_create_folder("田中太郎", "parent_x", service=service)
+        self.assertEqual(first, "folder_1")
+        self.assertEqual(second, "folder_1")
+        # 2 回目は Drive の list API を呼ばない
+        self.assertEqual(
+            service.files.return_value.list.call_count, list_calls_after_first,
+        )
+
+    def test_cache_key_includes_parent(self):
+        """同名フォルダでも親が違えばキャッシュを共有しない。"""
+        service = self._service_with_folders(
+            [{"id": "folder_1", "name": "田中太郎"}]
+        )
+        drive_client.find_or_create_folder("田中太郎", "parent_x", service=service)
+        calls_after_first = service.files.return_value.list.call_count
+        drive_client.find_or_create_folder("田中太郎", "parent_y", service=service)
+        self.assertGreater(
+            service.files.return_value.list.call_count, calls_after_first,
+        )
+
+    def test_cache_normalizes_name_variants(self):
+        """表記揺れ（全角/半角・空白）は同じキャッシュエントリになる。"""
+        service = self._service_with_folders(
+            [{"id": "folder_1", "name": "田中 太郎"}]
+        )
+        drive_client.find_or_create_folder("田中 太郎", "parent_x", service=service)
+        calls_after_first = service.files.return_value.list.call_count
+        got = drive_client.find_or_create_folder("田中太郎", "parent_x", service=service)
+        self.assertEqual(got, "folder_1")
+        self.assertEqual(
+            service.files.return_value.list.call_count, calls_after_first,
+        )
+
+    def test_clinic_folder_second_call_uses_cache(self):
+        service = self._service_with_folders(
+            [{"id": "clinic_1", "name": "001_山田歯科"}]
+        )
+        first = drive_client.find_or_create_clinic_folder(
+            clinic_number="001", clinic_name="山田歯科",
+            parent_id="root_x", service=service,
+        )
+        list_calls_after_first = service.files.return_value.list.call_count
+        second = drive_client.find_or_create_clinic_folder(
+            clinic_number="001", clinic_name="山田歯科",
+            parent_id="root_x", service=service,
+        )
+        self.assertEqual(first, "clinic_1")
+        self.assertEqual(second, "clinic_1")
+        self.assertEqual(
+            service.files.return_value.list.call_count, list_calls_after_first,
+        )
+
+    def test_created_folder_is_cached(self):
+        service = self._service_with_folders([])  # 既存なし → 新規作成
+        first = drive_client.find_or_create_folder("新規さん", "parent_x", service=service)
+        second = drive_client.find_or_create_folder("新規さん", "parent_x", service=service)
+        self.assertEqual(first, "created_id")
+        self.assertEqual(second, "created_id")
+        # create は 1 回だけ
+        self.assertEqual(service.files.return_value.create.call_count, 1)
+
+
 if __name__ == "__main__":
     unittest.main()

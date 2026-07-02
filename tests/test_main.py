@@ -602,6 +602,9 @@ class TestRunAttachmentPassthrough(unittest.TestCase):
         """対応するメインがこの実行に無い添付資料はスキップされ warning が出る。"""
         mock_load_profile.return_value = _make_profile()
         mock_sheets_client.get_processed_management_numbers.return_value = set()
+        mock_sheets_client.get_recorded_attachment_names.return_value = set()
+        # マスターにも未登録（メイン非依存ルーティングも不可）
+        mock_sheets_client.lookup_participant_by_management_number.return_value = None
         # 添付資料の管理番号 002-02-0 に対応するメインは入力に無い
         _install_run_mocks(
             mock_drive_client, mock_gen, mock_reader, mock_creator, mock_merger,
@@ -623,7 +626,7 @@ class TestRunAttachmentPassthrough(unittest.TestCase):
         mock_drive_client.download_pdf.assert_called_once_with("id_main")
         joined = "\n".join(log_ctx.output)
         self.assertIn("002-02-0【添付資料】孤児.pdf", joined)
-        self.assertIn("メイン実践事例 PDF がこの実行で処理されていない", joined)
+        self.assertIn("メイン実践事例 PDF がこの実行で処理されておらず", joined)
 
     @patch("src.main.ensure_fonts")
     @patch("src.main.pdf_merger")
@@ -644,15 +647,19 @@ class TestRunAttachmentPassthrough(unittest.TestCase):
         mock_merger,
         mock_ensure_fonts,
     ):
-        """前回実行で処理済みの管理番号を持つ添付資料はスキップされる。
+        """記録済みマーカーを持つ添付資料はスキップされる。
 
-        重複判定セットは実行開始時のスナップショット。同一実行内のメイン処理
-        がこのスナップショットを変えないことも確認する。
+        重複判定は「その添付資料自体が ``【添付資料】<元名>`` で出力一覧
+        シートに記録済みか」で行う（メインの管理番号共有 dedup による
+        恒久ロストの防止）。
         """
         mock_load_profile.return_value = _make_profile()
-        # 001-01-0 は前回処理済み（添付資料も前回コピー済みと見なす）
+        # 001-01-0 は前回処理済みで、添付資料も前回コピー済み（記録あり）
         mock_sheets_client.get_processed_management_numbers.return_value = {
             "001-01-0",
+        }
+        mock_sheets_client.get_recorded_attachment_names.return_value = {
+            "【添付資料】001-01-0【添付資料】補足.pdf",
         }
         _install_run_mocks(
             mock_drive_client, mock_gen, mock_reader, mock_creator, mock_merger,
@@ -1900,6 +1907,215 @@ class TestRunHardFailOnEmptyMasterInTargetFolderMode(unittest.TestCase):
         # 通常通り Claude が呼ばれ、シートに 1 行追記される
         self.assertEqual(mock_gen.generate_comment_with_metadata.call_count, 1)
         self.assertEqual(mock_sheets_client.append_output_record.call_count, 1)
+
+
+class TestRunTimeBudget(unittest.TestCase):
+    """実行時間バジェット（GHA 6h ジョブ kill による成果物ロスト防止）。"""
+
+    @patch("src.main.ensure_fonts")
+    @patch("src.main.pdf_merger")
+    @patch("src.main.pdf_creator")
+    @patch("src.main.pdf_reader")
+    @patch("src.main.comment_generator")
+    @patch("src.main.sheets_client")
+    @patch("src.main.drive_client")
+    @patch("src.discover.load_profile")
+    def test_budget_exceeded_stops_loop_but_finishes_tail(
+        self,
+        mock_load_profile,
+        mock_drive_client,
+        mock_sheets_client,
+        mock_gen,
+        mock_reader,
+        mock_creator,
+        mock_merger,
+        mock_ensure_fonts,
+    ):
+        """バジェット到達でループを打ち切り、完了マーカーまで完走する。
+
+        2 件目の処理前に deadline を超えるよう ``time.monotonic`` を進める。
+        1 件目は処理済み、2 件目は未処理（再実行で拾われる）。
+        """
+        mock_load_profile.return_value = _make_profile()
+        mock_sheets_client.get_processed_management_numbers.return_value = set()
+        _install_run_mocks(
+            mock_drive_client, mock_gen, mock_reader, mock_creator, mock_merger,
+            mock_sheets_client=mock_sheets_client,
+            pdf_files=[
+                {"id": "id_1", "name": "001-01-0事例.pdf"},
+                {"id": "id_2", "name": "002-02-0事例.pdf"},
+            ],
+        )
+
+        # 1 tick = 10 分。deadline チェック（ループ先頭）が 2 回目で超過する。
+        clock = {"now": 0.0}
+
+        def _fake_monotonic():
+            clock["now"] += 600.0
+            return clock["now"]
+
+        with patch("src.main.time.monotonic", side_effect=_fake_monotonic):
+            with self.assertLogs("jissen_comment", level="WARNING") as log_ctx:
+                main_module.run(
+                    test_count=0, profile_name="jissen_default",
+                    max_runtime_minutes=15,
+                )
+
+        # 1 件目だけ処理され、2 件目は打ち切り
+        self.assertEqual(mock_sheets_client.append_output_record.call_count, 1)
+        joined = "\n".join(log_ctx.output)
+        self.assertIn("実行時間バジェット", joined)
+        # 完了マーカーは「時間切れ部分完了」
+        marker = mock_sheets_client.append_completion_marker.call_args.kwargs
+        self.assertIn("時間切れ部分完了", marker["summary"])
+
+    @patch("src.main.ensure_fonts")
+    @patch("src.main.pdf_merger")
+    @patch("src.main.pdf_creator")
+    @patch("src.main.pdf_reader")
+    @patch("src.main.comment_generator")
+    @patch("src.main.sheets_client")
+    @patch("src.main.drive_client")
+    @patch("src.discover.load_profile")
+    def test_zero_budget_disables_deadline(
+        self,
+        mock_load_profile,
+        mock_drive_client,
+        mock_sheets_client,
+        mock_gen,
+        mock_reader,
+        mock_creator,
+        mock_merger,
+        mock_ensure_fonts,
+    ):
+        mock_load_profile.return_value = _make_profile()
+        mock_sheets_client.get_processed_management_numbers.return_value = set()
+        _install_run_mocks(
+            mock_drive_client, mock_gen, mock_reader, mock_creator, mock_merger,
+            mock_sheets_client=mock_sheets_client,
+            pdf_files=[
+                {"id": "id_1", "name": "001-01-0事例.pdf"},
+                {"id": "id_2", "name": "002-02-0事例.pdf"},
+            ],
+        )
+        main_module.run(
+            test_count=0, profile_name="jissen_default",
+            max_runtime_minutes=0,
+        )
+        self.assertEqual(mock_sheets_client.append_output_record.call_count, 2)
+
+
+class TestRunGoogleAuthFailFast(unittest.TestCase):
+    """Google 認証の恒久失敗（RefreshError）で即停止する。"""
+
+    @patch("src.main.ensure_fonts")
+    @patch("src.main.pdf_merger")
+    @patch("src.main.pdf_creator")
+    @patch("src.main.pdf_reader")
+    @patch("src.main.comment_generator")
+    @patch("src.main.sheets_client")
+    @patch("src.main.drive_client")
+    @patch("src.discover.load_profile")
+    def test_refresh_error_halts_run_with_marker(
+        self,
+        mock_load_profile,
+        mock_drive_client,
+        mock_sheets_client,
+        mock_gen,
+        mock_reader,
+        mock_creator,
+        mock_merger,
+        mock_ensure_fonts,
+    ):
+        from google.auth.exceptions import RefreshError as _RefreshError
+        mock_load_profile.return_value = _make_profile()
+        mock_sheets_client.get_processed_management_numbers.return_value = set()
+        _install_run_mocks(
+            mock_drive_client, mock_gen, mock_reader, mock_creator, mock_merger,
+            mock_sheets_client=mock_sheets_client,
+            pdf_files=[
+                {"id": f"id_{i}", "name": f"00{i}-01-0事例.pdf"}
+                for i in range(1, 4)
+            ],
+        )
+        mock_drive_client.download_pdf.side_effect = _RefreshError("expired")
+
+        with self.assertRaises(PermanentRunFailureError):
+            main_module.run(test_count=0, profile_name="jissen_default")
+
+        # 1 件目で停止（3 件ぶん失敗ループしない）
+        self.assertEqual(mock_drive_client.download_pdf.call_count, 1)
+        # 「中止」マーカーが追記される
+        marker = mock_sheets_client.append_completion_marker.call_args.kwargs
+        self.assertIn("中止", marker["summary"])
+
+
+class TestAttachmentMasterFallback(unittest.TestCase):
+    """メイン非依存の添付資料ルーティング（参加者マスター経由）。"""
+
+    @patch("src.main.ensure_fonts")
+    @patch("src.main.pdf_merger")
+    @patch("src.main.pdf_creator")
+    @patch("src.main.pdf_reader")
+    @patch("src.main.comment_generator")
+    @patch("src.main.sheets_client")
+    @patch("src.main.drive_client")
+    @patch("src.discover.load_profile")
+    def test_attachment_of_past_run_main_copied_via_master(
+        self,
+        mock_load_profile,
+        mock_drive_client,
+        mock_sheets_client,
+        mock_gen,
+        mock_reader,
+        mock_creator,
+        mock_merger,
+        mock_ensure_fonts,
+    ):
+        """メインが過去ラン処理済みでも、添付は マスター経由でコピーされる。
+
+        従来はメイン不在（case_map 無し）で警告スキップ = 恒久ロストだった。
+        """
+        from src.sheets_client import MasterRecord as _MasterRecord
+        mock_load_profile.return_value = _make_profile()
+        # メイン 001-01-0 は過去ラン処理済み → 入力にはメイン PDF が残っている
+        mock_sheets_client.get_processed_management_numbers.return_value = {
+            "001-01-0",
+        }
+        mock_sheets_client.get_recorded_attachment_names.return_value = set()
+        master_row = _MasterRecord(
+            management_number="001-01", clinic_name="山田歯科",
+            participant_name="田中太郎", venue="東京", email="",
+        )
+        mock_sheets_client.lookup_participant_by_management_number.return_value = (
+            master_row
+        )
+        _install_run_mocks(
+            mock_drive_client, mock_gen, mock_reader, mock_creator, mock_merger,
+            mock_sheets_client=mock_sheets_client,
+            pdf_files=[
+                {"id": "id_main", "name": "001-01-0実践事例.pdf"},
+                {"id": "id_att", "name": "001-01-0【添付資料】補足.pdf"},
+            ],
+        )
+
+        main_module.run(test_count=0, profile_name="jissen_default")
+
+        # メインは処理済みスキップ、添付だけコピーされる
+        upload_calls = mock_drive_client.upload_pdf_to_clinic_person.call_args_list
+        self.assertEqual(len(upload_calls), 1)
+        kwargs = upload_calls[0].kwargs
+        self.assertEqual(kwargs["file_name"], "001-01-0【添付資料】補足.pdf")
+        self.assertEqual(kwargs["clinic_number"], "001")
+        self.assertEqual(kwargs["clinic_name"], "山田歯科")
+        self.assertEqual(kwargs["person_name"], "田中太郎")
+        # マスター由来の確定名なのでフォルダ名同期を許可
+        self.assertTrue(kwargs["clinic_name_authoritative"])
+        # 出力一覧シートに 【添付資料】 行が記録される
+        appended = mock_sheets_client.append_output_record.call_args.kwargs
+        self.assertEqual(
+            appended["sample_name"], "【添付資料】001-01-0【添付資料】補足.pdf",
+        )
 
 
 if __name__ == "__main__":

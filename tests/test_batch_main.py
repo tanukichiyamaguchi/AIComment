@@ -691,11 +691,19 @@ class TestStep1AttachmentClassification(unittest.TestCase):
     def test_processed_attachment_not_saved(
         self, mock_drive, mock_sheets, mock_reader,
     ):
-        """処理済み管理番号の添付資料は batch_attachments.json に保存されない。"""
+        """記録済みマーカーを持つ添付資料は batch_attachments.json に保存されない。
+
+        重複判定は「メインの管理番号が処理済みか」ではなく「その添付資料自体が
+        出力一覧シートに ``【添付資料】<元名>`` で記録済みか」で行う（メイン
+        処理後に添付だけ後から追加されたケースの恒久ロスト防止）。
+        """
         mock_drive.list_pdfs.return_value = [
             {"id": "id_att", "name": "001-01-0【添付資料】補足.pdf"},
         ]
         mock_sheets.get_processed_management_numbers.return_value = {"001-01-0"}
+        mock_sheets.get_recorded_attachment_names.return_value = {
+            "【添付資料】001-01-0【添付資料】補足.pdf",
+        }
         _install_step1_mocks(mock_drive, mock_reader)
         profile = _make_profile()
 
@@ -703,6 +711,31 @@ class TestStep1AttachmentClassification(unittest.TestCase):
 
         records = json.loads(self._att_file.read_text())
         self.assertEqual(records, [])
+
+    @patch("src.batch_main.pdf_reader")
+    @patch("src.batch_main.sheets_client")
+    @patch("src.batch_main.drive_client")
+    def test_attachment_of_processed_main_still_saved_when_not_recorded(
+        self, mock_drive, mock_sheets, mock_reader,
+    ):
+        """メインが処理済みでも、添付自体が未記録なら保存対象になる。
+
+        (1) メイン処理後に添付だけ後から Drive に追加、(2) メイン記録後・
+        添付コピー前のクラッシュ再実行、のどちらでも添付資料を取りこぼさない。
+        """
+        mock_drive.list_pdfs.return_value = [
+            {"id": "id_att", "name": "001-01-0【添付資料】補足.pdf"},
+        ]
+        mock_sheets.get_processed_management_numbers.return_value = {"001-01-0"}
+        mock_sheets.get_recorded_attachment_names.return_value = set()
+        _install_step1_mocks(mock_drive, mock_reader)
+        profile = _make_profile()
+
+        batch_main.step1_prepare(profile, test_count=0)
+
+        records = json.loads(self._att_file.read_text())
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["file_id"], "id_att")
 
     @patch("src.batch_main.pdf_reader")
     @patch("src.batch_main.sheets_client")
@@ -801,8 +834,10 @@ class TestStep4AttachmentPassthrough(unittest.TestCase):
     def test_step4_orphan_attachment_skipped_with_warning(
         self, mock_fonts, mock_sheets, mock_drive, mock_creator, mock_merger,
     ):
-        """対応するメインが results に無い添付資料はスキップされ warning が出る。"""
+        """対応するメインが results に無く、マスターにも未登録の添付資料は
+        スキップされ warning が出る。"""
         _install_step4_mocks(mock_drive, mock_merger, mock_sheets)
+        mock_sheets.lookup_participant_by_management_number.return_value = None
         self._att_file.write_text(json.dumps([
             {
                 "file_id": "id_orphan",
@@ -1319,16 +1354,17 @@ class TestBatchStateFilesPersistence(unittest.TestCase):
         """
         from pathlib import Path as _P
         import tempfile as _tf
+        mock_gen.plan_batch_chunks.side_effect = lambda items: [items]
         mock_gen.submit_batch.return_value = "batch_real_id_1234567890"
         with _tf.TemporaryDirectory() as tmp:
             with patch.object(batch_main, "LOGS_DIR", _P(tmp)):
-                batch_id = batch_main.step2_submit_batch(
+                batch_ids = batch_main.step2_submit_batch(
                     _make_batch_items(["001-01-1新規.pdf"])
                 )
-                self.assertEqual(batch_id, "batch_real_id_1234567890")
-                # 永続ファイルに正しく書かれている
+                self.assertEqual(batch_ids, ["batch_real_id_1234567890"])
+                # 永続ファイルに正しく書かれている（1 行 1 ID 形式）
                 self.assertEqual(
-                    (_P(tmp) / "batch_id.txt").read_text(),
+                    (_P(tmp) / "batch_id.txt").read_text().strip(),
                     "batch_real_id_1234567890",
                 )
                 # tmp ファイルは残らない（atomic rename 完了）
@@ -1536,6 +1572,7 @@ class TestBatchFailFastOnPermanentError(unittest.TestCase):
     @patch("src.batch_main.comment_generator")
     def test_step2_submit_propagates_permanent_failure(self, mock_gen):
         """``submit_batch`` の恒久エラーは ``step2_submit_batch`` から伝播する。"""
+        mock_gen.plan_batch_chunks.side_effect = lambda items: [items]
         mock_gen.submit_batch.side_effect = PermanentRunFailureError(
             "Anthropic API のクレジット残高不足のため処理を中止しました。"
         )
@@ -1926,6 +1963,354 @@ class TestRunCommonRequireNonEmptyMaster(unittest.TestCase):
                 [], "参加者マスター(新人育成塾)", True,
                 logging.getLogger("test"),
             )
+
+
+class TestZeroNewItemsGracefulExit(unittest.TestCase):
+    """新規 0 件（増分運用の定常状態）で step=all が正常終了する。
+
+    従来は results ブロックが存在しない ``logs/batch_id.txt`` を読もうとして
+    FileNotFoundError → 赤ランになっていた（定常ケースがクラッシュする欠陥）。
+    """
+
+    @patch("src.batch_main.step3_wait_and_get_results")
+    @patch("src.batch_main.step2_submit_batch")
+    @patch("src.batch_main.step1_prepare")
+    @patch("src.batch_main.sheets_client")
+    @patch("src.batch_main.discover.resolve_run_config")
+    def test_zero_items_skips_results_and_exits_cleanly(
+        self, mock_resolve, mock_sheets, mock_step1, mock_step2, mock_step3,
+    ):
+        mock_resolve.return_value = _make_profile()
+        mock_sheets.get_open_batch_ids.return_value = []
+        mock_step1.return_value = []  # 新規 0 件
+
+        batch_main.run(batch_mode=True, step="all")  # 例外なく戻る
+
+        mock_step2.assert_not_called()
+        mock_step3.assert_not_called()
+
+    @patch("src.batch_main.discover.resolve_run_config")
+    def test_step_results_without_batch_id_file_gives_clear_error(
+        self, mock_resolve,
+    ):
+        """batch_id.txt 不在の ``--step results`` は案内付きのエラーになる。"""
+        from pathlib import Path as _P
+        import tempfile as _tf
+        mock_resolve.return_value = _make_profile()
+        with _tf.TemporaryDirectory() as tmp:
+            with patch.object(batch_main, "LOGS_DIR", _P(tmp)):
+                with self.assertRaises(FileNotFoundError) as ctx:
+                    batch_main.run(batch_mode=True, step="results")
+        self.assertIn("--batch-id", str(ctx.exception))
+
+
+class TestBatchResumeOpenBatches(unittest.TestCase):
+    """未回収バッチの自動レジューム（二重課金防止）。
+
+    GHA ジョブが step3/step4 の途中で kill された後の ``step=all`` 再実行は、
+    ephemeral ランナーに ``batch_id.txt`` が無いため従来は全件を再投入していた
+    （投入済みバッチの分が丸ごと二重課金）。``_バッチ管理`` タブから未回収
+    バッチを検知して回収から再開する。
+    """
+
+    @patch("src.batch_main._mark_batches_done")
+    @patch("src.batch_main.step4_generate_pdfs")
+    @patch("src.batch_main.step3_wait_and_get_results")
+    @patch("src.batch_main.sheets_client")
+    def test_open_batches_are_collected_then_marked_done(
+        self, mock_sheets, mock_step3, mock_step4, mock_mark,
+    ):
+        mock_sheets.get_open_batch_ids.return_value = ["msgbatch_a", "msgbatch_b"]
+        mock_step3.side_effect = [
+            {"file-1": {"comment": "A"}},
+            {"file-2": {"comment": "B"}},
+        ]
+        profile = _make_profile()
+
+        batch_main._resume_open_batches(profile, poll_max_seconds=600)
+
+        self.assertEqual(mock_step3.call_count, 2)
+        # 両バッチの結果がマージされて step4 に渡る
+        merged = mock_step4.call_args.args[1]
+        self.assertEqual(set(merged.keys()), {"file-1", "file-2"})
+        mock_mark.assert_called_once_with(
+            "出力一覧", ["msgbatch_a", "msgbatch_b"],
+        )
+
+    @patch("src.batch_main._mark_batches_done")
+    @patch("src.batch_main.step4_generate_pdfs")
+    @patch("src.batch_main.step3_wait_and_get_results")
+    @patch("src.batch_main.sheets_client")
+    def test_no_open_batches_is_noop(
+        self, mock_sheets, mock_step3, mock_step4, mock_mark,
+    ):
+        mock_sheets.get_open_batch_ids.return_value = []
+        batch_main._resume_open_batches(_make_profile(), poll_max_seconds=600)
+        mock_step3.assert_not_called()
+        mock_step4.assert_not_called()
+        mock_mark.assert_not_called()
+
+    @patch("src.batch_main._mark_batches_done")
+    @patch("src.batch_main.step4_generate_pdfs")
+    @patch("src.batch_main.step3_wait_and_get_results")
+    @patch("src.batch_main.sheets_client")
+    def test_state_read_failure_falls_back_to_normal_run(
+        self, mock_sheets, mock_step3, mock_step4, mock_mark,
+    ):
+        """``_バッチ管理`` 読み取り失敗は fail-soft（新規実行として続行）。"""
+        mock_sheets.get_open_batch_ids.side_effect = RuntimeError("Sheets down")
+        batch_main._resume_open_batches(_make_profile(), poll_max_seconds=600)
+        mock_step3.assert_not_called()
+
+    @patch("src.batch_main._mark_batches_done")
+    @patch("src.batch_main.step4_generate_pdfs")
+    @patch("src.batch_main.step3_wait_and_get_results")
+    @patch("src.batch_main.sheets_client")
+    def test_expired_batch_recorded_and_skipped(
+        self, mock_sheets, mock_step3, mock_step4, mock_mark,
+    ):
+        """29 日保持期限切れ（NotFound）のバッチは『期限切れ』として記録し、
+        永久にレジュームを塞がない。"""
+        import anthropic as _anthropic
+        import httpx as _httpx
+        mock_sheets.get_open_batch_ids.return_value = ["msgbatch_gone"]
+        mock_sheets.BATCH_STATE_EXPIRED = "期限切れ(結果喪失)"
+        request = _httpx.Request("GET", "https://api.anthropic.com")
+        response = _httpx.Response(404, request=request)
+        mock_step3.side_effect = _anthropic.NotFoundError(
+            "not found", response=response, body=None,
+        )
+        profile = _make_profile()
+
+        batch_main._resume_open_batches(profile, poll_max_seconds=600)
+
+        mock_sheets.append_batch_record.assert_called_once_with(
+            "出力一覧", "msgbatch_gone", "期限切れ(結果喪失)",
+        )
+        mock_step4.assert_not_called()
+        # 期限切れは consumed に入らない（done 記録しない）
+        mock_mark.assert_called_once_with("出力一覧", [])
+
+    @patch("src.batch_main._resume_open_batches")
+    @patch("src.batch_main.step1_prepare")
+    @patch("src.batch_main.discover.resolve_run_config")
+    def test_run_step_all_calls_resume_before_step1(
+        self, mock_resolve, mock_step1, mock_resume,
+    ):
+        mock_resolve.return_value = _make_profile()
+        mock_step1.return_value = []
+        parent = MagicMock()
+        parent.attach_mock(mock_resume, "resume")
+        parent.attach_mock(mock_step1, "step1")
+
+        batch_main.run(batch_mode=True, step="all")
+
+        call_names = [c[0] for c in parent.mock_calls]
+        self.assertLess(
+            call_names.index("resume"), call_names.index("step1"),
+        )
+
+
+class TestChunkedBatchSubmission(unittest.TestCase):
+    """チャンク分割送信（256MB 上限対策）と複数バッチ ID の取り回し。"""
+
+    @patch("src.batch_main.sheets_client")
+    @patch("src.batch_main.comment_generator")
+    def test_multiple_chunks_submit_multiple_batches(
+        self, mock_gen, mock_sheets,
+    ):
+        from pathlib import Path as _P
+        import tempfile as _tf
+        items = _make_batch_items(["001-01-1a.pdf", "002-02-2b.pdf"])
+        mock_gen.plan_batch_chunks.return_value = [[items[0]], [items[1]]]
+        mock_gen.submit_batch.side_effect = ["msgbatch_1", "msgbatch_2"]
+        mock_sheets.BATCH_STATE_SUBMITTED = "投入済み"
+
+        with _tf.TemporaryDirectory() as tmp:
+            with patch.object(batch_main, "LOGS_DIR", _P(tmp)):
+                batch_ids = batch_main.step2_submit_batch(
+                    items, state_target="出力一覧",
+                )
+                persisted = (_P(tmp) / "batch_id.txt").read_text()
+
+        self.assertEqual(batch_ids, ["msgbatch_1", "msgbatch_2"])
+        self.assertEqual(mock_gen.submit_batch.call_count, 2)
+        # 1 行 1 ID で永続化
+        self.assertEqual(persisted.split(), ["msgbatch_1", "msgbatch_2"])
+        # 投入済み記録が両バッチ分
+        self.assertEqual(mock_sheets.append_batch_record.call_count, 2)
+
+    @patch("src.batch_main.sheets_client")
+    @patch("src.batch_main.comment_generator")
+    def test_state_record_failure_does_not_block_submission(
+        self, mock_gen, mock_sheets,
+    ):
+        """Sheets への状態記録失敗はランを止めない（fail-soft）。"""
+        from pathlib import Path as _P
+        import tempfile as _tf
+        items = _make_batch_items(["001-01-1a.pdf"])
+        mock_gen.plan_batch_chunks.return_value = [items]
+        mock_gen.submit_batch.return_value = "msgbatch_1"
+        mock_sheets.append_batch_record.side_effect = RuntimeError("quota")
+        mock_sheets.BATCH_STATE_SUBMITTED = "投入済み"
+
+        with _tf.TemporaryDirectory() as tmp:
+            with patch.object(batch_main, "LOGS_DIR", _P(tmp)):
+                batch_ids = batch_main.step2_submit_batch(
+                    items, state_target="出力一覧",
+                )
+        self.assertEqual(batch_ids, ["msgbatch_1"])
+
+    def test_load_batch_ids_multi_line(self):
+        from pathlib import Path as _P
+        import tempfile as _tf
+        with _tf.TemporaryDirectory() as tmp:
+            with patch.object(batch_main, "LOGS_DIR", _P(tmp)):
+                (_P(tmp) / "batch_id.txt").write_text(
+                    "msgbatch_1\nmsgbatch_2\n\n"
+                )
+                self.assertEqual(
+                    batch_main._load_batch_ids_from_disk(),
+                    ["msgbatch_1", "msgbatch_2"],
+                )
+
+    def test_load_batch_ids_legacy_single_line(self):
+        """旧形式（改行なし単一 ID）も読める（後方互換）。"""
+        from pathlib import Path as _P
+        import tempfile as _tf
+        with _tf.TemporaryDirectory() as tmp:
+            with patch.object(batch_main, "LOGS_DIR", _P(tmp)):
+                (_P(tmp) / "batch_id.txt").write_text("msgbatch_legacy")
+                self.assertEqual(
+                    batch_main._load_batch_ids_from_disk(), ["msgbatch_legacy"],
+                )
+
+    @patch("src.batch_main._mark_batches_done")
+    @patch("src.batch_main.step4_generate_pdfs")
+    @patch("src.batch_main.step3_wait_and_get_results")
+    @patch("src.batch_main.discover.resolve_run_config")
+    def test_recovery_accepts_comma_separated_batch_ids(
+        self, mock_resolve, mock_step3, mock_step4, mock_mark,
+    ):
+        """``--step results --batch-id id1,id2`` で複数バッチを回収できる。"""
+        mock_resolve.return_value = _make_profile()
+        mock_step3.side_effect = [
+            {"file-1": {"comment": "A"}},
+            {"file-2": {"comment": "B"}},
+        ]
+
+        batch_main.run(
+            batch_mode=True, step="results",
+            batch_id="msgbatch_1, msgbatch_2",
+        )
+
+        self.assertEqual(mock_step3.call_count, 2)
+        called_ids = [c.args[0] for c in mock_step3.call_args_list]
+        self.assertEqual(called_ids, ["msgbatch_1", "msgbatch_2"])
+        # 回収（is_recovery）なので step4 まで完走し、done 記録される
+        mock_step4.assert_called_once()
+        mock_mark.assert_called_once_with(
+            "出力一覧", ["msgbatch_1", "msgbatch_2"],
+        )
+
+
+class TestStep4CaseMapForProcessedMains(unittest.TestCase):
+    """CB-3 スキップでも case_map を構築し、添付資料を恒久ロストさせない。
+
+    前回ランが「メイン記録後・添付コピー前」でクラッシュ → 再実行のとき、
+    メインは処理済みスキップだが、添付資料はメインと同じ出力先へコピー
+    されなければならない。
+    """
+
+    def setUp(self):
+        from src.config import LOGS_DIR
+        LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        self._att_file = LOGS_DIR / "batch_attachments.json"
+        self._att_backup = (
+            self._att_file.read_text() if self._att_file.exists() else None
+        )
+
+    def tearDown(self):
+        if self._att_backup is None:
+            self._att_file.unlink(missing_ok=True)
+        else:
+            self._att_file.write_text(self._att_backup)
+
+    @patch("src.batch_main.pdf_merger")
+    @patch("src.batch_main.pdf_creator")
+    @patch("src.batch_main.drive_client")
+    @patch("src.batch_main.sheets_client")
+    @patch("src.batch_main.ensure_fonts")
+    def test_attachment_of_skipped_main_still_copied(
+        self, mock_fonts, mock_sheets, mock_drive, mock_creator, mock_merger,
+    ):
+        import json as _json
+        _install_step4_mocks(mock_drive, mock_merger, mock_sheets)
+        items = _make_batch_items(["001-01-0実践事例.pdf"])
+        results = _make_batch_results(1)
+        # メインは前回ラン処理済み（CB-3 スキップ対象）
+        mock_sheets.get_processed_management_numbers.return_value = {"001-01-0"}
+        self._att_file.write_text(_json.dumps([
+            {
+                "file_id": "id_att",
+                "file_name": "001-01-0【添付資料】補足.pdf",
+                "management_number": "001-01-0",
+            }
+        ]))
+
+        batch_main.step4_generate_pdfs(_make_profile(), results, items=items)
+
+        # メインは再アップロードされず、添付資料 1 件だけコピーされる
+        upload_names = [
+            c.kwargs["file_name"]
+            for c in mock_drive.upload_pdf_to_clinic_person.call_args_list
+        ]
+        self.assertEqual(upload_names, ["001-01-0【添付資料】補足.pdf"])
+
+
+class TestStep1FailFast(unittest.TestCase):
+    """step1 の系統的失敗の fail-fast。"""
+
+    @patch("src.batch_main.pdf_reader")
+    @patch("src.batch_main.sheets_client")
+    @patch("src.batch_main.drive_client")
+    def test_refresh_error_aborts_immediately(
+        self, mock_drive, mock_sheets, mock_reader,
+    ):
+        """Google 認証の恒久失敗（RefreshError）は per-item で握りつぶさず
+        即停止する（1000 件ぶんの無駄な失敗ループを防ぐ）。"""
+        from google.auth.exceptions import RefreshError as _RefreshError
+        mock_drive.list_pdfs.return_value = [
+            {"id": f"id_{i}", "name": f"00{i}-01-0実践事例.pdf"}
+            for i in range(1, 4)
+        ]
+        mock_sheets.get_processed_management_numbers.return_value = set()
+        mock_sheets.get_recorded_attachment_names.return_value = set()
+        mock_drive.download_pdf.side_effect = _RefreshError("token expired")
+
+        with self.assertRaises(_RefreshError):
+            batch_main.step1_prepare(_make_profile(), test_count=0)
+
+        # 1 件目で停止し、2 件目以降をダウンロードしに行かない
+        self.assertEqual(mock_drive.download_pdf.call_count, 1)
+
+    @patch("src.batch_main.pdf_reader")
+    @patch("src.batch_main.sheets_client")
+    @patch("src.batch_main.drive_client")
+    def test_all_targets_failed_raises_loudly(
+        self, mock_drive, mock_sheets, mock_reader,
+    ):
+        """新規対象があるのに 1 件も準備できないときは緑終了せず停止する。"""
+        mock_drive.list_pdfs.return_value = [
+            {"id": "id_1", "name": "001-01-0実践事例.pdf"},
+        ]
+        mock_sheets.get_processed_management_numbers.return_value = set()
+        mock_sheets.get_recorded_attachment_names.return_value = set()
+        mock_drive.download_pdf.side_effect = OSError("network unreachable")
+
+        with self.assertRaises(RuntimeError) as ctx:
+            batch_main.step1_prepare(_make_profile(), test_count=0)
+        self.assertIn("すべての準備に失敗", str(ctx.exception))
 
 
 if __name__ == "__main__":

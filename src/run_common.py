@@ -174,6 +174,40 @@ def resolve_clinic_name(
     return clinic_name_from_ai, False
 
 
+def resolve_case_via_master(
+    sheets_module: Any,
+    master_records: list[Any],
+    mgmt_num: str,
+    logger: logging.Logger,
+) -> tuple[str, str, str] | None:
+    """添付資料の出力先 ``(医院番号, 医院名, 個人名)`` を参加者マスターだけで解決する。
+
+    添付資料は通常、同一ラン内で処理されたメイン PDF の ``case_map`` から
+    出力先を引く。しかし (1) メインが過去ランで処理済みで、添付資料だけ後から
+    Drive に追加されたケース、(2) メイン記録後・添付コピー前にクラッシュして
+    再実行したケース、では ``case_map`` に対応エントリが無い。従来はここで
+    警告スキップ = **添付資料の恒久ロスト** になっていた。
+
+    参加者マスターは管理番号（個人単位 ``NNN-NN``）→ 医院名・参加者名を持つ
+    ため、メイン PDF の AI 抽出結果に依存せずマスターだけで出力先を解決できる。
+
+    Returns:
+        ``(医院番号, 医院名（マスター標準表記）, 個人名)``。マスターに管理番号
+        が未登録なら None（呼び出し側が従来通り警告スキップする）。
+    """
+    record = sheets_module.lookup_participant_by_management_number(
+        master_records, mgmt_num,
+    )
+    if record is None or not record.clinic_name:
+        return None
+    person_name = record.participant_name or "unknown_person"
+    logger.info(
+        f"添付資料の出力先を参加者マスターから解決: {mgmt_num} → "
+        f"({record.clinic_number}, {record.clinic_name}, {person_name})"
+    )
+    return (record.clinic_number, record.clinic_name, person_name)
+
+
 def collect_draft_item(
     draft_items: list[dict[str, Any]],
     master_records: list[Any],
@@ -209,6 +243,96 @@ def collect_draft_item(
         )
 
 
+# Gmail 添付合計サイズの上限（1 通あたり、生バイト）。
+# Gmail のメッセージ上限は 25MB だが、添付は base64 で約 4/3 倍に膨らむため、
+# 生 PDF の合計を 17MB に抑える（17MB × 1.37 ≒ 23.3MB < 25MB）。超過グループは
+# 複数通に分割する。1 ファイル単独で超過する PDF は添付不能（分割できない）
+# ため、ERROR ログを出して添付から除外する（PDF 自体は Drive 保存済みで、
+# 運用者が Drive から手動添付できる）。
+_GMAIL_ATTACH_TOTAL_LIMIT_BYTES = 17 * 1024 * 1024
+
+
+def _chunk_paths_by_size(
+    pdf_paths: list[Any],
+    limit_bytes: int,
+    logger: logging.Logger,
+) -> tuple[list[list[Any]], list[Any]]:
+    """添付 PDF を合計サイズが ``limit_bytes`` 以下のチャンク列に分割する。
+
+    要素は元のオブジェクト（str / Path）をそのまま保持する（``create_draft``
+    がどちらも受けるため、変換して呼び出し契約を変えない）。
+
+    Returns:
+        ``(chunks, oversized)``。``oversized`` は単独で上限超過し添付不能な
+        ファイル（チャンクには含まれない）。
+    """
+    chunks: list[list[Any]] = []
+    current: list[Any] = []
+    current_size = 0
+    oversized: list[Any] = []
+    for path in pdf_paths:
+        try:
+            size = Path(path).stat().st_size
+        except OSError:
+            size = 0
+        if size > limit_bytes:
+            oversized.append(path)
+            continue
+        if current and current_size + size > limit_bytes:
+            chunks.append(current)
+            current = []
+            current_size = 0
+        current.append(path)
+        current_size += size
+    if current:
+        chunks.append(current)
+    return chunks, oversized
+
+
+def _create_draft_with_size_guard(
+    gmail_module: Any,
+    to_email: str,
+    person_name: str,
+    pdf_paths: list[Any],
+    logger: logging.Logger,
+) -> None:
+    """添付合計 25MB 上限を守って下書きを作成する（必要なら複数通に分割）。
+
+    Gmail はメッセージ全体 25MB が上限で、超過すると下書き作成が **恒久失敗**
+    する（リトライしても直らない → その個人宛の下書きが 1 通も作られない）。
+    合計サイズでチャンクに分割し、チャンクごとに 1 通作成する。例外は呼び出し
+    側で握る（本関数は raise し得る）。
+    """
+    chunks, oversized = _chunk_paths_by_size(
+        pdf_paths, _GMAIL_ATTACH_TOTAL_LIMIT_BYTES, logger,
+    )
+    for path in oversized:
+        logger.error(
+            f"添付 PDF が単独で Gmail 上限を超えるため下書きに添付できません"
+            f"（Drive には保存済み・手動添付してください）: {Path(path).name} "
+            f"({Path(path).stat().st_size // (1024 * 1024)}MB)"
+        )
+    if not chunks:
+        if oversized:
+            logger.error(
+                f"全添付がサイズ超過のため下書きを作成できません "
+                f"(宛先={person_name}様)。Drive から手動送付してください。"
+            )
+        return
+    if len(chunks) > 1:
+        logger.warning(
+            f"添付合計が Gmail 上限を超えるため {len(chunks)} 通に分割 "
+            f"(宛先={person_name}様, 計{len(pdf_paths)}ファイル)"
+        )
+    for chunk in chunks:
+        gmail_module.create_draft(
+            to_email=to_email,
+            person_name=person_name,
+            pdf_paths=chunk,
+            cc_email=None,
+        )
+
+
 def create_grouped_drafts(
     draft_items: list[dict[str, Any]],
     gmail_module: Any,
@@ -216,7 +340,8 @@ def create_grouped_drafts(
     """``draft_items`` をメールアドレスでグループ化して下書きを作成する（P-023）。
 
     - メールアドレスが空でない項目: アドレスごとに 1 通の下書きにまとめる
-      （複数 PDF はそのまま複数添付になる）
+      （複数 PDF はそのまま複数添付になる）。添付合計が Gmail 上限
+      （25MB/メッセージ）を超えるグループはサイズで複数通に分割する。
     - メールアドレスが空の項目: グループ化キーがないため項目ごとに 1 通の
       宛先空の下書きを作る（手動で補完してもらう運用）
 
@@ -250,7 +375,7 @@ def create_grouped_drafts(
         f"メール空{len(empty_email_items)}件 → 計{len(groups) + len(empty_email_items)}通の下書きを作成"
     )
 
-    # メールあり: グループごとに 1 通
+    # メールあり: グループごとに 1 通（サイズ超過時は複数通に分割）
     for email, items in groups.items():
         pdf_paths = [item["pdf_path"] for item in items]
         unique_names = sorted({item["person_name"] for item in items})
@@ -266,11 +391,12 @@ def create_grouped_drafts(
                 f"{unique_names} → '{person_name}' で下書き作成"
             )
         try:
-            gmail_module.create_draft(
+            _create_draft_with_size_guard(
+                gmail_module,
                 to_email=email,
                 person_name=person_name,
                 pdf_paths=pdf_paths,
-                cc_email=None,
+                logger=logger,
             )
         except Exception as e:
             logger.error(
@@ -280,11 +406,12 @@ def create_grouped_drafts(
     # メール空: 項目ごとに 1 通（集約キーがないため）
     for item in empty_email_items:
         try:
-            gmail_module.create_draft(
+            _create_draft_with_size_guard(
+                gmail_module,
                 to_email="",
                 person_name=item["person_name"],
                 pdf_paths=[item["pdf_path"]],
-                cc_email=None,
+                logger=logger,
             )
         except Exception as e:
             logger.error(

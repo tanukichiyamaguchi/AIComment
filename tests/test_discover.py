@@ -608,5 +608,41 @@ class TestResolveContextUsesMasterTabNameResolver(unittest.TestCase):
         self.assertTrue(cfg.master_sheet_strict)
 
 
+class TestResolveMasterSheetNameNormalization(unittest.TestCase):
+    """名寄せの NFKC 正規化（全角/半角・空白の表記揺れで HARD FAIL しない）。"""
+
+    def test_fullwidth_digits_in_tab_match_halfwidth_folder(self):
+        """タブ側 ``新人育成塾２０２６``（全角）× フォルダ側 ``新人育成塾2026``。"""
+        result = discover.resolve_master_sheet_name(
+            target_folder_name="新人育成塾2026_Q1",
+            available_master_tabs=["参加者マスター(新人育成塾２０２６)"],
+        )
+        self.assertEqual(result, "参加者マスター(新人育成塾２０２６)")
+
+    def test_space_variation_in_seminar_name(self):
+        """タブ側 ``新人 育成塾``（空白入り）× フォルダ側 ``新人育成塾_Q1``。"""
+        result = discover.resolve_master_sheet_name(
+            target_folder_name="新人育成塾_Q1",
+            available_master_tabs=["参加者マスター(新人 育成塾)"],
+        )
+        self.assertEqual(result, "参加者マスター(新人 育成塾)")
+
+    def test_fullwidth_folder_matches_halfwidth_tab(self):
+        """フォルダ側が全角英数でもタブ（半角）にマッチする。"""
+        result = discover.resolve_master_sheet_name(
+            target_folder_name="ＪＩＳＳＥＮ塾＿2026",
+            available_master_tabs=["参加者マスター(JISSEN塾)"],
+        )
+        self.assertEqual(result, "参加者マスター(JISSEN塾)")
+
+    def test_returned_tab_name_keeps_original_notation(self):
+        """返り値は元のタブ表記のまま（正規化形ではない）。"""
+        result = discover.resolve_master_sheet_name(
+            target_folder_name="経営塾2026",
+            available_master_tabs=["参加者マスター(経営塾　２０２６)"],
+        )
+        self.assertEqual(result, "参加者マスター(経営塾　２０２６)")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -348,22 +348,32 @@ def resolve_master_sheet_name(
 
     マッチ判定:
         - ``参加者マスター(`` と ``)`` を取り除いた中身（セミナー名）が
-          ``target_folder_name`` に部分一致する。
+          ``target_folder_name`` に部分一致する。比較は
+          ``normalize_name_for_match``（NFKC + 全空白除去）後に行い、
+          全角/半角・空白の表記揺れ（例: タブ側 ``新人育成塾２０２６`` と
+          フォルダ側 ``新人育成塾2026``）で名寄せミス → 意図しない HARD FAIL
+          にならないようにする（P-009 と同じ方針）。返すタブ名は元の表記。
         - 複数マッチした場合は **最長一致** を採用（より具体的なセミナー名を優先）。
         - 順序の安定性のため、長さが同じならアルファベット順で最後のものを返す
           （決定論的、再走でも同じ結果になる）。
     """
+    normalized_folder = normalize_name_for_match(target_folder_name)
+
+    # 正規化済みセミナー名 → 元のタブ名。正規化後に衝突する場合（実運用上は
+    # 同一セミナーの表記揺れタブ）は後勝ちでよい（どちらも同じセミナー）。
     seminar_to_tab: dict[str, str] = {}
     for tab in available_master_tabs:
         if not (tab.startswith("参加者マスター(") and tab.endswith(")")):
             continue
-        seminar_name = tab[len("参加者マスター("):-len(")")].strip()
+        seminar_name = normalize_name_for_match(
+            tab[len("参加者マスター("):-len(")")].strip()
+        )
         if seminar_name:
             seminar_to_tab[seminar_name] = tab
 
     matched = [
         name for name in seminar_to_tab
-        if name in target_folder_name
+        if name in normalized_folder
     ]
     if not matched:
         return f"参加者マスター({target_folder_name})"
