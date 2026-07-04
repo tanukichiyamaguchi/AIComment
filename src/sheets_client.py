@@ -616,7 +616,11 @@ def get_open_batch_ids(
     ).execute(num_retries=GOOGLE_API_NUM_RETRIES)
     rows = result.get("values", [])
 
-    submitted_order: list[str] = []
+    # 挿入順を保持する重複除去キーとして dict を使う（Python 3.7+ の dict は
+    # 挿入順を保持する）。以前は list + ``not in``（線形探索）で、append-only
+    # ログが年単位で増え続けると重複チェックが O(n²) になっていた
+    # （``_バッチ管理`` タブは行を削除しない設計のため行数は増加し続ける）。
+    submitted: dict[str, None] = {}
     closed: set[str] = set()
     for row in rows:
         # 列: [記録日時, 対象シート, バッチID, 状態]
@@ -626,12 +630,11 @@ def get_open_batch_ids(
         if target != target_sheet_name or not batch_id:
             continue
         if status == BATCH_STATE_SUBMITTED:
-            if batch_id not in submitted_order:
-                submitted_order.append(batch_id)
+            submitted.setdefault(batch_id, None)
         elif status in (BATCH_STATE_DONE, BATCH_STATE_EXPIRED):
             closed.add(batch_id)
 
-    open_ids = [b for b in submitted_order if b not in closed]
+    open_ids = [b for b in submitted if b not in closed]
     if open_ids:
         logger.warning(
             f"Sheets: 未回収バッチを検出 ({target_sheet_name}): {open_ids}"
