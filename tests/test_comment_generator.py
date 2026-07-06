@@ -1,6 +1,7 @@
 """comment_generator モジュールのテスト（構造化出力 + 抽出版）。"""
 
 import json
+import logging
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -898,6 +899,105 @@ class TestPlanBatchChunks(unittest.TestCase):
         ):
             chunks = comment_generator.plan_batch_chunks(items)
         self.assertEqual([len(c) for c in chunks], [1, 1])
+
+
+class TestCommentQualityGuard(unittest.TestCase):
+    """scrub 後コメントの品質ガード（Phase 23 PR-3a、warning-only）。
+
+    固有名詞スクラブで本文が壊滅的に短くなったケースを WARNING で可視化する。
+    失敗化はしない（Batch で失敗化すると failed_ids → シート未記録 → 次ラン
+    再投入 → 恒久再投入ループのリスクがあるため）。
+    """
+
+    def _payload(self, comment: str, clinic: str = "山田歯科医院") -> str:
+        return json.dumps({
+            "clinic_name": clinic,
+            "person_name": "田中太郎",
+            "sample_title": "事例",
+            "comment": comment,
+        }, ensure_ascii=False)
+
+    def test_scrub_reduction_logs_info_with_context(self):
+        """scrub で短くなったら INFO ログ（文字数 + context）が出る。"""
+        comment = "山田歯科医院の" + "あ" * 200
+        with self.assertLogs("jissen_comment", level="INFO") as log_ctx:
+            data = comment_generator._parse_extraction(
+                self._payload(comment), context="001-01-0.pdf",
+            )
+        joined = "\n".join(log_ctx.output)
+        self.assertIn("固有名詞スクラブ", joined)
+        self.assertIn("001-01-0.pdf", joined)
+        self.assertNotIn("山田歯科医院", data["comment"])
+
+    def test_short_comment_after_scrub_warns_but_returns(self):
+        """scrub 後 100 字未満 → WARNING が出るが dict は正常返却（raise しない）。"""
+        comment = "山田歯科医院" + "あ" * 50  # scrub 後 50 字
+        with self.assertLogs("jissen_comment", level="WARNING") as log_ctx:
+            data = comment_generator._parse_extraction(
+                self._payload(comment), context="item_x",
+            )
+        joined = "\n".join(log_ctx.output)
+        self.assertIn("極端に短い", joined)
+        self.assertIn("item_x", joined)
+        self.assertEqual(len(data["comment"]), 50)
+
+    def test_normal_length_comment_no_warning(self):
+        """200 字以上（固有名詞なし）は警告なし。"""
+        comment = "あ" * 250
+        logger = logging.getLogger("jissen_comment")
+        records: list[logging.LogRecord] = []
+        handler = logging.Handler()
+        handler.emit = records.append  # type: ignore[assignment]
+        logger.addHandler(handler)
+        try:
+            data = comment_generator._parse_extraction(self._payload(comment))
+        finally:
+            logger.removeHandler(handler)
+        warnings = [r for r in records if r.levelno >= logging.WARNING]
+        self.assertEqual(warnings, [])
+        self.assertEqual(len(data["comment"]), 250)
+
+    def test_empty_after_scrub_no_short_warning(self):
+        """scrub 後 0 字は「短い」警告の対象外（呼び出し側の空判定に委ねる）。"""
+        comment = "山田歯科医院"  # scrub で全消し → 0 字
+        logger = logging.getLogger("jissen_comment")
+        records: list[logging.LogRecord] = []
+        handler = logging.Handler()
+        handler.emit = records.append  # type: ignore[assignment]
+        logger.addHandler(handler)
+        try:
+            data = comment_generator._parse_extraction(self._payload(comment))
+        finally:
+            logger.removeHandler(handler)
+        short_warnings = [
+            r for r in records
+            if r.levelno >= logging.WARNING and "極端に短い" in r.getMessage()
+        ]
+        self.assertEqual(short_warnings, [])
+        self.assertEqual(data["comment"], "")
+
+    @patch("src.comment_generator._create_client")
+    def test_short_comment_not_marked_failed_in_batch_results(
+        self, mock_create_client,
+    ):
+        """短いコメントは failed_ids に入れない（恒久再投入ループ回避の契約）。"""
+        payload = self._payload("山田歯科医院" + "あ" * 60)
+
+        block = TextBlock(type="text", text=payload)
+        entry = MagicMock()
+        entry.custom_id = "file-abc"
+        entry.result.type = "succeeded"
+        entry.result.message.content = [block]
+
+        mock_client = MagicMock()
+        mock_create_client.return_value = mock_client
+        mock_client.messages.batches.results.return_value = iter([entry])
+
+        results, failed_ids = get_batch_results("batch_xx")
+
+        self.assertEqual(failed_ids, [])
+        self.assertIn("file-abc", results)
+        self.assertEqual(len(results["file-abc"]["comment"]), 60)
 
 
 if __name__ == "__main__":

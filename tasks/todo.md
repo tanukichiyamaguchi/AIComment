@@ -8,6 +8,16 @@ Phase 22（耐障害系）の次段。ユーザー優先領域「処理速度」
 6 レンズ監査 + 広域スイープ（Explore）→ 実装設計（Plan）で計画策定。
 計画ファイル: `/root/.claude/plans/swift-strolling-crystal.md`
 
+### PR-6: 長時間ハードニング（新設 2026-07-04・未着手）
+- [ ] 6a: 一時ディレクトリ掃除の全域化（mkdtemp直後からtry/finally。未ガード区間の
+      例外でrmtree不達→リークする問題）
+- [ ] 6b: disk由来 batch_results/attachments の防御的パース（meta.get化 +
+      JSONDecodeError の明確なエラーメッセージ）
+- [ ] 6c: ENABLE_GMAIL_DRAFTS=false 時のディスク逐次解放（アップロード直後に
+      サブディレクトリ削除）
+- 検証済み・対処不要: ログローテ(100MB×5世代) / logs/上書き型 / キャッシュ有界 /
+  メモリ(1000件で~115MB)
+
 ### PR-1: 正確性バグ修正（完了）
 - [x] **1a: 回収時 missing 誤報** — `--step results --batch-id`回収/自動レジュームで
       items が Drive 全件再走査から作られるため、過去処理済み PDF が「コメント未取得」
@@ -17,7 +27,7 @@ Phase 22（耐障害系）の次段。ユーザー優先領域「処理速度」
       `_remaining_seconds()` で解消（P-033）
 - [x] **1c: get_open_batch_ids の O(n²)** — list 線形探索を挿入順保持 dict に置換
 - [x] pytest 704 → 712 件 pass / mypy clean
-- [ ] ドラフト PR 作成
+- [x] PR #59 マージ済み（2026-07-04）
 
 ### PR-2: 処理速度（未着手・PR-1マージ後）
 - [ ] 2a: step1 ダウンロード並列化（ThreadPoolExecutor、既定 workers=1 で現状維持、
@@ -25,10 +35,12 @@ Phase 22（耐障害系）の次段。ユーザー優先領域「処理速度」
 - [ ] 2b: Drive/Sheets サービスの thread-local キャッシュ（build+token refresh 削減）
 - [ ] 2c: `read_master_records` のプロセス内メモ化（step1/step4 二重読み解消）
 
-### PR-3: 出力品質（未着手・PR-1と並行可）
-- [ ] 3a: コメント品質ガード（`_MIN_COMMENT_CHARS=100`、warning-only。batch失敗化は
-      恒久再投入ループのリスクがあるため見送り）
-- [ ] 3b: pdf_creator の本文/じっせん君画像の重なり回避（本文下端を40mm→50mm相当に）
+### PR-3: 出力品質（完了）
+- [x] 3a: コメント品質ガード（`_MIN_COMMENT_CHARS=100`、warning-only。batch失敗化は
+      恒久再投入ループのリスクがあるため見送り）。scrub 短縮の INFO ログ + context 追跡付き
+- [x] 3b: pdf_creator の本文/じっせん君画像の重なり回避（画像ジオメトリを定数昇格し
+      本文下限を導出: box_y+40mm → 画像帯上端+5mm クリアランス）
+- [x] pytest 712 → 719 件 pass / mypy clean
 
 ### PR-4: workflow入力拡張（未着手）
 - [ ] step choice に prepare/submit/pdfs 追加、poll_max_minutes 入力追加
