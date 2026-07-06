@@ -34,6 +34,7 @@ from src.utils import (
     ensure_fonts,
     extract_clinic_number,
     extract_management_number,
+    mask_name,
 )
 from src import config
 from src import discover, drive_client, gmail_client, run_common, sheets_client
@@ -350,7 +351,8 @@ def run(
                 case_map[mgmt_num] = (clinic_number, clinic_name, person_name)
 
                 logger.info(
-                    f"完了: {mgmt_num} / {clinic_name} / {person_name} / {sample_title}"
+                    f"完了: {mgmt_num} / {mask_name(clinic_name)} / "
+                    f"{mask_name(person_name)} / {sample_title}"
                 )
                 stats["success"] += 1
 

@@ -15,6 +15,7 @@ from typing import Any
 
 from googleapiclient.discovery import build
 
+from src.utils import mask_name
 from src.config import (
     GOOGLE_API_NUM_RETRIES,
     GOOGLE_CREDENTIALS_JSON,
@@ -511,7 +512,8 @@ def append_output_record(
     ).execute(num_retries=GOOGLE_API_NUM_RETRIES)
 
     logger.info(
-        f"Sheets: 出力一覧に追加 ({management_number} / {clinic_name} / {person_name} / {sample_name})"
+        f"Sheets: 出力一覧に追加 ({management_number} / {mask_name(clinic_name)} / "
+        f"{mask_name(person_name)} / {sample_name})"
     )
 
 
@@ -1185,7 +1187,7 @@ def lookup_email_by_clinic_and_person(
     if not candidates:
         logger.warning(
             f"参加者マスター: 医院管理番号 {clinic_number} に該当行なし "
-            f"(PDF 個人名={person_name!r})"
+            f"(PDF 個人名={mask_name(person_name)})"
         )
         return ""
 
@@ -1201,7 +1203,7 @@ def lookup_email_by_clinic_and_person(
     if len(exact) > 1:
         logger.warning(
             f"参加者マスター: 医院 {clinic_number} に同姓同名複数ヒット "
-            f"({person_name!r} で {len(exact)}件) → 先頭採用"
+            f"({mask_name(person_name)} で {len(exact)}件) → 先頭採用"
         )
         return exact[0].email
 
@@ -1210,7 +1212,7 @@ def lookup_email_by_clinic_and_person(
     # して完全一致のみ採用する（P-022）。
     if len(normalized_target) < _FUZZY_MIN_LENGTH:
         logger.warning(
-            f"参加者マスター: 個人名 {person_name!r} が短すぎてファジー一致を"
+            f"参加者マスター: 個人名 {mask_name(person_name)} が短すぎてファジー一致を"
             f"スキップ (医院 {clinic_number} 内に完全一致なし、誤マッチ防止のため"
             f"距離 1 候補は採用しない)"
         )
@@ -1226,13 +1228,14 @@ def lookup_email_by_clinic_and_person(
     if len(fuzzy) == 1:
         logger.info(
             f"参加者マスター: ファジー一致採用 "
-            f"(PDF={person_name!r} ↔ マスター={fuzzy[0].participant_name!r})"
+            f"(PDF={mask_name(person_name)} ↔ "
+            f"マスター={mask_name(fuzzy[0].participant_name)})"
         )
         return fuzzy[0].email
     if len(fuzzy) > 1:
         logger.warning(
             f"参加者マスター: 医院 {clinic_number} にファジー候補複数 "
-            f"({person_name!r} で {len(fuzzy)}件) → 先頭採用 "
+            f"({mask_name(person_name)} で {len(fuzzy)}件) → 先頭採用 "
             f"({fuzzy[0].participant_name!r})"
         )
         return fuzzy[0].email

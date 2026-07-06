@@ -20,6 +20,7 @@ import logging
 
 from src import config
 from src.utils import extract_management_number, is_attachment_filename, setup_logging
+from src.utils import mask_name
 
 
 class MasterSheetEmptyError(RuntimeError):
@@ -164,12 +165,12 @@ def resolve_clinic_name(
     if clinic_name_from_master:
         logger.info(
             f"医院名をマスターシートから取得: "
-            f"{clinic_number} → {clinic_name_from_master}"
+            f"{clinic_number} → {mask_name(clinic_name_from_master)}"
         )
         return clinic_name_from_master, True
     logger.warning(
         f"参加者マスター未登録、AI 抽出値で代用: "
-        f"医院番号={clinic_number}, AI 抽出={clinic_name_from_ai}"
+        f"医院番号={clinic_number}, AI 抽出={mask_name(clinic_name_from_ai)}"
     )
     return clinic_name_from_ai, False
 
@@ -203,7 +204,8 @@ def resolve_case_via_master(
     person_name = record.participant_name or "unknown_person"
     logger.info(
         f"添付資料の出力先を参加者マスターから解決: {mgmt_num} → "
-        f"({record.clinic_number}, {record.clinic_name}, {person_name})"
+        f"({record.clinic_number}, {mask_name(record.clinic_name)}, "
+        f"{mask_name(person_name)})"
     )
     return (record.clinic_number, record.clinic_name, person_name)
 
@@ -228,7 +230,7 @@ def collect_draft_item(
         if not email:
             logger.warning(
                 f"メール未ヒット → 宛先空で下書き予定 "
-                f"(医院管理番号={clinic_number}, 個人名={person_name!r})"
+                f"(医院管理番号={clinic_number}, 個人名={mask_name(person_name)})"
             )
         draft_items.append({
             "email": email,
@@ -316,13 +318,13 @@ def _create_draft_with_size_guard(
         if oversized:
             logger.error(
                 f"全添付がサイズ超過のため下書きを作成できません "
-                f"(宛先={person_name}様)。Drive から手動送付してください。"
+                f"(宛先={mask_name(person_name)}様)。Drive から手動送付してください。"
             )
         return
     if len(chunks) > 1:
         logger.warning(
             f"添付合計が Gmail 上限を超えるため {len(chunks)} 通に分割 "
-            f"(宛先={person_name}様, 計{len(pdf_paths)}ファイル)"
+            f"(宛先={mask_name(person_name)}様, 計{len(pdf_paths)}ファイル)"
         )
     for chunk in chunks:
         gmail_module.create_draft(
@@ -388,7 +390,8 @@ def create_grouped_drafts(
             person_name = f"{unique_names[0]} ほか{len(unique_names) - 1}名"
             logger.warning(
                 f"同一メール {email!r} に異なる個人名が紐づいています: "
-                f"{unique_names} → '{person_name}' で下書き作成"
+                f"{[mask_name(n) for n in unique_names]} → "
+                f"'{mask_name(person_name)}' で下書き作成"
             )
         try:
             _create_draft_with_size_guard(
@@ -549,8 +552,8 @@ def passthrough_attachment(
         )
 
         logger.info(
-            f"添付資料コピー完了: {mgmt_num} / {clinic_name} / "
-            f"{person_name} / {file_name}"
+            f"添付資料コピー完了: {mgmt_num} / {mask_name(clinic_name)} / "
+            f"{mask_name(person_name)} / {file_name}"
         )
         stats["success"] += 1
 

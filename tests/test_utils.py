@@ -13,6 +13,7 @@ from src.utils import (
     mask_email,
     normalize_name_for_match,
     sanitize_filename,
+    mask_name,
 )
 
 
@@ -430,6 +431,31 @@ class TestEnsureFontsRetry(unittest.TestCase):
             self.assertTrue(bold.exists())
             self.assertEqual(bold.read_bytes(), b"VARFONT")  # Regular と同一実体
             mock_get.assert_not_called()  # ネットワーク不要
+
+
+class TestMaskName(unittest.TestCase):
+    """``mask_name``: 氏名・医院名のログ用マスク（Phase 23 PR-5）。
+
+    ログは 30 日保持の GHA アーティファクトに残るため、個人を特定できる
+    氏名（および医院名）を平文で出さない。先頭 1 文字は運用者の突合手がかり
+    として残す（mask_email と同じ思想）。
+    """
+
+    def test_typical_japanese_name(self):
+        self.assertEqual(mask_name("田中太郎"), "田＊＊＊")
+
+    def test_clinic_name(self):
+        self.assertEqual(mask_name("山田歯科医院"), "山＊＊＊＊＊")
+
+    def test_single_char_name_still_masked(self):
+        # 1 文字でも必ず ＊ を付ける（完全平文を残さない）
+        self.assertEqual(mask_name("田"), "田＊")
+
+    def test_empty_returns_placeholder(self):
+        self.assertEqual(mask_name(""), "＊")
+
+    def test_ascii_name(self):
+        self.assertEqual(mask_name("Taro"), "T＊＊＊")
 
 
 if __name__ == "__main__":
