@@ -21,6 +21,7 @@ from src.config import (
     GOOGLE_SCOPES,
 )
 from src.utils import mask_email
+from src.utils import mask_name
 
 logger = logging.getLogger("jissen_comment")
 
@@ -169,7 +170,7 @@ def create_draft(
                 f", 添付{len(path_list)}件" if len(path_list) > 1 else ""
             )
             logger.info(
-                f"Gmail下書き作成: {person_name}様 "
+                f"Gmail下書き作成: {mask_name(person_name)}様 "
                 f"(TO={mask_email(to_email)}{cc_log}{attach_log}) "
                 f"→ draft_id={draft_id}"
             )

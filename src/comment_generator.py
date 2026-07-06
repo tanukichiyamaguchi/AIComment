@@ -20,6 +20,7 @@ from src.config import (
     CLAUDE_MAX_TOKENS,
     CLAUDE_TEMPERATURE,
 )
+from src.utils import mask_name
 
 logger = logging.getLogger("jissen_comment")
 
@@ -609,8 +610,8 @@ def generate_comment_with_metadata(
                 raise ValueError("コメントが空です")
 
             logger.info(
-                f"抽出完了: clinic='{data['clinic_name']}' "
-                f"person='{data['person_name']}' "
+                f"抽出完了: clinic='{mask_name(data['clinic_name'])}' "
+                f"person='{mask_name(data['person_name'])}' "
                 f"title='{data['sample_title']}' "
                 f"comment={len(data['comment'])}文字"
             )
@@ -872,7 +873,7 @@ def get_batch_results(
         results[custom_id] = data
         logger.info(
             f"Batch結果取得: {custom_id} "
-            f"clinic='{data['clinic_name']}' person='{data['person_name']}' "
+            f"clinic='{mask_name(data['clinic_name'])}' person='{mask_name(data['person_name'])}' "
             f"title='{data['sample_title']}'"
         )
 

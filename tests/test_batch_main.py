@@ -1079,7 +1079,9 @@ class TestStep4MasterSheetIntegration(unittest.TestCase):
         joined = "\n".join(log_ctx.output)
         self.assertIn("参加者マスター未登録", joined)
         self.assertIn("111", joined)
-        self.assertIn("山田歯科", joined)
+        # PII ログマスク（PR-5）: 医院名は先頭1文字+＊で伏せられる
+        self.assertIn("山＊", joined)
+        self.assertNotIn("山田歯科", joined)
 
     @patch("src.batch_main.pdf_merger")
     @patch("src.batch_main.pdf_creator")

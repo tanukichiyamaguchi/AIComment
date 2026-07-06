@@ -57,6 +57,23 @@ def setup_logging() -> logging.Logger:
     return logger
 
 
+def mask_name(name: str) -> str:
+    """氏名・医院名をマスクする（ログ出力用）。
+
+    ログは GHA アーティファクトとして 30 日間保持され、リポジトリの read
+    権限保持者は誰でもダウンロードできる。個人を特定できる氏名（および
+    医院名）を平文で残さないため、先頭 1 文字 + ``＊`` に伏せる。
+    先頭 1 文字を残すのは、運用者が「どの人の件か」をシート・Drive と
+    突き合わせる手がかりのため（``mask_email`` と同じ思想）。
+
+    マスクは **ログ専用**。シート・ファイル名・Drive フォルダ名は業務データ
+    なので平文のまま（そこを伏せると成果物が壊れる）。
+    """
+    if not name:
+        return "＊"
+    return name[0] + "＊" * max(len(name) - 1, 1)
+
+
 def mask_email(email: str) -> str:
     """メールアドレスをマスクする（ログ出力用）。"""
     if "@" not in email:

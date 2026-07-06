@@ -41,6 +41,7 @@ Phase 22（耐障害系）の次段。ユーザー優先領域「処理速度」
       二重読みを 1 読みに。空結果も同一オブジェクトでキャッシュ）
 - [x] config._get_int 新設（不正値は既定へ fail-soft）
 - [x] pytest 725 → 740 件 pass / mypy clean
+- [x] PR #62 マージ済み（2026-07-06）
 
 ### PR-3: 出力品質（完了）
 - [x] PR #60 マージ済み（2026-07-06）
@@ -50,11 +51,20 @@ Phase 22（耐障害系）の次段。ユーザー優先領域「処理速度」
       本文下限を導出: box_y+40mm → 画像帯上端+5mm クリアランス）
 - [x] pytest 712 → 719 件 pass / mypy clean
 
-### PR-4: workflow入力拡張（未着手）
-- [ ] step choice に prepare/submit/pdfs 追加、poll_max_minutes 入力追加
+### PR-4: workflow入力拡張（完了 2026-07-06）
+- [x] step choice に prepare/submit/pdfs を追加（batch-orchestrator の分割実行を
+      dispatch から実行可能に。logs/ 手動復元が前提の上級操作と明記）
+- [x] poll_max_minutes 入力（既定300）を追加し --poll-max-minutes に配線
+      （Batchモードのみ。step=all の既存経路は不変）
 
-### PR-5: PIIログマスク（未着手・PR-3の後）
-- [ ] `mask_name` 追加、氏名・医院名を含むログ呼び出しをマスク
+### PR-5: PIIログマスク（完了 2026-07-06）
+- [x] `utils.mask_name`（先頭1文字+＊）を追加
+- [x] 氏名・医院名を平文出力する全ログを棚卸ししてマスク:
+      comment_generator 抽出/Batch結果ログ / main・batch_main 完了ログ /
+      run_common（医院名解決・下書き蓄積・分割下書き・添付コピー・マスター解決）/
+      gmail_client 下書き作成ログ / sheets_client（出力一覧追記・個人名lookup系）
+- [x] 対象はログのみ（シート・ファイル名・Drive階層は業務データなので平文のまま）
+- [x] pytest 740 件 pass（mask_name 単体5 + 既存2件をマスク期待値に更新）/ mypy clean
 
 ### バックログ（見送り・記録のみ）
 - OCR フォールバック（スキャンPDF救済、工数L）/ コスト予算ゲート / 定期実行cron /

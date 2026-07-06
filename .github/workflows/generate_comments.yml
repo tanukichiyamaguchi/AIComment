@@ -24,16 +24,23 @@ on:
         type: boolean
         default: false
       step:
-        description: 'Batch step (all=通常, results=完了済みバッチから回収＝結果取得→Drive再走査→PDF/Drive/シートまで完走). resultsを使うときは batch_id 必須。'
+        description: 'Batch step (all=通常, results=完了済みバッチから回収. prepare/submit/pdfs は logs/ アーティファクトの手動復元が前提の分割実行=上級操作). resultsを使うときは batch_id 必須。'
         type: choice
         default: 'all'
         options:
           - all
           - results
+          - prepare
+          - submit
+          - pdfs
       batch_id:
         description: 'step=results 時のみ使用。回収したい完了済みバッチID（例 msgbatch_xxx、カンマ区切りで複数可）。'
         type: string
         default: ''
+      poll_max_minutes:
+        description: 'Batchモードの結果ポーリング最大待機（分）。GHA 6h 上限内で自発タイムアウトさせる。タイムアウトしても次回 step=all が自動回収する。'
+        type: number
+        default: 300
 
 permissions:
   contents: read
@@ -82,33 +89,46 @@ jobs:
           fi
 
           STEP_FLAG=""
-          if [ "${{ inputs.step }}" = "results" ]; then
-            # results モードは batch_main 専用（通常モードには step 概念がない）。
+          if [ "${{ inputs.step }}" != "all" ]; then
+            # step 指定は batch_main 専用（通常モードには step 概念がない）。
             if [ "${{ inputs.batch_mode }}" != "true" ]; then
-              echo "::error::step=results は Batch モード (batch_mode=true) でのみ使えます"
+              echo "::error::step=${{ inputs.step }} は Batch モード (batch_mode=true) でのみ使えます"
               exit 1
             fi
-            if [ -z "${{ inputs.batch_id }}" ]; then
-              echo "::error::step=results を使うときは batch_id 必須（例 msgbatch_xxx）"
-              exit 1
+            if [ "${{ inputs.step }}" = "results" ]; then
+              if [ -z "${{ inputs.batch_id }}" ]; then
+                echo "::error::step=results を使うときは batch_id 必須（例 msgbatch_xxx）"
+                exit 1
+              fi
+              STEP_FLAG="--step results --batch-id ${{ inputs.batch_id }}"
+            else
+              # prepare / submit / pdfs: batch-orchestrator の分割実行運用。
+              # 前段の logs/（batch_prep.json 等）が必要な step は、アーティ
+              # ファクトから logs/ を手動復元した上で使う（description 参照）。
+              STEP_FLAG="--step ${{ inputs.step }}"
             fi
-            STEP_FLAG="--step results --batch-id ${{ inputs.batch_id }}"
+          fi
+
+          # 結果ポーリングの最大待機（Batch モードのみ。src.main には無い引数）。
+          POLL_FLAG=""
+          if [ "${{ inputs.batch_mode }}" = "true" ]; then
+            POLL_FLAG="--poll-max-minutes ${{ inputs.poll_max_minutes }}"
           fi
 
           if [ -n "${{ inputs.target_folder }}" ]; then
             $ENTRY \
               --target-folder "${{ inputs.target_folder }}" \
               --test-count ${{ inputs.test_count }} \
-              $STEP_FLAG
+              $STEP_FLAG $POLL_FLAG
           elif [ -n "${{ inputs.profile }}" ]; then
             $ENTRY \
               --profile "${{ inputs.profile }}" \
               --test-count ${{ inputs.test_count }} \
-              $STEP_FLAG
+              $STEP_FLAG $POLL_FLAG
           else
             $ENTRY \
               --test-count ${{ inputs.test_count }} \
-              $STEP_FLAG
+              $STEP_FLAG $POLL_FLAG
           fi
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
