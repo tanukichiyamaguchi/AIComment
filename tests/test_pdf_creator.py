@@ -291,5 +291,66 @@ class TestTruncationWarning(unittest.TestCase):
         self.assertEqual(truncation_warnings, [])
 
 
+class TestBodyImageNoOverlap(unittest.TestCase):
+    """本文がじっせん君画像帯（右下）と重ならないことの end-to-end 検証
+    （Phase 23 PR-3b）。
+
+    画像は箱下端 +10mm から 35mm の高さを占有する（上端 = 下端から 70mm）。
+    旧実装は本文を 65mm（baseline 基準）まで描いており、満幅の最下行が画像に
+    食い込み得た。修正後は全文字が画像帯上端より上で終わる。
+    """
+
+    # 画像帯上端: BOX_MARGIN(25mm) + _IMG_BOTTOM_OFFSET(10mm) + _IMG_SIZE(35mm)
+    # = 70mm を pt に換算（1mm = 72/25.4 pt）
+    _IMG_TOP_PT = 70 * 72 / 25.4  # ≈ 198.43pt
+
+    def test_long_comment_chars_stay_above_image_band(self):
+        """超長文でも全文字（descender 含む）が画像帯より上にある。"""
+        long_comment = "\n".join("あ" * 60 for _ in range(40))  # 確実に下限到達
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "overlap.pdf"
+            create_comment_page(
+                comment=long_comment,
+                clinic_name="山田歯科",
+                person_name="田中太郎",
+                output_path=output,
+            )
+            with pdfplumber.open(output) as pdf:
+                chars = pdf.pages[0].chars
+        self.assertTrue(chars)  # 本文が描画されている
+        min_y0 = min(ch["y0"] for ch in chars)
+        # 全文字の下端が画像帯上端より上（クリアランス 5mm の内側）
+        self.assertGreater(min_y0, self._IMG_TOP_PT)
+
+    def test_normal_comment_still_fits_without_truncation(self):
+        """350 字 + 段落改行は新しい下限でも切り捨てなしで収まる（収容力回帰）。"""
+        comment = "\n".join("あ" * 70 for _ in range(5))  # 350 字・5 段落
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "fits.pdf"
+            logger = logging.getLogger("jissen_comment")
+            records: list[logging.LogRecord] = []
+            handler = logging.Handler()
+            handler.emit = records.append  # type: ignore[assignment]
+            logger.addHandler(handler)
+            try:
+                create_comment_page(
+                    comment=comment,
+                    clinic_name="山田歯科",
+                    person_name="田中太郎",
+                    output_path=output,
+                )
+            finally:
+                logger.removeHandler(handler)
+            with pdfplumber.open(output) as pdf:
+                text = pdf.pages[0].extract_text() or ""
+        truncation_warnings = [
+            r for r in records
+            if r.levelno >= logging.WARNING and "切り捨て" in r.getMessage()
+        ]
+        self.assertEqual(truncation_warnings, [])
+        # 350 文字の「あ」が全て描画されている
+        self.assertEqual(text.count("あ"), 350)
+
+
 if __name__ == "__main__":
     unittest.main()

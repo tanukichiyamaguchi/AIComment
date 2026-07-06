@@ -470,8 +470,27 @@ def _build_extraction_request_params(
     }
 
 
-def _parse_extraction(text: str) -> dict[str, str]:
-    """JSONテキストをパースし、必須フィールドを文字列として補完する。"""
+# scrub 後コメントの下限文字数（品質ガード）。プロンプトは 200〜350 字を要求
+# するが、固有名詞スクラブ（``_scrub_names_from_comment``）が本文中に混入した
+# 医院名・氏名を機械除去した結果、極端に短くなるケースがある。要求の半分未満
+# を「壊滅的な欠損」として WARNING で可視化する（P-001: 無言の劣化を出荷しない）。
+#
+# **warning-only（失敗化しない）の設計判断**: Batch モードで失敗扱いにすると
+# failed_ids → 出力シート未記録 → 次ランで再投入 → 同じ結果なら恒久再投入
+# ループ（毎回課金だけ発生）になる。これを塞ぐには「失敗管理番号の永続記録」
+# という新しい状態が必要になり Simplicity First に反するため、短いコメントも
+# 成果物として出荷し、ログ（30 日保持のアーティファクト）で運用者が追跡する。
+_MIN_COMMENT_CHARS = 100
+
+
+def _parse_extraction(text: str, *, context: str = "") -> dict[str, str]:
+    """JSONテキストをパースし、必須フィールドを文字列として補完する。
+
+    Args:
+        text: Claude 応答の JSON テキスト
+        context: ログ用の識別子（通常モード: PDF ファイル名 / Batch: custom_id）。
+            品質ガードの警告がどの item のものか追跡できるようにする。
+    """
     try:
         data = json.loads(text)
     except json.JSONDecodeError as e:
@@ -481,11 +500,27 @@ def _parse_extraction(text: str) -> dict[str, str]:
     if not isinstance(data, dict):
         raise ValueError(f"Claude応答がオブジェクトではありません: {text[:200]}")
     extracted = {field: str(data.get(field, "") or "").strip() for field in _EXTRACTED_FIELDS}
+
+    raw_len = len(extracted["comment"])
     extracted["comment"] = _scrub_names_from_comment(
         comment=extracted["comment"],
         clinic_name=extracted["clinic_name"],
         person_name=extracted["person_name"],
     )
+    scrubbed_len = len(extracted["comment"])
+    context_note = f" ({context})" if context else ""
+    if raw_len and scrubbed_len < raw_len:
+        # 固有名詞が本文に混入していた証跡。頻発するならプロンプト調整の材料。
+        logger.info(
+            f"固有名詞スクラブでコメントを短縮: "
+            f"{raw_len} → {scrubbed_len}文字{context_note}"
+        )
+    if 0 < scrubbed_len < _MIN_COMMENT_CHARS:
+        logger.warning(
+            f"コメントが規定（200〜350字）より極端に短い: {scrubbed_len}文字"
+            f"（scrub 前 {raw_len}文字）{context_note}。"
+            f"このまま PDF 化されます（ログで追跡・必要なら該当行を削除して再実行）。"
+        )
     return extracted
 
 
@@ -563,7 +598,7 @@ def generate_comment_with_metadata(
                     continue
                 raise ValueError("API応答が空です")
 
-            data = _parse_extraction(text_blocks[0].text)
+            data = _parse_extraction(text_blocks[0].text, context=pdf_filename)
             if not data["comment"]:
                 logger.warning(
                     f"コメントが空です (試行{attempt + 1}/{max_retries + 1})"
@@ -823,7 +858,7 @@ def get_batch_results(
             continue
 
         try:
-            data = _parse_extraction(text_blocks[0].text)
+            data = _parse_extraction(text_blocks[0].text, context=custom_id)
         except ValueError as e:
             logger.error(f"Batch結果のJSONパース失敗: {custom_id} - {e}")
             failed_ids.append(custom_id)

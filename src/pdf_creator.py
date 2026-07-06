@@ -27,6 +27,13 @@ NAME_FONT_SIZE = 13
 BODY_FONT_SIZE = 11
 LINE_HEIGHT = BODY_FONT_SIZE * 1.8
 
+# じっせん君画像（右下配置）のジオメトリ。本文の描画下限はこの画像帯から導出
+# する（定数を重複させると、画像サイズ変更時に本文と画像が重なる不変式が
+# 黙って壊れるため）。
+_IMG_SIZE = 35 * mm
+_IMG_BOTTOM_OFFSET = 10 * mm  # 枠下端から画像下端までの余白
+_BODY_BOTTOM_CLEARANCE = 5 * mm  # 本文最下行と画像上端の間に確保する余白
+
 _fonts_registered = False
 
 
@@ -152,9 +159,16 @@ def create_comment_page(
 
     wrapped_lines = _wrap_text(comment, "NotoSansJP", BODY_FONT_SIZE, content_w)
 
+    # 本文の描画下限。じっせん君画像は箱下端 +_IMG_BOTTOM_OFFSET から
+    # _IMG_SIZE の高さを占有するため、その上端 + クリアランスより下には
+    # 本文を描かない（長文時に最下行が画像と重なる問題の回避）。
+    # 旧実装の固定値 box_y + 40mm は画像上端（box_y + 45mm）より低く、
+    # 満幅の最下行が画像に食い込み得た。
+    body_min_y = box_y + _IMG_BOTTOM_OFFSET + _IMG_SIZE + _BODY_BOTTOM_CLEARANCE
+
     drawn_lines = 0
     for line in wrapped_lines:
-        if y < box_y + 40 * mm:  # じっせん君画像分の余白を確保
+        if y < body_min_y:
             break
         c.drawString(content_x, y, line)
         y -= LINE_HEIGHT
@@ -172,10 +186,10 @@ def create_comment_page(
 
     # ── じっせん君画像（右下） ──
     if JISSEN_KUN_IMAGE.exists():
-        img_width = 35 * mm
-        img_height = 35 * mm
+        img_width = _IMG_SIZE
+        img_height = _IMG_SIZE
         img_x = box_x + box_w - 15 * mm - img_width
-        img_y = box_y + 10 * mm
+        img_y = box_y + _IMG_BOTTOM_OFFSET
         try:
             c.drawImage(
                 str(JISSEN_KUN_IMAGE),
