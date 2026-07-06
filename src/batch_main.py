@@ -517,6 +517,25 @@ def step2_submit_batch(
 # 再実行が自動で回収から再開する（再投入・二重課金なし）。
 _DEFAULT_POLL_MAX_WAIT_SECONDS = 5 * 60 * 60
 
+# ポーリング残量計算の最小フロア（秒）。deadline を過ぎていても 0 を渡すと
+# ポーリングが一度も試行されずに即タイムアウトしてしまうため、最低 60 秒は
+# 確保する（step3_wait_and_get_results / _resume_open_batches の per-batch
+# 計算と同じフロア）。
+_MIN_POLL_SECONDS = 60
+
+
+def _remaining_seconds(deadline: float) -> int:
+    """``deadline``（``time.monotonic()`` 基準）までの残り秒数を返す。
+
+    ``run()`` は ``_resume_open_batches`` と ``_collect_results_for_batches``
+    の両方にポーリング予算を渡すが、両者に ``poll_max_seconds`` を独立に
+    満額渡すと合計待機が GHA の 6h ジョブ上限を超えてジョブ kill される
+    （resume の回収と新規バッチの回収は同じランの中で直列に起きるため、
+    本来は 1 つの予算を分け合うべき）。``run()`` が 1 本の deadline を持ち、
+    本関数経由で「その時点で残っている予算」を都度計算して渡す。
+    """
+    return max(int(deadline - time.monotonic()), _MIN_POLL_SECONDS)
+
 
 def step3_wait_and_get_results(
     batch_id: str,
@@ -682,7 +701,10 @@ def step4_generate_pdfs(
             f"{len(step4_processed)} 件（重複処理を防ぐため）"
         )
 
-    stats = {"success": 0, "error": 0, "missing": 0, "skip_already_processed": 0}
+    stats = {
+        "success": 0, "error": 0, "missing": 0,
+        "skip_already_processed": 0, "skip_unsubmitted": 0,
+    }
 
     # 添付資料パススルー用の対応表。メイン PDF の処理ループで構築し、
     # ループ後に添付資料をこの表で引いて同じ出力フォルダへコピーする。
@@ -730,13 +752,40 @@ def step4_generate_pdfs(
 
     for item in items:
         custom_id = item["custom_id"]
+        pdf_file_name = item.get("pdf_file_name", "")
+        # mgmt_num はどちらの分岐（results 有無）でも必要なため先に抽出する。
+        mgmt_num = extract_management_number(pdf_file_name)
+
         if custom_id not in results:
-            logger.warning(f"コメント未取得: {custom_id}")
-            stats["missing"] += 1
+            # results に無い item は 3 通りに分類する。回収実行
+            # （``--step results --batch-id`` / 自動レジューム）では items が
+            # ``reconstruct_items_from_drive`` による Drive 全件再走査で作られる
+            # ため、「今回のバッチには含まれない過去処理済み PDF」や「そもそも
+            # 投入されなかった PDF」が items に混入する。これらを無条件で
+            # missing 扱いすると、1000 件規模の回収実行で無関係な PDF が大量に
+            # 「コメント未取得」警告 + missing 集計され、完了マーカーの
+            # 「未取得 N 件」が実態と乖離する（過去に処理済みなのに「未取得」に
+            # 見える）。
+            if mgmt_num and mgmt_num in step4_processed:
+                # 過去ラン（または今回の別バッチ）で処理済み。CB-3 と同じ判定
+                # だが結果を伴わないため per-item ログは出さない（回収実行での
+                # ログ洪水を防ぐ）。
+                stats["skip_already_processed"] += 1
+            elif not mgmt_num:
+                # 管理番号を抽出できないファイル（Drive 再走査でのみ発生し得る。
+                # step1 の通常経路では select_new_targets が事前に除外済み）。
+                logger.info(
+                    f"未投入ファイルをスキップ（管理番号抽出不可のため投入対象"
+                    f"外だった可能性）: {pdf_file_name}"
+                )
+                stats["skip_unsubmitted"] += 1
+            else:
+                # 投入されたはずなのに結果が無い＝真の missing。
+                logger.warning(f"コメント未取得: {custom_id} ({pdf_file_name})")
+                stats["missing"] += 1
             continue
 
         meta = results[custom_id]
-        pdf_file_name = item.get("pdf_file_name", "")
         clinic_name_from_ai = meta["clinic_name"] or "unknown_clinic"
         person_name = meta["person_name"] or "unknown_person"
         sample_title = meta["sample_title"] or Path(pdf_file_name).stem or "untitled"
@@ -748,7 +797,6 @@ def step4_generate_pdfs(
         # ``find_or_create_clinic_folder`` 側で旧来の名前ベース照合に
         # フォールバックする。
         clinic_number = extract_clinic_number(pdf_file_name)
-        mgmt_num = extract_management_number(pdf_file_name)
         if not mgmt_num:
             logger.warning(
                 f"管理番号をファイル名から抽出できません"
@@ -895,7 +943,9 @@ def step4_generate_pdfs(
     logger.info(
         f"Step 4完了: 成功 {stats['success']}/{total}件, "
         f"エラー {stats['error']}/{total}件, "
-        f"未取得 {stats['missing']}/{total}件"
+        f"未取得 {stats['missing']}/{total}件 "
+        f"(処理済みスキップ {stats['skip_already_processed']}件, "
+        f"未投入スキップ {stats['skip_unsubmitted']}件)"
     )
 
     # 出力一覧シートの最終行に「完了」マーカーを 1 行追加（fail-soft）。
@@ -1180,6 +1230,12 @@ def run(
         if batch_id else []
     )
     poll_max_seconds = poll_max_minutes * 60
+    # run() 全体で 1 本の deadline を持つ。resume（回収）フェーズと通常フェーズの
+    # 結果待ちが両方走ると合計待機時間が GHA の 6h ジョブ上限を超え得るため、
+    # 「このラン全体でポーリングに使ってよい予算」を 1 つに固定し、各フェーズは
+    # ``_remaining_seconds`` でその時点の残量を取得する（P-030 と同じ思想:
+    # 予算枯渇時は安全にタイムアウトし、次回実行の自動レジュームに引き継ぐ）。
+    poll_deadline = time.monotonic() + poll_max_seconds
 
     # 回収判定: 明示的に ``--batch-id`` を渡した ``results`` 実行だけを「回収」と
     # みなし、step4 まで完走させる。``batch_id`` を ``batch_id.txt`` から補完する
@@ -1192,7 +1248,7 @@ def run(
     # 未回収バッチの自動レジューム（``step=all`` のみ）。ジョブ kill 後の
     # 再実行で全件再投入 → 二重課金になるのを防ぐ。
     if step == "all":
-        _resume_open_batches(cfg, poll_max_seconds)
+        _resume_open_batches(cfg, _remaining_seconds(poll_deadline))
 
     if step in ("all", "prepare"):
         items = step1_prepare(cfg, test_count=test_count)
@@ -1223,7 +1279,9 @@ def run(
     if step in ("all", "results"):
         if not batch_ids:
             batch_ids = _load_batch_ids_from_disk()
-        results = _collect_results_for_batches(batch_ids, poll_max_seconds)
+        results = _collect_results_for_batches(
+            batch_ids, _remaining_seconds(poll_deadline),
+        )
 
     if step in ("all", "pdfs") or is_recovery:
         # CB-2: step=pdfs / 回収を別 GHA 実行から呼ぶケース。in-memory results が

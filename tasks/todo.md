@@ -1,5 +1,45 @@
 # じっせん君コメントシステム - Task Tracker
 
+## Phase 23: 処理速度 × 出力品質・正確性の改善（2026-07-02〜）
+
+### ゴール
+Phase 22（耐障害系）の次段。ユーザー優先領域「処理速度」「出力品質・正確性」に絞った
+修正を優先度順の複数 PR で実施（Gmail 関連・コスト予算ゲート・定期実行/通知はスコープ外）。
+6 レンズ監査 + 広域スイープ（Explore）→ 実装設計（Plan）で計画策定。
+計画ファイル: `/root/.claude/plans/swift-strolling-crystal.md`
+
+### PR-1: 正確性バグ修正（完了）
+- [x] **1a: 回収時 missing 誤報** — `--step results --batch-id`回収/自動レジュームで
+      items が Drive 全件再走査から作られるため、過去処理済み PDF が「コメント未取得」
+      誤報される問題を修正（3分岐: 処理済み/管理番号抽出不可/真のmissing、P-032）
+- [x] **1b: 時間バジェット二重消費** — resume フェーズと通常フェーズが各々満額
+      poll_max_seconds を消費し合計で GHA 6h 超過し得た問題を、run() 単一 deadline +
+      `_remaining_seconds()` で解消（P-033）
+- [x] **1c: get_open_batch_ids の O(n²)** — list 線形探索を挿入順保持 dict に置換
+- [x] pytest 704 → 712 件 pass / mypy clean
+- [ ] ドラフト PR 作成
+
+### PR-2: 処理速度（未着手・PR-1マージ後）
+- [ ] 2a: step1 ダウンロード並列化（ThreadPoolExecutor、既定 workers=1 で現状維持、
+      env `STEP1_DOWNLOAD_WORKERS` で本番のみ ON）
+- [ ] 2b: Drive/Sheets サービスの thread-local キャッシュ（build+token refresh 削減）
+- [ ] 2c: `read_master_records` のプロセス内メモ化（step1/step4 二重読み解消）
+
+### PR-3: 出力品質（未着手・PR-1と並行可）
+- [ ] 3a: コメント品質ガード（`_MIN_COMMENT_CHARS=100`、warning-only。batch失敗化は
+      恒久再投入ループのリスクがあるため見送り）
+- [ ] 3b: pdf_creator の本文/じっせん君画像の重なり回避（本文下端を40mm→50mm相当に）
+
+### PR-4: workflow入力拡張（未着手）
+- [ ] step choice に prepare/submit/pdfs 追加、poll_max_minutes 入力追加
+
+### PR-5: PIIログマスク（未着手・PR-3の後）
+- [ ] `mask_name` 追加、氏名・医院名を含むログ呼び出しをマスク
+
+### バックログ（見送り・記録のみ）
+- OCR フォールバック（スキャンPDF救済、工数L）/ コスト予算ゲート / 定期実行cron /
+  GITHUB_STEP_SUMMARY / 失敗通知 / mypy strict化 / batch_main分割リファクタ 等
+
 ## Phase 22: 大量PDF運用の耐障害監査と修復（2026-07-02）
 
 ### ゴール

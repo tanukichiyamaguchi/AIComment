@@ -1667,6 +1667,24 @@ class TestBatchStateRecords(unittest.TestCase):
         )
 
     @patch("src.sheets_client.get_sheets_service")
+    def test_duplicate_submitted_rows_deduped_preserving_first_order(
+        self, mock_get_service,
+    ):
+        """append-only ログに同一バッチの重複投入済み行があっても、初出順で
+        1 回だけ返す（dict ベースの重複除去が list 版と同じ挙動であることの
+        回帰確認、Phase 23 PR-1c）。"""
+        mock_get_service.return_value = self._service_with_state_rows([
+            ["t1", "出力A", "msgbatch_1", "投入済み"],
+            ["t2", "出力A", "msgbatch_2", "投入済み"],
+            ["t3", "出力A", "msgbatch_1", "投入済み"],  # 重複行
+            ["t4", "出力A", "msgbatch_3", "投入済み"],
+        ])
+        self.assertEqual(
+            sheets_client.get_open_batch_ids("出力A", spreadsheet_id="ssid"),
+            ["msgbatch_1", "msgbatch_2", "msgbatch_3"],
+        )
+
+    @patch("src.sheets_client.get_sheets_service")
     def test_empty_when_state_sheet_missing(self, mock_get_service):
         """``_バッチ管理`` タブ未作成（初回運用）なら空リスト。"""
         service = MagicMock()

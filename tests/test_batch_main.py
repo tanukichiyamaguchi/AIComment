@@ -2313,5 +2313,205 @@ class TestStep1FailFast(unittest.TestCase):
         self.assertIn("すべての準備に失敗", str(ctx.exception))
 
 
+class TestStep4MissingReportAccuracy(unittest.TestCase):
+    """回収実行での「コメント未取得」誤報を修正（Phase 23 PR-1a）。
+
+    ``--step results --batch-id`` 回収・自動レジュームは items を
+    ``reconstruct_items_from_drive``（Drive 全メイン PDF 再走査）で作るため、
+    今回のバッチに含まれない過去処理済み PDF や、そもそも投入されなかった
+    PDF が items に混入する。これらを無条件で missing 扱いすると、回収実行の
+    完了マーカー「未取得 N件」が実態と乖離する。
+    """
+
+    @patch("src.batch_main.pdf_merger")
+    @patch("src.batch_main.pdf_creator")
+    @patch("src.batch_main.drive_client")
+    @patch("src.batch_main.sheets_client")
+    @patch("src.batch_main.ensure_fonts")
+    def test_recovery_scenario_classifies_three_cases_correctly(
+        self, mock_fonts, mock_sheets, mock_drive, mock_creator, mock_merger,
+    ):
+        _install_step4_mocks(mock_drive, mock_merger, mock_sheets)
+        # 001-01-0: 過去ラン処理済み（results に無い・Drive 再走査で混入）
+        # 999-99-9: 管理番号抽出不可（Drive 再走査でのみ発生し得る）
+        # 003-03-0: 新規・今回のバッチで成功
+        items = _make_batch_items([
+            "001-01-0旧事例.pdf",
+            "noprefixファイル.pdf",
+            "003-03-0新規事例.pdf",
+        ])
+        # _make_batch_items は custom_id=item_0001.. の連番。3件目だけ結果を持つ。
+        results = {items[2]["custom_id"]: {
+            "clinic_name": "山田歯科", "person_name": "田中太郎",
+            "sample_title": "事例タイトル", "comment": "コメント本文",
+        }}
+        mock_sheets.get_processed_management_numbers.return_value = {"001-01-0"}
+
+        with self.assertLogs("jissen_comment", level="INFO") as log_ctx:
+            batch_main.step4_generate_pdfs(_make_profile(), results, items=items)
+
+        joined = "\n".join(log_ctx.output)
+        self.assertNotIn("コメント未取得", joined)
+        # メイン処理は 1 件（新規分）だけ upload される
+        self.assertEqual(mock_drive.upload_pdf_to_clinic_person.call_count, 1)
+
+    @patch("src.batch_main.pdf_merger")
+    @patch("src.batch_main.pdf_creator")
+    @patch("src.batch_main.drive_client")
+    @patch("src.batch_main.sheets_client")
+    @patch("src.batch_main.ensure_fonts")
+    def test_true_missing_still_warns(
+        self, mock_fonts, mock_sheets, mock_drive, mock_creator, mock_merger,
+    ):
+        """投入されたはずなのに結果が無い真の missing は従来通り警告する。"""
+        _install_step4_mocks(mock_drive, mock_merger, mock_sheets)
+        items = _make_batch_items(["001-01-0新規事例.pdf"])
+        mock_sheets.get_processed_management_numbers.return_value = set()
+
+        with self.assertLogs("jissen_comment", level="WARNING") as log_ctx:
+            batch_main.step4_generate_pdfs(_make_profile(), results={}, items=items)
+
+        self.assertIn("コメント未取得", "\n".join(log_ctx.output))
+
+    @patch("src.batch_main.pdf_merger")
+    @patch("src.batch_main.pdf_creator")
+    @patch("src.batch_main.drive_client")
+    @patch("src.batch_main.sheets_client")
+    @patch("src.batch_main.ensure_fonts")
+    def test_processed_without_results_skips_silently(
+        self, mock_fonts, mock_sheets, mock_drive, mock_creator, mock_merger,
+    ):
+        """過去ラン処理済みかつ results 無しは per-item WARNING を出さない。"""
+        _install_step4_mocks(mock_drive, mock_merger, mock_sheets)
+        items = _make_batch_items(["001-01-0旧事例.pdf"])
+        mock_sheets.get_processed_management_numbers.return_value = {"001-01-0"}
+
+        import logging
+        logger = logging.getLogger("jissen_comment")
+        records: list[logging.LogRecord] = []
+        handler = logging.Handler()
+        handler.emit = records.append  # type: ignore[assignment]
+        logger.addHandler(handler)
+        try:
+            batch_main.step4_generate_pdfs(_make_profile(), results={}, items=items)
+        finally:
+            logger.removeHandler(handler)
+
+        warnings = [r for r in records if r.levelno >= logging.WARNING]
+        self.assertEqual(warnings, [])
+        mock_drive.upload_pdf_to_clinic_person.assert_not_called()
+
+    @patch("src.batch_main.pdf_merger")
+    @patch("src.batch_main.pdf_creator")
+    @patch("src.batch_main.drive_client")
+    @patch("src.batch_main.sheets_client")
+    @patch("src.batch_main.ensure_fonts")
+    def test_unsubmitted_no_mgmt_number_skips_without_warning(
+        self, mock_fonts, mock_sheets, mock_drive, mock_creator, mock_merger,
+    ):
+        """管理番号抽出不可の未投入ファイルは INFO のみで WARNING は出さない。"""
+        _install_step4_mocks(mock_drive, mock_merger, mock_sheets)
+        items = _make_batch_items(["管理番号なしファイル.pdf"])
+        mock_sheets.get_processed_management_numbers.return_value = set()
+
+        import logging
+        logger = logging.getLogger("jissen_comment")
+        records: list[logging.LogRecord] = []
+        handler = logging.Handler()
+        handler.emit = records.append  # type: ignore[assignment]
+        logger.addHandler(handler)
+        try:
+            batch_main.step4_generate_pdfs(_make_profile(), results={}, items=items)
+        finally:
+            logger.removeHandler(handler)
+
+        warnings = [r for r in records if r.levelno >= logging.WARNING]
+        self.assertEqual(warnings, [])
+
+
+class TestRunPollBudgetSharing(unittest.TestCase):
+    """resume フェーズと通常フェーズがポーリング予算を分け合う（Phase 23 PR-1b）。
+
+    従来は両フェーズに ``poll_max_seconds`` を独立に満額渡しており、両方
+    走ると合計待機が GHA の 6h ジョブ上限を超えて kill され得た。
+    """
+
+    @patch("src.batch_main.step4_generate_pdfs")
+    @patch("src.batch_main._collect_results_for_batches")
+    @patch("src.batch_main.step2_submit_batch")
+    @patch("src.batch_main.step1_prepare")
+    @patch("src.batch_main._resume_open_batches")
+    @patch("src.batch_main.discover.resolve_run_config")
+    def test_collect_receives_reduced_budget_after_resume_consumes_time(
+        self, mock_resolve, mock_resume, mock_step1, mock_step2,
+        mock_collect, mock_step4,
+    ):
+        mock_resolve.return_value = _make_profile()
+        mock_step1.return_value = _make_batch_items(["001-01-1a.pdf"])
+        mock_step2.return_value = ["msgbatch_1"]
+        mock_collect.return_value = {}
+
+        # monotonic: run() 冒頭の deadline 計算で 1 回、resume 呼び出し前に
+        # _remaining_seconds で 1 回、collect 呼び出し前にもう 1 回。
+        # 1 時間経過をシミュレートする。
+        clock = {"now": 0.0}
+
+        def _fake_monotonic():
+            return clock["now"]
+
+        with patch("src.batch_main.time.monotonic", side_effect=_fake_monotonic):
+            def _resume_side_effect(cfg, poll_max_seconds):
+                clock["now"] += 3600.0  # resume が 1h 消費
+
+            mock_resume.side_effect = _resume_side_effect
+            batch_main.run(
+                batch_mode=True, step="all", poll_max_minutes=300,  # 300分=18000秒
+            )
+
+        collect_call = mock_collect.call_args
+        remaining = collect_call.args[1]
+        # 18000 - 3600 = 14400 秒。多少の計算誤差を許容して近似確認。
+        self.assertAlmostEqual(remaining, 14400, delta=2)
+
+    @patch("src.batch_main.step4_generate_pdfs")
+    @patch("src.batch_main._collect_results_for_batches")
+    @patch("src.batch_main.step2_submit_batch")
+    @patch("src.batch_main.step1_prepare")
+    @patch("src.batch_main._resume_open_batches")
+    @patch("src.batch_main.discover.resolve_run_config")
+    def test_collect_gets_floor_seconds_when_budget_exhausted(
+        self, mock_resolve, mock_resume, mock_step1, mock_step2,
+        mock_collect, mock_step4,
+    ):
+        """resume が予算を使い切っても collect には最低 60 秒が渡る。"""
+        mock_resolve.return_value = _make_profile()
+        mock_step1.return_value = _make_batch_items(["001-01-1a.pdf"])
+        mock_step2.return_value = ["msgbatch_1"]
+        mock_collect.return_value = {}
+
+        clock = {"now": 0.0}
+
+        def _fake_monotonic():
+            return clock["now"]
+
+        with patch("src.batch_main.time.monotonic", side_effect=_fake_monotonic):
+            def _resume_side_effect(cfg, poll_max_seconds):
+                clock["now"] += 999999.0  # 予算を大幅に使い切る
+
+            mock_resume.side_effect = _resume_side_effect
+            batch_main.run(
+                batch_mode=True, step="all", poll_max_minutes=300,
+            )
+
+        remaining = mock_collect.call_args.args[1]
+        self.assertEqual(remaining, 60)
+
+    def test_remaining_seconds_helper(self):
+        with patch("src.batch_main.time.monotonic", return_value=100.0):
+            self.assertEqual(batch_main._remaining_seconds(1000.0), 900)
+            # deadline 超過時はフロア値
+            self.assertEqual(batch_main._remaining_seconds(50.0), 60)
+
+
 if __name__ == "__main__":
     unittest.main()
