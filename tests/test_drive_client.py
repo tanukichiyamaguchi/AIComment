@@ -977,5 +977,57 @@ class TestFolderResolutionCache(unittest.TestCase):
         self.assertEqual(service.files.return_value.create.call_count, 1)
 
 
+class TestServiceThreadLocalCache(unittest.TestCase):
+    """Drive サービスの thread-local キャッシュ（Phase 23 PR-2b）。
+
+    build()+認証+初回リフレッシュ（1 回あたり数百 ms）を API 呼び出しごとに
+    繰り返さない。並列 DL ではスレッドごとに独立サービス（httplib2 は
+    非スレッドセーフ）。
+    """
+
+    @patch("src.drive_client.get_drive_service")
+    def test_same_thread_builds_once(self, mock_build):
+        mock_build.return_value = MagicMock()
+        first = drive_client._cached_drive_service()
+        second = drive_client._cached_drive_service()
+        self.assertIs(first, second)
+        mock_build.assert_called_once()
+
+    @patch("src.drive_client.get_drive_service")
+    def test_reset_forces_rebuild(self, mock_build):
+        mock_build.return_value = MagicMock()
+        drive_client._cached_drive_service()
+        drive_client.reset_service_cache()
+        drive_client._cached_drive_service()
+        self.assertEqual(mock_build.call_count, 2)
+
+    @patch("src.drive_client.get_drive_service")
+    def test_each_thread_gets_own_service(self, mock_build):
+        import threading
+        mock_build.side_effect = lambda: MagicMock()
+        services = {}
+
+        def _grab(key):
+            services[key] = drive_client._cached_drive_service()
+
+        t1 = threading.Thread(target=_grab, args=("t1",))
+        t2 = threading.Thread(target=_grab, args=("t2",))
+        t1.start(); t2.start(); t1.join(); t2.join()
+
+        self.assertEqual(mock_build.call_count, 2)
+        self.assertIsNot(services["t1"], services["t2"])
+
+    @patch("src.drive_client.get_drive_service")
+    def test_download_pdf_reuses_cached_service(self, mock_build):
+        """download_pdf を 2 回呼んでも build は 1 回（実利用経路の確認）。"""
+        service = MagicMock()
+        mock_build.return_value = service
+        with patch("src.drive_client.MediaIoBaseDownload") as mock_dl:
+            mock_dl.return_value.next_chunk.return_value = (None, True)
+            drive_client.download_pdf("id_1")
+            drive_client.download_pdf("id_2")
+        mock_build.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()

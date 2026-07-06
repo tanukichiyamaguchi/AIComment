@@ -1854,5 +1854,94 @@ class TestEnsuredSheetsCache(unittest.TestCase):
         )
 
 
+class TestMasterRecordsMemoization(unittest.TestCase):
+    """read_master_records のプロセス内メモ化（Phase 23 PR-2c）。
+
+    batch の step1 strict ガード + step4 の二重読みを 1 読みに削減する
+    （同一ラン内でマスターは不変というスナップショット前提）。
+    """
+
+    def _service(self) -> MagicMock:
+        service = MagicMock()
+        service.spreadsheets.return_value.get.return_value.execute.return_value = {
+            "sheets": [{"properties": {"title": "参加者マスター"}}]
+        }
+        service.spreadsheets.return_value.values.return_value.get.return_value \
+            .execute.return_value = {
+                "values": [
+                    ["管理番号", "医院名", "参加者名", "会場", "メール"],
+                    ["001-01", "山田歯科", "田中太郎", "東京", "a@example.com"],
+                ]
+            }
+        return service
+
+    @patch("src.sheets_client.get_sheets_service")
+    def test_second_read_hits_cache(self, mock_get_service):
+        mock_get_service.return_value = self._service()
+        first = sheets_client.read_master_records(
+            spreadsheet_id="ssid", sheet_name="参加者マスター",
+        )
+        calls_after_first = mock_get_service.call_count
+        second = sheets_client.read_master_records(
+            spreadsheet_id="ssid", sheet_name="参加者マスター",
+        )
+        self.assertIs(first, second)
+        # 2 回目はサービス構築も API も呼ばれない
+        self.assertEqual(mock_get_service.call_count, calls_after_first)
+
+    @patch("src.sheets_client.get_sheets_service")
+    def test_cache_is_per_sheet(self, mock_get_service):
+        mock_get_service.return_value = self._service()
+        sheets_client.read_master_records(
+            spreadsheet_id="ssid", sheet_name="参加者マスター(A)",
+        )
+        values_get = (
+            mock_get_service.return_value.spreadsheets.return_value
+            .values.return_value.get
+        )
+        calls_after_first = values_get.call_count
+        sheets_client.read_master_records(
+            spreadsheet_id="ssid", sheet_name="参加者マスター(B)",
+        )
+        self.assertGreater(values_get.call_count, calls_after_first)
+
+    @patch("src.sheets_client.get_sheets_service")
+    def test_reset_forces_reread(self, mock_get_service):
+        mock_get_service.return_value = self._service()
+        sheets_client.read_master_records(
+            spreadsheet_id="ssid", sheet_name="参加者マスター",
+        )
+        values_get = (
+            mock_get_service.return_value.spreadsheets.return_value
+            .values.return_value.get
+        )
+        calls_after_first = values_get.call_count
+        sheets_client.reset_master_records_cache()
+        sheets_client.read_master_records(
+            spreadsheet_id="ssid", sheet_name="参加者マスター",
+        )
+        self.assertGreater(values_get.call_count, calls_after_first)
+
+    @patch("src.sheets_client.get_sheets_service")
+    def test_empty_sheet_result_is_also_cached(self, mock_get_service):
+        service = MagicMock()
+        service.spreadsheets.return_value.get.return_value.execute.return_value = {
+            "sheets": [{"properties": {"title": "参加者マスター"}}]
+        }
+        service.spreadsheets.return_value.values.return_value.get.return_value \
+            .execute.return_value = {}
+        mock_get_service.return_value = service
+        first = sheets_client.read_master_records(
+            spreadsheet_id="ssid", sheet_name="参加者マスター",
+        )
+        calls_after_first = mock_get_service.call_count
+        second = sheets_client.read_master_records(
+            spreadsheet_id="ssid", sheet_name="参加者マスター",
+        )
+        self.assertEqual(first, [])
+        self.assertIs(first, second)
+        self.assertEqual(mock_get_service.call_count, calls_after_first)
+
+
 if __name__ == "__main__":
     unittest.main()

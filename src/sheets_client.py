@@ -114,6 +114,28 @@ def get_sheets_service() -> Any:
     return build("sheets", "v4", credentials=creds)
 
 
+# ── サービスの thread-local キャッシュ ──
+# ``build()`` + 認証情報生成 + 初回トークンリフレッシュのコストを排除する
+# （drive_client と同じパターン）。Sheets の書き込みは throttle 済みの
+# メインスレッドのみだが、実装を drive 側と揃えて thread-local にする。
+_SERVICE_TLS = threading.local()
+
+
+def _cached_sheets_service() -> Any:
+    """thread-local にキャッシュした Sheets サービスを返す（初回のみ構築）。"""
+    service = getattr(_SERVICE_TLS, "service", None)
+    if service is None:
+        service = get_sheets_service()
+        _SERVICE_TLS.service = service
+    return service
+
+
+def reset_service_cache() -> None:
+    """サービスキャッシュをクリアする（テスト用）。"""
+    global _SERVICE_TLS
+    _SERVICE_TLS = threading.local()
+
+
 def read_records(
     spreadsheet_id: str | None = None,
     sheet_name: str = "Sheet1",
@@ -131,7 +153,7 @@ def read_records(
     if not spreadsheet_id:
         raise ValueError("SPREADSHEET_IDが設定されていません")
 
-    service = get_sheets_service()
+    service = _cached_sheets_service()
     range_name = f"{sheet_name}!A:D"
 
     result = service.spreadsheets().values().get(
@@ -202,7 +224,7 @@ def update_status(
     if not spreadsheet_id:
         raise ValueError("SPREADSHEET_IDが設定されていません")
 
-    service = get_sheets_service()
+    service = _cached_sheets_service()
     range_name = f"{sheet_name}!D{row_number}"
 
     service.spreadsheets().values().update(
@@ -357,7 +379,7 @@ def get_processed_management_numbers(
         raise ValueError("SPREADSHEET_IDが設定されていません")
     sheet_name = sheet_name or OUTPUT_SHEET_NAME
 
-    service = get_sheets_service()
+    service = _cached_sheets_service()
 
     # 出力一覧シートがまだ作成されていない（初回実行）場合、A2:A の取得は
     # 400 エラーになる。シート一覧を先に確認し、未作成なら空集合で返す。
@@ -409,7 +431,7 @@ def get_recorded_attachment_names(
         raise ValueError("SPREADSHEET_IDが設定されていません")
     sheet_name = sheet_name or OUTPUT_SHEET_NAME
 
-    service = get_sheets_service()
+    service = _cached_sheets_service()
     meta = service.spreadsheets().get(
         spreadsheetId=spreadsheet_id
     ).execute(num_retries=GOOGLE_API_NUM_RETRIES)
@@ -462,7 +484,7 @@ def append_output_record(
     sheet_name = sheet_name or OUTPUT_SHEET_NAME
     processed_at = processed_at or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    service = get_sheets_service()
+    service = _cached_sheets_service()
     _ensure_output_sheet(service, spreadsheet_id, sheet_name)
 
     _throttle_sheets_write()
@@ -517,7 +539,7 @@ def append_completion_marker(
     sheet_name = sheet_name or OUTPUT_SHEET_NAME
     completed_at = completed_at or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    service = get_sheets_service()
+    service = _cached_sheets_service()
     _ensure_output_sheet(service, spreadsheet_id, sheet_name)
 
     _throttle_sheets_write()
@@ -566,7 +588,7 @@ def append_batch_record(
     if not spreadsheet_id:
         raise ValueError("SPREADSHEET_IDが設定されていません")
 
-    service = get_sheets_service()
+    service = _cached_sheets_service()
     _ensure_sheet_with_header(
         service, spreadsheet_id, BATCH_STATE_SHEET_NAME, _BATCH_STATE_HEADER
     )
@@ -602,7 +624,7 @@ def get_open_batch_ids(
     if not spreadsheet_id:
         raise ValueError("SPREADSHEET_IDが設定されていません")
 
-    service = get_sheets_service()
+    service = _cached_sheets_service()
     meta = service.spreadsheets().get(
         spreadsheetId=spreadsheet_id
     ).execute(num_retries=GOOGLE_API_NUM_RETRIES)
@@ -666,7 +688,7 @@ def get_recorded_clinic_numbers(
         raise ValueError("SPREADSHEET_IDが設定されていません")
     sheet_name = sheet_name or OUTPUT_SHEET_NAME
 
-    service = get_sheets_service()
+    service = _cached_sheets_service()
 
     # 医院シートがまだ作成されていない（初回実行）場合、A2:A の取得は
     # 400 エラーになる。シート一覧を先に確認し、未作成なら空集合で返す。
@@ -723,7 +745,7 @@ def append_clinic_folder_record(
         raise ValueError("SPREADSHEET_IDが設定されていません")
     sheet_name = sheet_name or OUTPUT_SHEET_NAME
 
-    service = get_sheets_service()
+    service = _cached_sheets_service()
     _ensure_clinic_sheet(service, spreadsheet_id, sheet_name)
 
     _throttle_sheets_write()
@@ -885,7 +907,7 @@ def list_master_sheet_tabs(
     if not spreadsheet_id:
         raise ValueError("SPREADSHEET_IDが設定されていません")
 
-    service = get_sheets_service()
+    service = _cached_sheets_service()
     meta = service.spreadsheets().get(
         spreadsheetId=spreadsheet_id,
     ).execute(num_retries=GOOGLE_API_NUM_RETRIES)
@@ -929,16 +951,33 @@ def _ensure_master_sheet(
     return was_created
 
 
+# 参加者マスターのプロセス内キャッシュ（key = (spreadsheet_id, sheet_name)）。
+# batch モードは strict ガード（step1）と step4 で同じタブを 2 回読む。
+# 「同一ラン内でマスターは不変」という既存前提（Step4 docstring の
+# 「スナップショット」・``find_or_create_clinic_folder`` のコメント）に従い
+# メモ化する。1 ラン = 1 プロセスなので staleness は問題にならない。
+_MASTER_CACHE: dict[tuple[str, str], list["MasterRecord"]] = {}
+
+
+def reset_master_records_cache() -> None:
+    """参加者マスターキャッシュをクリアする（テスト用）。"""
+    _MASTER_CACHE.clear()
+
+
 def read_master_records(
     spreadsheet_id: str | None = None,
     sheet_name: str | None = None,
 ) -> list[MasterRecord]:
-    """参加者マスターシートを全件読み取る。
+    """参加者マスターシートを全件読み取る（プロセス内メモ化つき）。
 
     シートが存在しなければ自動作成（ヘッダーのみ書き込む）して空リストを返す。
     形式不正のメール (``_validate_email`` で False) は警告して空扱い、行自体は
     残す（医院名 lookup には使えるため）。医院管理番号も医院名も両方空の行は
     空行として読み飛ばす。
+
+    同一プロセス内の 2 回目以降はキャッシュを返す（同一ラン内でマスターは
+    不変というスナップショット前提。batch の step1 strict ガード + step4 の
+    二重読みを 1 読みに削減する）。
 
     Args:
         spreadsheet_id: スプレッドシート ID。省略時は ``config.SPREADSHEET_ID``。
@@ -952,7 +991,12 @@ def read_master_records(
         raise ValueError("SPREADSHEET_IDが設定されていません")
     sheet_name = sheet_name or MASTER_SHEET_NAME
 
-    service = get_sheets_service()
+    cache_key = (spreadsheet_id, sheet_name)
+    cached = _MASTER_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    service = _cached_sheets_service()
     was_created = _ensure_master_sheet(service, spreadsheet_id, sheet_name)
 
     result = service.spreadsheets().values().get(
@@ -967,7 +1011,9 @@ def read_master_records(
         logger.info(
             f"Sheets: 参加者マスターシートが空 (ヘッダーのみ): {sheet_name}"
         )
-        return []
+        empty: list[MasterRecord] = []
+        _MASTER_CACHE[cache_key] = empty
+        return empty
 
     records: list[MasterRecord] = []
     # ヘッダー行はスキップ（A1 はヘッダー）
@@ -1011,6 +1057,7 @@ def read_master_records(
         logger.info(
             f"Sheets: 参加者マスター {len(records)}件を取得 ({sheet_name})"
         )
+    _MASTER_CACHE[cache_key] = records
     return records
 
 

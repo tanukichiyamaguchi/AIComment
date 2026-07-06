@@ -137,6 +137,10 @@ jobs:
           # Gmail 下書き生成のオン/オフ（既定 OFF）。ON にしたい実行のみ
           # workflow_dispatch の create_gmail_drafts を true にする。
           ENABLE_GMAIL_DRAFTS: ${{ inputs.create_gmail_drafts }}
+          # Batch step1（ダウンロード + テキスト抽出）の並列度。コード既定は 1
+          # （逐次）で、本番のみ 4 並列にする。問題があれば '1' に戻すだけで
+          # 完全に従来の逐次コードパスへ退避できる。8 以下推奨（Drive quota）。
+          STEP1_DOWNLOAD_WORKERS: '4'
 
       - name: Upload logs
         if: always()
