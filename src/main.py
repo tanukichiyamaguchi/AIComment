@@ -35,6 +35,7 @@ from src.utils import (
     extract_clinic_number,
     extract_management_number,
 )
+from src import config
 from src import discover, drive_client, gmail_client, run_common, sheets_client
 from src import pdf_reader, comment_generator, pdf_creator, pdf_merger
 from src.comment_generator import (
@@ -212,259 +213,280 @@ def run(
     # ``mkdtemp`` + 関数末尾の ``shutil.rmtree`` でクリーンアップする。
     session_outputs_dir = Path(tempfile.mkdtemp(prefix="aicomment_outputs_"))
 
-    # 実行時間バジェット（GHA 6h ジョブ kill による成果物ロスト防止）。
-    deadline = (
-        time.monotonic() + max_runtime_minutes * 60
-        if max_runtime_minutes > 0 else None
-    )
-    time_budget_hit = False
+    # Gmail 下書きが OFF のときは、出力 PDF を集約下書きまで保持する必要が
+    # 無い。アップロード成功のたびにサブディレクトリを即削除し、大量ランで
+    # /tmp が圧迫されるのを防ぐ（長時間・大量ラン対策）。
+    keep_outputs = config.ENABLE_GMAIL_DRAFTS
 
-    for i, pdf_file in enumerate(targets, start=1):
-        if deadline is not None and time.monotonic() > deadline:
-            time_budget_hit = True
+    # 一時ディレクトリの掃除は mkdtemp 直後からの try/finally で保証する。
+    # 以前は末尾のドラフト作成呼び出しだけを finally が包んでおり、メイン
+    # ループ〜添付資料ループの未ガード箇所で例外が出ると rmtree に到達せず、
+    # ローカル/Codespaces の反復実行で一時ディレクトリが蓄積した。
+    try:
+
+        # 実行時間バジェット（GHA 6h ジョブ kill による成果物ロスト防止）。
+        deadline = (
+            time.monotonic() + max_runtime_minutes * 60
+            if max_runtime_minutes > 0 else None
+        )
+        time_budget_hit = False
+
+        for i, pdf_file in enumerate(targets, start=1):
+            if deadline is not None and time.monotonic() > deadline:
+                time_budget_hit = True
+                logger.warning(
+                    f"実行時間バジェット（{max_runtime_minutes}分）に到達しました。"
+                    f"残り {len(targets) - i + 1} 件はループを打ち切り、処理済み分の"
+                    f"下書き作成・完了マーカーを完走させます。未処理分は再実行の"
+                    f"増分処理で続きから処理されます。"
+                )
+                break
+
+            file_id = pdf_file["id"]
+            file_name = pdf_file["name"]
+            logger.info(f"--- [{i}/{len(targets)}] {file_name} ---")
+
+            try:
+                pdf_data = drive_client.download_pdf(file_id)
+                pdf_text = pdf_reader.extract_text(pdf_data)
+                if not pdf_text:
+                    logger.warning(f"テキスト抽出失敗: {file_name}")
+                    stats["skip"] += 1
+                    continue
+
+                metadata = comment_generator.generate_comment_with_metadata(
+                    pdf_text=pdf_text,
+                    pdf_filename=file_name,
+                )
+                clinic_name_from_ai = metadata["clinic_name"] or "unknown_clinic"
+                person_name = metadata["person_name"] or "unknown_person"
+                sample_title = metadata["sample_title"] or Path(file_name).stem
+                comment = metadata["comment"]
+
+                # 医院番号（管理番号の先頭セグメント）を抽出する。医院フォルダの
+                # 識別は医院番号のみで行うため（P-019）、医院番号と医院名を別々に
+                # ``upload_pdf_to_clinic_person`` に渡す。医院番号が空（管理番号
+                # なし）の場合は ``find_or_create_clinic_folder`` 側で旧来の名前
+                # ベース照合にフォールバックする。
+                clinic_number = extract_clinic_number(file_name)
+                mgmt_num = extract_management_number(file_name)
+
+                # 医院名は参加者マスターの標準表記を最優先、未登録なら AI 抽出値で
+                # 代用（警告ログは resolve_clinic_name 内）。以後すべての医院名
+                # 用途で ``clinic_name`` 変数を使う。
+                clinic_name, clinic_name_is_authoritative = (
+                    run_common.resolve_clinic_name(
+                        sheets_client, master_records,
+                        clinic_number, clinic_name_from_ai, logger,
+                    )
+                )
+
+                output_filename = pdf_merger.make_output_filename(
+                    clinic_name, person_name, sample_title
+                )
+
+                # 中間ファイル（コメントページ）は iteration スコープの tempdir、
+                # 最終出力 PDF は session_outputs_dir に書き出してループ終了後
+                # まで生存させる。同じ個人の複数 PDF を 1 通の下書きに集約する
+                # ため。
+                pdf_subdir = session_outputs_dir / f"main_{i:05d}"
+                pdf_subdir.mkdir(parents=True, exist_ok=True)
+                output_path = pdf_subdir / output_filename
+
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    comment_page_path = Path(tmpdir) / "comment_page.pdf"
+                    pdf_creator.create_comment_page(
+                        comment=comment,
+                        clinic_name=clinic_name,
+                        person_name=person_name,
+                        output_path=comment_page_path,
+                    )
+
+                    pdf_merger.merge_pdfs(
+                        original_pdf_data=pdf_data,
+                        comment_page_path=comment_page_path,
+                        output_path=output_path,
+                    )
+
+                    upload_result = drive_client.upload_pdf_to_clinic_person(
+                        file_path=output_path,
+                        output_root_folder_id=cfg.output_folder_id,
+                        clinic_number=clinic_number,
+                        clinic_name=clinic_name,
+                        person_name=person_name,
+                        file_name=output_filename,
+                        # マスター由来の確定医院名なら既存フォルダ名も同期させる
+                        clinic_name_authoritative=clinic_name_is_authoritative,
+                    )
+
+                    # 管理番号は処理対象選定時に抽出・検証済み（空でないことが保証される）。
+                    sheets_client.append_output_record(
+                        management_number=mgmt_num,
+                        clinic_name=clinic_name,
+                        person_name=person_name,
+                        sample_name=sample_title,
+                        drive_url=upload_result["webViewLink"],
+                        sheet_name=cfg.output_sheet_name,
+                    )
+
+                    # 医院フォルダURLシートに医院を記録（同一医院は 1 行のみ）。
+                    clinic_recorder.record(
+                        clinic_number, clinic_name,
+                        upload_result["clinic_folder_id"],
+                    )
+
+                # Gmail 下書きはここで作らず、 ``draft_items`` に蓄積する。
+                # ループ終了後にメールアドレスでグルーピングして 1 通にまとめる。
+                _collect_draft_item(
+                    clinic_number=clinic_number,
+                    person_name=person_name,
+                    pdf_path=output_path,
+                )
+
+                # 添付資料パススルー用の対応表を構築。同じ管理番号の添付資料を
+                # このメインと同じ出力フォルダへコピーするために使う。医院名は
+                # 既にマスター標準化済みの値が入っているため、添付資料経路は
+                # この表をそのまま再利用すれば同じフォルダ・同じ列値になる。
+                case_map[mgmt_num] = (clinic_number, clinic_name, person_name)
+
+                logger.info(
+                    f"完了: {mgmt_num} / {clinic_name} / {person_name} / {sample_title}"
+                )
+                stats["success"] += 1
+
+                # ドラフト OFF なら出力 PDF はもう不要（Drive 保存済み）。
+                # 逐次削除してディスク滞留を防ぐ。
+                if not keep_outputs:
+                    shutil.rmtree(pdf_subdir, ignore_errors=True)
+
+            except PermanentRunFailureError as e:
+                # ラン全体で恒久的に失敗する条件（残高不足 / 認証 / 権限）を検知。
+                # 以降のどの PDF も必ず同じエラーになるため、残りを処理せず即停止する
+                # （無駄な API 呼び出し + エラーログの乱立を防ぐ）。既に成功・記録
+                # 済みの件は影響なし。未処理分は出力一覧シート未記録なので、残高
+                # チャージ後の再実行で処理対象として拾える。
+                run_halted = e
+                logger.error(
+                    permanent_failure_message(
+                        processed=stats["success"], detail=str(e),
+                    )
+                )
+                break
+
+            except RefreshError as e:
+                # Google 認証の恒久失敗（OAuth トークン失効/取り消し）。Anthropic の
+                # 恒久エラーと同様、以降の全 PDF も必ず失敗するため即停止する
+                # （per-item fail-soft で数百件のエラーログを乱立させない）。
+                run_halted = PermanentRunFailureError(
+                    f"Google 認証エラー（OAuth トークン失効の可能性）: {e}。"
+                    f"GOOGLE_OAUTH_TOKEN_JSON を再発行して再実行してください。"
+                )
+                logger.error(str(run_halted))
+                break
+
+            except Exception as e:
+                logger.error(f"処理エラー: {file_name} - {e}", exc_info=True)
+                stats["error"] += 1
+
+        # ── 添付資料パススルー経路 ──
+        # 添付資料 PDF は AI 処理（テキスト抽出 / Claude API / コメントページ生成
+        # / 結合）を一切せず、同じ管理番号のメインと同じ出力フォルダへ元ファイル
+        # のままコピーする。メイン処理が完了した後にまとめて処理する。
+        # ラン停止中（恒久エラー検知）は添付資料も処理せずスキップする。
+        if run_halted is not None:
             logger.warning(
-                f"実行時間バジェット（{max_runtime_minutes}分）に到達しました。"
-                f"残り {len(targets) - i + 1} 件はループを打ち切り、処理済み分の"
-                f"下書き作成・完了マーカーを完走させます。未処理分は再実行の"
-                f"増分処理で続きから処理されます。"
+                "恒久エラーのためラン停止中: 添付資料パススルーをスキップします"
+                f"（未処理 {len(attachment_files)}件）"
             )
-            break
-
-        file_id = pdf_file["id"]
-        file_name = pdf_file["name"]
-        logger.info(f"--- [{i}/{len(targets)}] {file_name} ---")
-
-        try:
-            pdf_data = drive_client.download_pdf(file_id)
-            pdf_text = pdf_reader.extract_text(pdf_data)
-            if not pdf_text:
-                logger.warning(f"テキスト抽出失敗: {file_name}")
-                stats["skip"] += 1
-                continue
-
-            metadata = comment_generator.generate_comment_with_metadata(
-                pdf_text=pdf_text,
-                pdf_filename=file_name,
+        # 添付資料の重複判定は「その添付資料自体が出力一覧シートに記録済みか」
+        # （``【添付資料】<元名>`` マーカー）で行う。以前の「メインの管理番号が
+        # 処理済みなら添付もスキップ」方式は、メイン処理後に添付だけ後から Drive
+        # に追加されたケース等で添付資料が恒久ロストする欠陥があった。
+        recorded_attachments: set[str] = set()
+        if attachment_files and run_halted is None:
+            logger.info(f"--- 添付資料パススルー: {len(attachment_files)}件 ---")
+            recorded_attachments = sheets_client.get_recorded_attachment_names(
+                sheet_name=cfg.output_sheet_name,
             )
-            clinic_name_from_ai = metadata["clinic_name"] or "unknown_clinic"
-            person_name = metadata["person_name"] or "unknown_person"
-            sample_title = metadata["sample_title"] or Path(file_name).stem
-            comment = metadata["comment"]
-
-            # 医院番号（管理番号の先頭セグメント）を抽出する。医院フォルダの
-            # 識別は医院番号のみで行うため（P-019）、医院番号と医院名を別々に
-            # ``upload_pdf_to_clinic_person`` に渡す。医院番号が空（管理番号
-            # なし）の場合は ``find_or_create_clinic_folder`` 側で旧来の名前
-            # ベース照合にフォールバックする。
-            clinic_number = extract_clinic_number(file_name)
+        for pdf_file in [] if run_halted is not None else attachment_files:
+            file_id = pdf_file["id"]
+            file_name = pdf_file["name"]
             mgmt_num = extract_management_number(file_name)
 
-            # 医院名は参加者マスターの標準表記を最優先、未登録なら AI 抽出値で
-            # 代用（警告ログは resolve_clinic_name 内）。以後すべての医院名
-            # 用途で ``clinic_name`` 変数を使う。
-            clinic_name, clinic_name_is_authoritative = (
-                run_common.resolve_clinic_name(
-                    sheets_client, master_records,
-                    clinic_number, clinic_name_from_ai, logger,
+            if not mgmt_num:
+                logger.warning(
+                    f"管理番号をファイル名から抽出できないため添付資料をスキップ"
+                    f"（先頭が NNN-NN-N 形式でない）: {file_name}"
                 )
-            )
+                stats["skip_no_number"] += 1
+                continue
 
-            output_filename = pdf_merger.make_output_filename(
-                clinic_name, person_name, sample_title
-            )
+            if f"【添付資料】{file_name}" in recorded_attachments:
+                logger.info(f"記録済みのため添付資料をスキップ: {mgmt_num} ({file_name})")
+                stats["skip_processed"] += 1
+                continue
 
-            # 中間ファイル（コメントページ）は iteration スコープの tempdir、
-            # 最終出力 PDF は session_outputs_dir に書き出してループ終了後
-            # まで生存させる。同じ個人の複数 PDF を 1 通の下書きに集約する
-            # ため。
-            pdf_subdir = session_outputs_dir / f"main_{i:05d}"
-            pdf_subdir.mkdir(parents=True, exist_ok=True)
-            output_path = pdf_subdir / output_filename
-
-            with tempfile.TemporaryDirectory() as tmpdir:
-                comment_page_path = Path(tmpdir) / "comment_page.pdf"
-                pdf_creator.create_comment_page(
-                    comment=comment,
-                    clinic_name=clinic_name,
-                    person_name=person_name,
-                    output_path=comment_page_path,
+            # case_map（同一ラン内で処理されたメイン）を最優先。無ければ参加者
+            # マスターだけで出力先を解決するフォールバック（メインが過去ラン処理
+            # 済みで添付だけ後から追加されたケースの恒久ロスト防止）。
+            case = case_map.get(mgmt_num)
+            case_from_master = False
+            if case is None:
+                case = run_common.resolve_case_via_master(
+                    sheets_client, master_records, mgmt_num, logger,
                 )
-
-                pdf_merger.merge_pdfs(
-                    original_pdf_data=pdf_data,
-                    comment_page_path=comment_page_path,
-                    output_path=output_path,
+                case_from_master = case is not None
+            if case is None:
+                logger.warning(
+                    f"対応するメイン実践事例 PDF がこの実行で処理されておらず、"
+                    f"参加者マスターにも管理番号 {mgmt_num} が未登録のため"
+                    f"スキップ: {file_name}"
                 )
+                stats["skip_attachment_orphan"] += 1
+                continue
 
-                upload_result = drive_client.upload_pdf_to_clinic_person(
-                    file_path=output_path,
-                    output_root_folder_id=cfg.output_folder_id,
-                    clinic_number=clinic_number,
-                    clinic_name=clinic_name,
-                    person_name=person_name,
-                    file_name=output_filename,
-                    # マスター由来の確定医院名なら既存フォルダ名も同期させる
-                    clinic_name_authoritative=clinic_name_is_authoritative,
-                )
-
-                # 管理番号は処理対象選定時に抽出・検証済み（空でないことが保証される）。
-                sheets_client.append_output_record(
-                    management_number=mgmt_num,
-                    clinic_name=clinic_name,
-                    person_name=person_name,
-                    sample_name=sample_title,
-                    drive_url=upload_result["webViewLink"],
-                    sheet_name=cfg.output_sheet_name,
-                )
-
-                # 医院フォルダURLシートに医院を記録（同一医院は 1 行のみ）。
-                clinic_recorder.record(
-                    clinic_number, clinic_name,
-                    upload_result["clinic_folder_id"],
-                )
-
-            # Gmail 下書きはここで作らず、 ``draft_items`` に蓄積する。
-            # ループ終了後にメールアドレスでグルーピングして 1 通にまとめる。
-            _collect_draft_item(
+            # case_map は (医院番号, 医院名, 個人名)。医院名はメイン処理ループで
+            # 既に参加者マスター標準化済み（未登録時は AI 抽出値）。添付資料は
+            # メインと同じ管理番号 = 同じ医院番号なので、``find_or_create_clinic_folder``
+            # 経由でメインと同じ医院フォルダへコピーされる。
+            clinic_number, clinic_name, person_name = case
+            run_common.passthrough_attachment(
+                drive_module=drive_client,
+                sheets_module=sheets_client,
+                logger=logger,
+                stats=stats,
+                collect_draft=_collect_draft_item,
+                file_id=file_id,
+                file_name=file_name,
+                mgmt_num=mgmt_num,
                 clinic_number=clinic_number,
+                clinic_name=clinic_name,
                 person_name=person_name,
-                pdf_path=output_path,
+                output_folder_id=cfg.output_folder_id,
+                output_sheet_name=cfg.output_sheet_name,
+                session_outputs_dir=session_outputs_dir,
+                # マスター由来の確定名なら既存フォルダ名の同期を許可
+                clinic_name_authoritative=case_from_master,
             )
-
-            # 添付資料パススルー用の対応表を構築。同じ管理番号の添付資料を
-            # このメインと同じ出力フォルダへコピーするために使う。医院名は
-            # 既にマスター標準化済みの値が入っているため、添付資料経路は
-            # この表をそのまま再利用すれば同じフォルダ・同じ列値になる。
-            case_map[mgmt_num] = (clinic_number, clinic_name, person_name)
-
-            logger.info(
-                f"完了: {mgmt_num} / {clinic_name} / {person_name} / {sample_title}"
-            )
-            stats["success"] += 1
-
-        except PermanentRunFailureError as e:
-            # ラン全体で恒久的に失敗する条件（残高不足 / 認証 / 権限）を検知。
-            # 以降のどの PDF も必ず同じエラーになるため、残りを処理せず即停止する
-            # （無駄な API 呼び出し + エラーログの乱立を防ぐ）。既に成功・記録
-            # 済みの件は影響なし。未処理分は出力一覧シート未記録なので、残高
-            # チャージ後の再実行で処理対象として拾える。
-            run_halted = e
-            logger.error(
-                permanent_failure_message(
-                    processed=stats["success"], detail=str(e),
+            # ドラフト OFF なら添付コピーの一時ファイルも逐次削除
+            # （ディスク滞留防止）。
+            if not keep_outputs:
+                shutil.rmtree(
+                    session_outputs_dir / f"attach_{file_id}", ignore_errors=True,
                 )
-            )
-            break
 
-        except RefreshError as e:
-            # Google 認証の恒久失敗（OAuth トークン失効/取り消し）。Anthropic の
-            # 恒久エラーと同様、以降の全 PDF も必ず失敗するため即停止する
-            # （per-item fail-soft で数百件のエラーログを乱立させない）。
-            run_halted = PermanentRunFailureError(
-                f"Google 認証エラー（OAuth トークン失効の可能性）: {e}。"
-                f"GOOGLE_OAUTH_TOKEN_JSON を再発行して再実行してください。"
-            )
-            logger.error(str(run_halted))
-            break
-
-        except Exception as e:
-            logger.error(f"処理エラー: {file_name} - {e}", exc_info=True)
-            stats["error"] += 1
-
-    # ── 添付資料パススルー経路 ──
-    # 添付資料 PDF は AI 処理（テキスト抽出 / Claude API / コメントページ生成
-    # / 結合）を一切せず、同じ管理番号のメインと同じ出力フォルダへ元ファイル
-    # のままコピーする。メイン処理が完了した後にまとめて処理する。
-    # ラン停止中（恒久エラー検知）は添付資料も処理せずスキップする。
-    if run_halted is not None:
-        logger.warning(
-            "恒久エラーのためラン停止中: 添付資料パススルーをスキップします"
-            f"（未処理 {len(attachment_files)}件）"
-        )
-    # 添付資料の重複判定は「その添付資料自体が出力一覧シートに記録済みか」
-    # （``【添付資料】<元名>`` マーカー）で行う。以前の「メインの管理番号が
-    # 処理済みなら添付もスキップ」方式は、メイン処理後に添付だけ後から Drive
-    # に追加されたケース等で添付資料が恒久ロストする欠陥があった。
-    recorded_attachments: set[str] = set()
-    if attachment_files and run_halted is None:
-        logger.info(f"--- 添付資料パススルー: {len(attachment_files)}件 ---")
-        recorded_attachments = sheets_client.get_recorded_attachment_names(
-            sheet_name=cfg.output_sheet_name,
-        )
-    for pdf_file in [] if run_halted is not None else attachment_files:
-        file_id = pdf_file["id"]
-        file_name = pdf_file["name"]
-        mgmt_num = extract_management_number(file_name)
-
-        if not mgmt_num:
-            logger.warning(
-                f"管理番号をファイル名から抽出できないため添付資料をスキップ"
-                f"（先頭が NNN-NN-N 形式でない）: {file_name}"
-            )
-            stats["skip_no_number"] += 1
-            continue
-
-        if f"【添付資料】{file_name}" in recorded_attachments:
-            logger.info(f"記録済みのため添付資料をスキップ: {mgmt_num} ({file_name})")
-            stats["skip_processed"] += 1
-            continue
-
-        # case_map（同一ラン内で処理されたメイン）を最優先。無ければ参加者
-        # マスターだけで出力先を解決するフォールバック（メインが過去ラン処理
-        # 済みで添付だけ後から追加されたケースの恒久ロスト防止）。
-        case = case_map.get(mgmt_num)
-        case_from_master = False
-        if case is None:
-            case = run_common.resolve_case_via_master(
-                sheets_client, master_records, mgmt_num, logger,
-            )
-            case_from_master = case is not None
-        if case is None:
-            logger.warning(
-                f"対応するメイン実践事例 PDF がこの実行で処理されておらず、"
-                f"参加者マスターにも管理番号 {mgmt_num} が未登録のため"
-                f"スキップ: {file_name}"
-            )
-            stats["skip_attachment_orphan"] += 1
-            continue
-
-        # case_map は (医院番号, 医院名, 個人名)。医院名はメイン処理ループで
-        # 既に参加者マスター標準化済み（未登録時は AI 抽出値）。添付資料は
-        # メインと同じ管理番号 = 同じ医院番号なので、``find_or_create_clinic_folder``
-        # 経由でメインと同じ医院フォルダへコピーされる。
-        clinic_number, clinic_name, person_name = case
-        run_common.passthrough_attachment(
-            drive_module=drive_client,
-            sheets_module=sheets_client,
-            logger=logger,
-            stats=stats,
-            collect_draft=_collect_draft_item,
-            file_id=file_id,
-            file_name=file_name,
-            mgmt_num=mgmt_num,
-            clinic_number=clinic_number,
-            clinic_name=clinic_name,
-            person_name=person_name,
-            output_folder_id=cfg.output_folder_id,
-            output_sheet_name=cfg.output_sheet_name,
-            session_outputs_dir=session_outputs_dir,
-            # マスター由来の確定名なら既存フォルダ名の同期を許可
-            clinic_name_authoritative=case_from_master,
-        )
-
-    # ── 集約下書き作成 ──
-    # メイン + 添付資料ループで蓄積した ``draft_items`` をメールアドレスで
-    # グルーピングし、グループごとに 1 通の Gmail 下書きを作成する。同じ
-    # 個人の複数 PDF が 1 通の下書きに集約される（複数添付）。メールが
-    # 空の項目は集約せず、PDF ごとに宛先空の下書きを作る（手動補完前提）。
-    # Gmail 下書きの ON/OFF 判定は ``_create_grouped_drafts_for_run`` 内で行う
-    # （ENABLE_GMAIL_DRAFTS=false ならスキップ）。一時ファイル削除は必ず行う。
-    # 既に成功した分の下書き作成と一時ファイル削除は、ラン停止時でも行う
-    # （完了済みの成果物は運用者に届ける）。
-    try:
+        # ── 集約下書き作成 ──
+        # メイン + 添付資料ループで蓄積した ``draft_items`` をメールアドレスで
+        # グルーピングし、グループごとに 1 通の Gmail 下書きを作成する。同じ
+        # 個人の複数 PDF が 1 通の下書きに集約される（複数添付）。メールが
+        # 空の項目は集約せず、PDF ごとに宛先空の下書きを作る（手動補完前提）。
+        # Gmail 下書きの ON/OFF 判定は ``_create_grouped_drafts_for_run`` 内で行う
+        # （ENABLE_GMAIL_DRAFTS=false ならスキップ）。一時ファイル削除は必ず行う。
+        # 既に成功した分の下書き作成と一時ファイル削除は、ラン停止時でも行う
+        # （完了済みの成果物は運用者に届ける）。
         _create_grouped_drafts_for_run(draft_items, gmail_client)
     finally:
-        # PDF 一時ファイルは下書き作成が終わったので削除
+        # PDF 一時ファイルは下書き作成が終わったので削除（例外経路でも必ず）
         shutil.rmtree(session_outputs_dir, ignore_errors=True)
 
     logger.info("=== 処理完了 ===")
