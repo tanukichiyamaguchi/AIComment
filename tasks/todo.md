@@ -8,13 +8,14 @@ Phase 22（耐障害系）の次段。ユーザー優先領域「処理速度」
 6 レンズ監査 + 広域スイープ（Explore）→ 実装設計（Plan）で計画策定。
 計画ファイル: `/root/.claude/plans/swift-strolling-crystal.md`
 
-### PR-6: 長時間ハードニング（新設 2026-07-04・未着手）
-- [ ] 6a: 一時ディレクトリ掃除の全域化（mkdtemp直後からtry/finally。未ガード区間の
-      例外でrmtree不達→リークする問題）
-- [ ] 6b: disk由来 batch_results/attachments の防御的パース（meta.get化 +
-      JSONDecodeError の明確なエラーメッセージ）
-- [ ] 6c: ENABLE_GMAIL_DRAFTS=false 時のディスク逐次解放（アップロード直後に
-      サブディレクトリ削除）
+### PR-6: 長時間ハードニング（完了 2026-07-06）
+- [x] 6a: 一時ディレクトリ掃除の全域化（mkdtemp直後からtry/finally。未ガード区間の
+      例外でrmtree不達→リークする問題、P-034）
+- [x] 6b: disk由来 batch_results/attachments の防御的パース（meta.get化 + 空comment
+      の per-item エラー化 + JSONDecodeError の復旧手順つき RuntimeError）
+- [x] 6c: ENABLE_GMAIL_DRAFTS=false 時のディスク逐次解放（アップロード直後に
+      サブディレクトリ削除。ON は従来通り、回帰テストで固定）
+- [x] pytest 719 → 725 件 pass / mypy clean
 - 検証済み・対処不要: ログローテ(100MB×5世代) / logs/上書き型 / キャッシュ有界 /
   メモリ(1000件で~115MB)
 
@@ -36,6 +37,7 @@ Phase 22（耐障害系）の次段。ユーザー優先領域「処理速度」
 - [ ] 2c: `read_master_records` のプロセス内メモ化（step1/step4 二重読み解消）
 
 ### PR-3: 出力品質（完了）
+- [x] PR #60 マージ済み（2026-07-06）
 - [x] 3a: コメント品質ガード（`_MIN_COMMENT_CHARS=100`、warning-only。batch失敗化は
       恒久再投入ループのリスクがあるため見送り）。scrub 短縮の INFO ログ + context 追跡付き
 - [x] 3b: pdf_creator の本文/じっせん君画像の重なり回避（画像ジオメトリを定数昇格し

@@ -2118,5 +2118,68 @@ class TestAttachmentMasterFallback(unittest.TestCase):
         )
 
 
+class TestTempDirCleanupOnException(unittest.TestCase):
+    """未ガード区間の例外でも一時ディレクトリが掃除される（Phase 23 PR-6a）。
+
+    以前は finally がドラフト作成呼び出しだけを包んでおり、メインループ後の
+    get_recorded_attachment_names（Sheets 例外が伝播し得る）などで落ちると
+    session_outputs_dir がリークしていた。
+    """
+
+    @patch("src.main.ensure_fonts")
+    @patch("src.main.pdf_merger")
+    @patch("src.main.pdf_creator")
+    @patch("src.main.pdf_reader")
+    @patch("src.main.comment_generator")
+    @patch("src.main.sheets_client")
+    @patch("src.main.drive_client")
+    @patch("src.discover.load_profile")
+    def test_exception_after_main_loop_still_cleans_tempdir(
+        self,
+        mock_load_profile,
+        mock_drive_client,
+        mock_sheets_client,
+        mock_gen,
+        mock_reader,
+        mock_creator,
+        mock_merger,
+        mock_ensure_fonts,
+    ):
+        import tempfile as _tf
+        from pathlib import Path as _P
+
+        mock_load_profile.return_value = _make_profile()
+        mock_sheets_client.get_processed_management_numbers.return_value = set()
+        # 添付資料があると main ループ後に get_recorded_attachment_names が
+        # 呼ばれる（未ガード区間）。ここで Sheets 例外を注入する。
+        mock_sheets_client.get_recorded_attachment_names.side_effect = (
+            RuntimeError("Sheets down")
+        )
+        _install_run_mocks(
+            mock_drive_client, mock_gen, mock_reader, mock_creator, mock_merger,
+            mock_sheets_client=mock_sheets_client,
+            pdf_files=[
+                {"id": "id_main", "name": "001-01-0実践事例.pdf"},
+                {"id": "id_att", "name": "001-01-0【添付資料】補足.pdf"},
+            ],
+        )
+
+        session_dir = _P(_tf.mkdtemp(prefix="test_session_main_"))
+        real_mkdtemp = _tf.mkdtemp
+
+        def _fake(*args, **kwargs):
+            prefix = kwargs.get("prefix") or (args[2] if len(args) > 2 else None)
+            if prefix == "aicomment_outputs_":
+                return str(session_dir)
+            return real_mkdtemp(*args, **kwargs)
+
+        with patch("src.main.tempfile.mkdtemp", side_effect=_fake):
+            with self.assertRaises(RuntimeError):
+                main_module.run(test_count=0, profile_name="jissen_default")
+
+        # 例外経路でも一時ディレクトリが掃除されている
+        self.assertFalse(session_dir.exists())
+
+
 if __name__ == "__main__":
     unittest.main()

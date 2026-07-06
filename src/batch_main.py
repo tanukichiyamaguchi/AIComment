@@ -39,6 +39,7 @@ from src.utils import (
     extract_clinic_number,
     extract_management_number,
 )
+from src import config
 from src.config import LOGS_DIR
 from src import discover, drive_client, gmail_client, run_common, sheets_client
 from src import pdf_reader, comment_generator, pdf_creator, pdf_merger
@@ -750,191 +751,225 @@ def step4_generate_pdfs(
     session_outputs_dir = Path(tempfile.mkdtemp(prefix="aicomment_batch_outputs_"))
     draft_items: list[dict[str, Any]] = []
 
-    for item in items:
-        custom_id = item["custom_id"]
-        pdf_file_name = item.get("pdf_file_name", "")
-        # mgmt_num はどちらの分岐（results 有無）でも必要なため先に抽出する。
-        mgmt_num = extract_management_number(pdf_file_name)
+    # Gmail 下書きが OFF のときは、出力 PDF を集約下書きまで保持する必要が
+    # 無い。アップロード成功のたびにサブディレクトリを即削除し、1000 件 ×
+    # 数 MB の結合 PDF が /tmp に滞留してディスクを圧迫するのを防ぐ
+    # （長時間・大量ラン対策）。ON のときは従来通り集約添付まで保持する。
+    keep_outputs = config.ENABLE_GMAIL_DRAFTS
 
-        if custom_id not in results:
-            # results に無い item は 3 通りに分類する。回収実行
-            # （``--step results --batch-id`` / 自動レジューム）では items が
-            # ``reconstruct_items_from_drive`` による Drive 全件再走査で作られる
-            # ため、「今回のバッチには含まれない過去処理済み PDF」や「そもそも
-            # 投入されなかった PDF」が items に混入する。これらを無条件で
-            # missing 扱いすると、1000 件規模の回収実行で無関係な PDF が大量に
-            # 「コメント未取得」警告 + missing 集計され、完了マーカーの
-            # 「未取得 N 件」が実態と乖離する（過去に処理済みなのに「未取得」に
-            # 見える）。
-            if mgmt_num and mgmt_num in step4_processed:
-                # 過去ラン（または今回の別バッチ）で処理済み。CB-3 と同じ判定
-                # だが結果を伴わないため per-item ログは出さない（回収実行での
-                # ログ洪水を防ぐ）。
-                stats["skip_already_processed"] += 1
-            elif not mgmt_num:
-                # 管理番号を抽出できないファイル（Drive 再走査でのみ発生し得る。
-                # step1 の通常経路では select_new_targets が事前に除外済み）。
-                logger.info(
-                    f"未投入ファイルをスキップ（管理番号抽出不可のため投入対象"
-                    f"外だった可能性）: {pdf_file_name}"
-                )
-                stats["skip_unsubmitted"] += 1
-            else:
-                # 投入されたはずなのに結果が無い＝真の missing。
-                logger.warning(f"コメント未取得: {custom_id} ({pdf_file_name})")
-                stats["missing"] += 1
-            continue
-
-        meta = results[custom_id]
-        clinic_name_from_ai = meta["clinic_name"] or "unknown_clinic"
-        person_name = meta["person_name"] or "unknown_person"
-        sample_title = meta["sample_title"] or Path(pdf_file_name).stem or "untitled"
-        comment = meta["comment"]
-
-        # 医院番号（管理番号の先頭セグメント）を抽出する。医院フォルダの識別
-        # は医院番号のみで行うため（P-019）、医院番号と医院名を別々に
-        # ``upload_pdf_to_clinic_person`` に渡す。医院番号が空の場合は
-        # ``find_or_create_clinic_folder`` 側で旧来の名前ベース照合に
-        # フォールバックする。
-        clinic_number = extract_clinic_number(pdf_file_name)
-        if not mgmt_num:
-            logger.warning(
-                f"管理番号をファイル名から抽出できません"
-                f"（先頭が NNN-NN-N 形式でない）: {pdf_file_name}"
-            )
-
-        # CB-3: Step4 開始時のスナップショットに mgmt_num が含まれていれば
-        # 前回 Step4 で処理済み（Drive アップロード + Sheets 追記 + 下書き想定）。
-        # 再処理すると Drive / Sheets / Gmail で重複が出るためスキップ。
-        # ただし case_map（添付資料パススルー用の対応表）には **登録する**。
-        # 前回ランが「メイン記録後・添付コピー前」でクラッシュした場合、この
-        # 登録が無いと添付資料が対応表を引けず恒久ロストになる（AI 抽出結果
-        # ``meta`` はバッチ結果に残っているため、アップロードなしで医院名解決
-        # だけ行える）。
-        if mgmt_num and mgmt_num in step4_processed:
-            logger.info(
-                f"Step4 スキップ（処理済み再実行検知）: {mgmt_num} "
-                f"({pdf_file_name})"
-            )
-            resolved_name, _ = run_common.resolve_clinic_name(
-                sheets_client, master_records,
-                extract_clinic_number(pdf_file_name), clinic_name_from_ai,
-                logger,
-            )
-            case_map[mgmt_num] = (
-                extract_clinic_number(pdf_file_name), resolved_name, person_name
-            )
-            stats["skip_already_processed"] += 1
-            continue
-
-        # 医院名は参加者マスターの標準表記を最優先、未登録なら AI 抽出値で
-        # 代用（警告ログは resolve_clinic_name 内）。以後すべての医院名
-        # 用途で ``clinic_name`` 変数を使う。
-        clinic_name, clinic_name_is_authoritative = (
-            run_common.resolve_clinic_name(
-                sheets_client, master_records,
-                clinic_number, clinic_name_from_ai, logger,
-            )
-        )
-
-        output_filename = pdf_merger.make_output_filename(
-            clinic_name, person_name, sample_title
-        )
-
-        try:
-            pdf_data = drive_client.download_pdf(item["pdf_data_id"])
-
-            # 中間ファイルは iteration スコープ、最終出力は session_outputs_dir
-            # に書いてループ終了後の集約下書き作成まで生存させる。
-            pdf_subdir = session_outputs_dir / f"main_{custom_id}"
-            pdf_subdir.mkdir(parents=True, exist_ok=True)
-            output_path = pdf_subdir / output_filename
-
-            with tempfile.TemporaryDirectory() as tmpdir:
-                comment_page_path = Path(tmpdir) / "comment_page.pdf"
-                pdf_creator.create_comment_page(
-                    comment=comment,
-                    clinic_name=clinic_name,
-                    person_name=person_name,
-                    output_path=comment_page_path,
-                )
-
-                pdf_merger.merge_pdfs(
-                    original_pdf_data=pdf_data,
-                    comment_page_path=comment_page_path,
-                    output_path=output_path,
-                )
-
-                upload_result = drive_client.upload_pdf_to_clinic_person(
-                    file_path=output_path,
-                    output_root_folder_id=profile.output_folder_id,
-                    clinic_number=clinic_number,
-                    clinic_name=clinic_name,
-                    person_name=person_name,
-                    file_name=output_filename,
-                    # マスター由来の確定医院名なら既存フォルダ名も同期させる
-                    clinic_name_authoritative=clinic_name_is_authoritative,
-                )
-
-                sheets_client.append_output_record(
-                    management_number=mgmt_num,
-                    clinic_name=clinic_name,
-                    person_name=person_name,
-                    sample_name=sample_title,
-                    drive_url=upload_result["webViewLink"],
-                    sheet_name=profile.output_sheet_name,
-                )
-                # 医院フォルダURLシートに医院を記録（同一医院は 1 行のみ）。
-                clinic_recorder.record(
-                    clinic_number, clinic_name,
-                    upload_result["clinic_folder_id"],
-                )
-
-            # Gmail 下書きはここで作らず draft_items に蓄積する。ループ終了後
-            # にメールアドレスでグルーピングして 1 通にまとめる。
-            _collect_draft_item_batch(
-                draft_items=draft_items,
-                master_records=master_records,
-                clinic_number=clinic_number,
-                person_name=person_name,
-                pdf_path=output_path,
-            )
-
-            # 添付資料パススルー用の対応表を構築。医院名は既にマスター標準化
-            # 済みの値が入っているため、添付資料経路はこの表をそのまま再利用
-            # すれば同じフォルダ・同じ列値になる。
-            if mgmt_num:
-                case_map[mgmt_num] = (
-                    clinic_number, clinic_name, person_name
-                )
-            logger.info(
-                f"完了: {mgmt_num} / {clinic_name} / {person_name} / {sample_title}"
-            )
-            stats["success"] += 1
-
-        except Exception as e:
-            logger.error(
-                f"処理エラー: {custom_id} ({pdf_file_name}) - {e}",
-                exc_info=True,
-            )
-            stats["error"] += 1
-
-    # ── 添付資料パススルー経路 ──
-    # batch_attachments.json を読み、各添付資料を case_map で引いて、同じ管理
-    # 番号のメインと同じ出力フォルダへ元ファイル名のままコピーする。AI 処理
-    # （Claude API / コメントページ生成 / 結合）は一切しない。ファイルが
-    # 存在しない（添付資料ゼロ）場合は何もしない。添付資料 PDF も同じ
-    # session_outputs_dir / draft_items に蓄積される（同じ個人宛グループに合流）。
-    _process_attachments(
-        profile, case_map, stats, master_records,
-        session_outputs_dir, draft_items,
-    )
-
-    # ── 集約下書き作成 ──
-    # メイン + 添付資料経路で蓄積した draft_items をメールアドレスでグルーピング
-    # し、グループごとに 1 通の Gmail 下書きを作成する。Gmail 下書きの ON/OFF
-    # 判定は ``_create_grouped_drafts_for_batch`` 内で行う。一時ファイル削除は必ず行う。
+    # 一時ディレクトリの掃除は mkdtemp 直後からの try/finally で保証する。
+    # 以前は末尾のドラフト作成呼び出しだけを finally が包んでおり、メイン
+    # ループ・添付経路の per-item try に包まれていない箇所（disk 由来 JSON の
+    # 不正・results のフィールド欠落など）で例外が出ると rmtree に到達せず、
+    # ローカル/Codespaces の反復実行で一時ディレクトリが蓄積した。
     try:
+
+        for item in items:
+            custom_id = item["custom_id"]
+            pdf_file_name = item.get("pdf_file_name", "")
+            # mgmt_num はどちらの分岐（results 有無）でも必要なため先に抽出する。
+            mgmt_num = extract_management_number(pdf_file_name)
+
+            if custom_id not in results:
+                # results に無い item は 3 通りに分類する。回収実行
+                # （``--step results --batch-id`` / 自動レジューム）では items が
+                # ``reconstruct_items_from_drive`` による Drive 全件再走査で作られる
+                # ため、「今回のバッチには含まれない過去処理済み PDF」や「そもそも
+                # 投入されなかった PDF」が items に混入する。これらを無条件で
+                # missing 扱いすると、1000 件規模の回収実行で無関係な PDF が大量に
+                # 「コメント未取得」警告 + missing 集計され、完了マーカーの
+                # 「未取得 N 件」が実態と乖離する（過去に処理済みなのに「未取得」に
+                # 見える）。
+                if mgmt_num and mgmt_num in step4_processed:
+                    # 過去ラン（または今回の別バッチ）で処理済み。CB-3 と同じ判定
+                    # だが結果を伴わないため per-item ログは出さない（回収実行での
+                    # ログ洪水を防ぐ）。
+                    stats["skip_already_processed"] += 1
+                elif not mgmt_num:
+                    # 管理番号を抽出できないファイル（Drive 再走査でのみ発生し得る。
+                    # step1 の通常経路では select_new_targets が事前に除外済み）。
+                    logger.info(
+                        f"未投入ファイルをスキップ（管理番号抽出不可のため投入対象"
+                        f"外だった可能性）: {pdf_file_name}"
+                    )
+                    stats["skip_unsubmitted"] += 1
+                else:
+                    # 投入されたはずなのに結果が無い＝真の missing。
+                    logger.warning(f"コメント未取得: {custom_id} ({pdf_file_name})")
+                    stats["missing"] += 1
+                continue
+
+            # results は通常 ``_parse_extraction`` が全フィールドを保証するが、
+            # 回収経路では disk（``batch_results.json``）から読むため、旧形式・
+            # 手編集のファイルだとフィールドが欠落し得る。KeyError で per-item
+            # try の外から抜けてラン全体が死なないよう .get で防御する。
+            meta = results[custom_id]
+            clinic_name_from_ai = meta.get("clinic_name", "") or "unknown_clinic"
+            person_name = meta.get("person_name", "") or "unknown_person"
+            sample_title = (
+                meta.get("sample_title", "") or Path(pdf_file_name).stem or "untitled"
+            )
+            comment = meta.get("comment", "")
+            if not comment:
+                # comment 欠落/空はこの item の恒久異常（コメントページを空で
+                # 作らない）。per-item エラーとして計上し続行する。
+                logger.error(
+                    f"バッチ結果に comment がありません（disk 上の "
+                    f"batch_results.json が不正な可能性）: {custom_id} "
+                    f"({pdf_file_name})"
+                )
+                stats["error"] += 1
+                continue
+
+            # 医院番号（管理番号の先頭セグメント）を抽出する。医院フォルダの識別
+            # は医院番号のみで行うため（P-019）、医院番号と医院名を別々に
+            # ``upload_pdf_to_clinic_person`` に渡す。医院番号が空の場合は
+            # ``find_or_create_clinic_folder`` 側で旧来の名前ベース照合に
+            # フォールバックする。
+            clinic_number = extract_clinic_number(pdf_file_name)
+            if not mgmt_num:
+                logger.warning(
+                    f"管理番号をファイル名から抽出できません"
+                    f"（先頭が NNN-NN-N 形式でない）: {pdf_file_name}"
+                )
+
+            # CB-3: Step4 開始時のスナップショットに mgmt_num が含まれていれば
+            # 前回 Step4 で処理済み（Drive アップロード + Sheets 追記 + 下書き想定）。
+            # 再処理すると Drive / Sheets / Gmail で重複が出るためスキップ。
+            # ただし case_map（添付資料パススルー用の対応表）には **登録する**。
+            # 前回ランが「メイン記録後・添付コピー前」でクラッシュした場合、この
+            # 登録が無いと添付資料が対応表を引けず恒久ロストになる（AI 抽出結果
+            # ``meta`` はバッチ結果に残っているため、アップロードなしで医院名解決
+            # だけ行える）。
+            if mgmt_num and mgmt_num in step4_processed:
+                logger.info(
+                    f"Step4 スキップ（処理済み再実行検知）: {mgmt_num} "
+                    f"({pdf_file_name})"
+                )
+                resolved_name, _ = run_common.resolve_clinic_name(
+                    sheets_client, master_records,
+                    extract_clinic_number(pdf_file_name), clinic_name_from_ai,
+                    logger,
+                )
+                case_map[mgmt_num] = (
+                    extract_clinic_number(pdf_file_name), resolved_name, person_name
+                )
+                stats["skip_already_processed"] += 1
+                continue
+
+            # 医院名は参加者マスターの標準表記を最優先、未登録なら AI 抽出値で
+            # 代用（警告ログは resolve_clinic_name 内）。以後すべての医院名
+            # 用途で ``clinic_name`` 変数を使う。
+            clinic_name, clinic_name_is_authoritative = (
+                run_common.resolve_clinic_name(
+                    sheets_client, master_records,
+                    clinic_number, clinic_name_from_ai, logger,
+                )
+            )
+
+            output_filename = pdf_merger.make_output_filename(
+                clinic_name, person_name, sample_title
+            )
+
+            try:
+                pdf_data = drive_client.download_pdf(item["pdf_data_id"])
+
+                # 中間ファイルは iteration スコープ、最終出力は session_outputs_dir
+                # に書いてループ終了後の集約下書き作成まで生存させる。
+                pdf_subdir = session_outputs_dir / f"main_{custom_id}"
+                pdf_subdir.mkdir(parents=True, exist_ok=True)
+                output_path = pdf_subdir / output_filename
+
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    comment_page_path = Path(tmpdir) / "comment_page.pdf"
+                    pdf_creator.create_comment_page(
+                        comment=comment,
+                        clinic_name=clinic_name,
+                        person_name=person_name,
+                        output_path=comment_page_path,
+                    )
+
+                    pdf_merger.merge_pdfs(
+                        original_pdf_data=pdf_data,
+                        comment_page_path=comment_page_path,
+                        output_path=output_path,
+                    )
+
+                    upload_result = drive_client.upload_pdf_to_clinic_person(
+                        file_path=output_path,
+                        output_root_folder_id=profile.output_folder_id,
+                        clinic_number=clinic_number,
+                        clinic_name=clinic_name,
+                        person_name=person_name,
+                        file_name=output_filename,
+                        # マスター由来の確定医院名なら既存フォルダ名も同期させる
+                        clinic_name_authoritative=clinic_name_is_authoritative,
+                    )
+
+                    sheets_client.append_output_record(
+                        management_number=mgmt_num,
+                        clinic_name=clinic_name,
+                        person_name=person_name,
+                        sample_name=sample_title,
+                        drive_url=upload_result["webViewLink"],
+                        sheet_name=profile.output_sheet_name,
+                    )
+                    # 医院フォルダURLシートに医院を記録（同一医院は 1 行のみ）。
+                    clinic_recorder.record(
+                        clinic_number, clinic_name,
+                        upload_result["clinic_folder_id"],
+                    )
+
+                # Gmail 下書きはここで作らず draft_items に蓄積する。ループ終了後
+                # にメールアドレスでグルーピングして 1 通にまとめる。
+                _collect_draft_item_batch(
+                    draft_items=draft_items,
+                    master_records=master_records,
+                    clinic_number=clinic_number,
+                    person_name=person_name,
+                    pdf_path=output_path,
+                )
+
+                # 添付資料パススルー用の対応表を構築。医院名は既にマスター標準化
+                # 済みの値が入っているため、添付資料経路はこの表をそのまま再利用
+                # すれば同じフォルダ・同じ列値になる。
+                if mgmt_num:
+                    case_map[mgmt_num] = (
+                        clinic_number, clinic_name, person_name
+                    )
+                logger.info(
+                    f"完了: {mgmt_num} / {clinic_name} / {person_name} / {sample_title}"
+                )
+                stats["success"] += 1
+
+                # ドラフト OFF なら出力 PDF はもう不要（Drive 保存済み）。
+                # 逐次削除してディスク滞留を防ぐ。
+                if not keep_outputs:
+                    shutil.rmtree(pdf_subdir, ignore_errors=True)
+
+            except Exception as e:
+                logger.error(
+                    f"処理エラー: {custom_id} ({pdf_file_name}) - {e}",
+                    exc_info=True,
+                )
+                stats["error"] += 1
+
+        # ── 添付資料パススルー経路 ──
+        # batch_attachments.json を読み、各添付資料を case_map で引いて、同じ管理
+        # 番号のメインと同じ出力フォルダへ元ファイル名のままコピーする。AI 処理
+        # （Claude API / コメントページ生成 / 結合）は一切しない。ファイルが
+        # 存在しない（添付資料ゼロ）場合は何もしない。添付資料 PDF も同じ
+        # session_outputs_dir / draft_items に蓄積される（同じ個人宛グループに合流）。
+        _process_attachments(
+            profile, case_map, stats, master_records,
+            session_outputs_dir, draft_items,
+            keep_outputs=keep_outputs,
+        )
+
+        # ── 集約下書き作成 ──
+        # メイン + 添付資料経路で蓄積した draft_items をメールアドレスでグルーピング
+        # し、グループごとに 1 通の Gmail 下書きを作成する。Gmail 下書きの ON/OFF
+        # 判定は ``_create_grouped_drafts_for_batch`` 内で行う。一時ファイル削除は必ず行う。
         _create_grouped_drafts_for_batch(draft_items)
     finally:
         shutil.rmtree(session_outputs_dir, ignore_errors=True)
@@ -1000,6 +1035,7 @@ def _process_attachments(
     master_records: list[MasterRecord],
     session_outputs_dir: Path,
     draft_items: list[dict[str, Any]],
+    keep_outputs: bool = True,
 ) -> None:
     """``batch_attachments.json`` を読み、添付資料をメインと同じ出力先へコピーする。
 
@@ -1024,7 +1060,17 @@ def _process_attachments(
         logger.info("添付資料データなし（batch_attachments.json 不在）")
         return
 
-    attachment_records: list[dict] = json.loads(attachments_file.read_text())
+    try:
+        attachment_records: list[dict] = json.loads(attachments_file.read_text())
+    except json.JSONDecodeError as e:
+        # atomic write（P-023）により通常は起きないが、手編集・部分コピー等で
+        # 壊れた場合に生の Traceback で終わらせず、復旧手順つきで loud に停止
+        # する（P-001）。
+        raise RuntimeError(
+            f"添付資料データが壊れています: {attachments_file}。"
+            f"このファイルを削除するか、--step prepare を再実行して"
+            f"作り直してください（元エラー: {e}）"
+        ) from e
     if not attachment_records:
         logger.info("添付資料 0 件")
         return
@@ -1090,6 +1136,11 @@ def _process_attachments(
             session_outputs_dir=session_outputs_dir,
             clinic_name_authoritative=clinic_name_authoritative,
         )
+        # ドラフト OFF なら添付コピーの一時ファイルも逐次削除（ディスク滞留防止）。
+        if not keep_outputs:
+            shutil.rmtree(
+                session_outputs_dir / f"attach_{file_id}", ignore_errors=True,
+            )
 
 
 def _mark_batches_done(target_sheet_name: str, batch_ids: list[str]) -> None:

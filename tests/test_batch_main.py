@@ -2513,5 +2513,209 @@ class TestRunPollBudgetSharing(unittest.TestCase):
             self.assertEqual(batch_main._remaining_seconds(50.0), 60)
 
 
+class TestLongRunHardening(unittest.TestCase):
+    """長時間・反復動作のハードニング（Phase 23 PR-6）。
+
+    - 一時ディレクトリ掃除の全域化（未ガード区間の例外でもリークしない）
+    - disk 由来 JSON（batch_results / batch_attachments）の防御的パース
+    - ドラフト OFF 時のディスク逐次解放
+    """
+
+    def setUp(self):
+        from src.config import LOGS_DIR
+        LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        self._att_file = LOGS_DIR / "batch_attachments.json"
+        self._att_backup = (
+            self._att_file.read_text() if self._att_file.exists() else None
+        )
+
+    def tearDown(self):
+        if self._att_backup is None:
+            self._att_file.unlink(missing_ok=True)
+        else:
+            self._att_file.write_text(self._att_backup)
+
+    def _make_session_dir(self):
+        """mkdtemp を差し替えて掃除の有無を観測できる実ディレクトリを作る。"""
+        import tempfile as _tf
+        from pathlib import Path as _P
+        return _P(_tf.mkdtemp(prefix="test_session_"))
+
+    def _selective_mkdtemp(self, session_dir):
+        """session_outputs_dir の mkdtemp だけを差し替える fake を返す。
+
+        step4 はループ内の中間ファイルにも ``tempfile.TemporaryDirectory``
+        （内部で mkdtemp を呼ぶ）を使うため、無条件に固定パスを返すと
+        TemporaryDirectory の exit がセッションディレクトリを消してしまう。
+        prefix で選別し、それ以外は本物に委譲する。
+        """
+        import tempfile as _tf
+        real_mkdtemp = _tf.mkdtemp
+
+        def _fake(*args, **kwargs):
+            prefix = kwargs.get("prefix") or (args[2] if len(args) > 2 else None)
+            if prefix == "aicomment_batch_outputs_":
+                return str(session_dir)
+            return real_mkdtemp(*args, **kwargs)
+
+        return _fake
+
+    @patch("src.batch_main.pdf_merger")
+    @patch("src.batch_main.pdf_creator")
+    @patch("src.batch_main.drive_client")
+    @patch("src.batch_main.sheets_client")
+    @patch("src.batch_main.ensure_fonts")
+    def test_corrupt_attachments_json_raises_clear_error_and_cleans_tempdir(
+        self, mock_fonts, mock_sheets, mock_drive, mock_creator, mock_merger,
+    ):
+        """壊れた batch_attachments.json → 復旧手順つき RuntimeError。
+        かつ、（未ガード区間だった箇所の例外でも）一時ディレクトリは削除される。"""
+        _install_step4_mocks(mock_drive, mock_merger, mock_sheets)
+        mock_sheets.get_processed_management_numbers.return_value = set()
+        self._att_file.write_text("{ this is not valid json !!!")
+        session_dir = self._make_session_dir()
+
+        with patch(
+            "src.batch_main.tempfile.mkdtemp",
+            side_effect=self._selective_mkdtemp(session_dir),
+        ):
+            with self.assertRaises(RuntimeError) as ctx:
+                batch_main.step4_generate_pdfs(
+                    _make_profile(),
+                    results=_make_batch_results(1),
+                    items=_make_batch_items(["001-01-0事例.pdf"]),
+                )
+
+        self.assertIn("--step prepare", str(ctx.exception))
+        # 例外経路でも一時ディレクトリが掃除されている（6a）
+        self.assertFalse(session_dir.exists())
+
+    @patch("src.batch_main.pdf_merger")
+    @patch("src.batch_main.pdf_creator")
+    @patch("src.batch_main.drive_client")
+    @patch("src.batch_main.sheets_client")
+    @patch("src.batch_main.ensure_fonts")
+    def test_success_path_still_cleans_tempdir(
+        self, mock_fonts, mock_sheets, mock_drive, mock_creator, mock_merger,
+    ):
+        """成功パスの掃除は従来どおり（回帰）。"""
+        _install_step4_mocks(mock_drive, mock_merger, mock_sheets)
+        mock_sheets.get_processed_management_numbers.return_value = set()
+        session_dir = self._make_session_dir()
+
+        with patch(
+            "src.batch_main.tempfile.mkdtemp",
+            side_effect=self._selective_mkdtemp(session_dir),
+        ):
+            batch_main.step4_generate_pdfs(
+                _make_profile(),
+                results=_make_batch_results(1),
+                items=_make_batch_items(["001-01-0事例.pdf"]),
+            )
+
+        self.assertFalse(session_dir.exists())
+
+    @patch("src.batch_main.pdf_merger")
+    @patch("src.batch_main.pdf_creator")
+    @patch("src.batch_main.drive_client")
+    @patch("src.batch_main.sheets_client")
+    @patch("src.batch_main.ensure_fonts")
+    def test_missing_meta_fields_counted_as_error_not_crash(
+        self, mock_fonts, mock_sheets, mock_drive, mock_creator, mock_merger,
+    ):
+        """disk 由来の旧形式/手編集 results（フィールド欠落）でも KeyError で
+        ラン全体が死なず、per-item エラーとして続行する（6b）。"""
+        _install_step4_mocks(mock_drive, mock_merger, mock_sheets)
+        mock_sheets.get_processed_management_numbers.return_value = set()
+        items = _make_batch_items(["001-01-0欠落.pdf", "002-02-0正常.pdf"])
+        results = {
+            items[0]["custom_id"]: {"clinic_name": "山田歯科"},  # comment 欠落
+            items[1]["custom_id"]: {
+                "clinic_name": "山田歯科", "person_name": "田中太郎",
+                "sample_title": "事例", "comment": "コメント本文",
+            },
+        }
+
+        with self.assertLogs("jissen_comment", level="ERROR") as log_ctx:
+            batch_main.step4_generate_pdfs(_make_profile(), results, items=items)
+
+        joined = "\n".join(log_ctx.output)
+        self.assertIn("comment がありません", joined)
+        # 欠落 item はスキップ、正常 item は処理される
+        self.assertEqual(mock_drive.upload_pdf_to_clinic_person.call_count, 1)
+
+    @patch("src.batch_main.pdf_merger")
+    @patch("src.batch_main.pdf_creator")
+    @patch("src.batch_main.drive_client")
+    @patch("src.batch_main.sheets_client")
+    @patch("src.batch_main.ensure_fonts")
+    def test_drafts_off_deletes_outputs_incrementally(
+        self, mock_fonts, mock_sheets, mock_drive, mock_creator, mock_merger,
+    ):
+        """ENABLE_GMAIL_DRAFTS=False: アップロード成功直後にサブディレクトリが
+        消えている（集約下書きフェーズを待たない）。"""
+        _install_step4_mocks(mock_drive, mock_merger, mock_sheets)
+        mock_sheets.get_processed_management_numbers.return_value = set()
+        session_dir = self._make_session_dir()
+        observed: dict[str, bool] = {}
+
+        def _drafts_probe(draft_items):
+            # 集約下書きフェーズ到達時点で main_* サブディレクトリが残って
+            # いないことを観測する
+            observed["main_dirs"] = any(
+                p.name.startswith("main_") for p in session_dir.iterdir()
+            )
+
+        with patch(
+            "src.batch_main.tempfile.mkdtemp",
+            side_effect=self._selective_mkdtemp(session_dir),
+        ), patch(
+            "src.batch_main._create_grouped_drafts_for_batch",
+            side_effect=_drafts_probe,
+        ), patch.object(batch_main.config, "ENABLE_GMAIL_DRAFTS", False):
+            batch_main.step4_generate_pdfs(
+                _make_profile(),
+                results=_make_batch_results(1),
+                items=_make_batch_items(["001-01-0事例.pdf"]),
+            )
+
+        self.assertFalse(observed["main_dirs"])
+
+    @patch("src.batch_main.pdf_merger")
+    @patch("src.batch_main.pdf_creator")
+    @patch("src.batch_main.drive_client")
+    @patch("src.batch_main.sheets_client")
+    @patch("src.batch_main.ensure_fonts")
+    def test_drafts_on_keeps_outputs_until_draft_creation(
+        self, mock_fonts, mock_sheets, mock_drive, mock_creator, mock_merger,
+    ):
+        """ENABLE_GMAIL_DRAFTS=True: 集約下書きフェーズまで出力を保持する
+        （現状維持の回帰）。"""
+        _install_step4_mocks(mock_drive, mock_merger, mock_sheets)
+        mock_sheets.get_processed_management_numbers.return_value = set()
+        session_dir = self._make_session_dir()
+        observed: dict[str, bool] = {}
+
+        def _drafts_probe(draft_items):
+            observed["main_dirs"] = any(
+                p.name.startswith("main_") for p in session_dir.iterdir()
+            )
+
+        with patch(
+            "src.batch_main.tempfile.mkdtemp",
+            side_effect=self._selective_mkdtemp(session_dir),
+        ), patch(
+            "src.batch_main._create_grouped_drafts_for_batch",
+            side_effect=_drafts_probe,
+        ), patch.object(batch_main.config, "ENABLE_GMAIL_DRAFTS", True):
+            batch_main.step4_generate_pdfs(
+                _make_profile(),
+                results=_make_batch_results(1),
+                items=_make_batch_items(["001-01-0事例.pdf"]),
+            )
+
+        self.assertTrue(observed["main_dirs"])
+
+
 if __name__ == "__main__":
     unittest.main()
