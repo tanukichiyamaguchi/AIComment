@@ -18,6 +18,23 @@ def _get_secret(key: str, default: str = "") -> str:
         return default
 
 
+def _get_int(key: str, default: int) -> int:
+    """環境変数を正の整数として取得する。
+
+    不正値（数値でない・0 以下）は ``default`` にフォールバックする。誤設定で
+    ラン全体が起動不能になるより、安全な既定で動き続ける方を優先する
+    （fail-soft、値は起動ログで確認できる）。
+    """
+    raw = _get_secret(key, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
 def _get_bool(key: str, default: bool) -> bool:
     """環境変数を真偽値として取得する。
 
@@ -73,6 +90,13 @@ GOOGLE_SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/gmail.compose",
 ]
+
+# ── Batch step1 のダウンロード並列度 ──
+# step1（PDF ダウンロード + テキスト抽出）は 1000 件で 15〜50 分かかる最重量
+# フェーズ。並列度 > 1 で ThreadPoolExecutor により短縮できる（I/O バウンド）。
+# 既定 1 = 従来の逐次実行（コードパスも従来のまま）。本番 GHA では workflow の
+# env で 4 を指定する。8 以下推奨（Drive の per-user クエリ quota への配慮）。
+STEP1_DOWNLOAD_WORKERS = _get_int("STEP1_DOWNLOAD_WORKERS", 1)
 
 # Google API の一過性エラー（503/429/5xx）に対する自動リトライ回数。
 # googleapiclient の ``HttpRequest.execute(num_retries=N)`` /

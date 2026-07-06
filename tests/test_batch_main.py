@@ -2717,5 +2717,126 @@ class TestLongRunHardening(unittest.TestCase):
         self.assertTrue(observed["main_dirs"])
 
 
+class TestStep1ParallelDownload(unittest.TestCase):
+    """step1 ダウンロード並列化（Phase 23 PR-2a）。
+
+    既定 workers=1 は従来の逐次コードパス。workers>1 は ThreadPoolExecutor +
+    executor.map（投入順 yield）で、items の順序は targets 順で決定的。
+    """
+
+    def _pdf_files(self, n: int) -> list[dict]:
+        return [
+            {"id": f"id_{i:03d}", "name": f"{i:03d}-01-0事例.pdf"}
+            for i in range(1, n + 1)
+        ]
+
+    @patch("src.batch_main.pdf_reader")
+    @patch("src.batch_main.sheets_client")
+    @patch("src.batch_main.drive_client")
+    def test_parallel_preserves_target_order(
+        self, mock_drive, mock_sheets, mock_reader,
+    ):
+        """並列でも items の順序は targets 順（チャンク境界の決定論）。"""
+        import time as _time
+        files = self._pdf_files(5)
+        mock_drive.list_pdfs.return_value = files
+        mock_sheets.get_processed_management_numbers.return_value = set()
+        mock_sheets.get_recorded_attachment_names.return_value = set()
+
+        def _slow_download(file_id):
+            # 先頭ほど遅くする（完了順 ≠ 投入順の状況を作る）
+            _time.sleep(0.05 if file_id == "id_001" else 0.0)
+            return f"%PDF {file_id}".encode()
+
+        mock_drive.download_pdf.side_effect = _slow_download
+        mock_reader.extract_text.side_effect = (
+            lambda data: data.decode().replace("%PDF ", "text-")
+        )
+
+        items = batch_main.step1_prepare(
+            _make_profile(), test_count=0, download_workers=3,
+        )
+
+        self.assertEqual(
+            [it["pdf_data_id"] for it in items],
+            [f["id"] for f in files],
+        )
+        self.assertEqual(items[0]["pdf_text"], "text-id_001")
+
+    @patch("src.batch_main.pdf_reader")
+    @patch("src.batch_main.sheets_client")
+    @patch("src.batch_main.drive_client")
+    def test_parallel_single_failure_is_isolated(
+        self, mock_drive, mock_sheets, mock_reader,
+    ):
+        """並列中の 1 件失敗は skipped_records に入り、残りは items に入る。"""
+        files = self._pdf_files(3)
+        mock_drive.list_pdfs.return_value = files
+        mock_sheets.get_processed_management_numbers.return_value = set()
+        mock_sheets.get_recorded_attachment_names.return_value = set()
+
+        def _download(file_id):
+            if file_id == "id_002":
+                raise OSError("network blip")
+            return b"%PDF ok"
+
+        mock_drive.download_pdf.side_effect = _download
+        mock_reader.extract_text.return_value = "テキスト"
+
+        items = batch_main.step1_prepare(
+            _make_profile(), test_count=0, download_workers=3,
+        )
+
+        self.assertEqual(
+            [it["pdf_data_id"] for it in items], ["id_001", "id_003"],
+        )
+        import json as _json
+        from src.config import LOGS_DIR
+        skips = _json.loads((LOGS_DIR / "batch_step1_skips.json").read_text())
+        self.assertEqual(
+            [s["file_id"] for s in skips if s["reason"] == "download_or_parse_error"],
+            ["id_002"],
+        )
+
+    @patch("src.batch_main.pdf_reader")
+    @patch("src.batch_main.sheets_client")
+    @patch("src.batch_main.drive_client")
+    def test_parallel_refresh_error_fails_fast(
+        self, mock_drive, mock_sheets, mock_reader,
+    ):
+        """並列でも RefreshError は fail-fast で伝播する。"""
+        from google.auth.exceptions import RefreshError as _RefreshError
+        mock_drive.list_pdfs.return_value = self._pdf_files(4)
+        mock_sheets.get_processed_management_numbers.return_value = set()
+        mock_sheets.get_recorded_attachment_names.return_value = set()
+        mock_drive.download_pdf.side_effect = _RefreshError("expired")
+
+        with self.assertRaises(_RefreshError):
+            batch_main.step1_prepare(
+                _make_profile(), test_count=0, download_workers=3,
+            )
+
+    @patch("src.batch_main.ThreadPoolExecutor")
+    @patch("src.batch_main.pdf_reader")
+    @patch("src.batch_main.sheets_client")
+    @patch("src.batch_main.drive_client")
+    def test_workers_one_uses_sequential_path(
+        self, mock_drive, mock_sheets, mock_reader, mock_executor,
+    ):
+        """workers=1（既定）は ThreadPoolExecutor を使わない（従来パス温存）。"""
+        mock_drive.list_pdfs.return_value = self._pdf_files(2)
+        mock_sheets.get_processed_management_numbers.return_value = set()
+        mock_sheets.get_recorded_attachment_names.return_value = set()
+        mock_drive.download_pdf.return_value = b"%PDF ok"
+        mock_reader.extract_text.return_value = "テキスト"
+
+        items = batch_main.step1_prepare(
+            _make_profile(), test_count=0, download_workers=1,
+        )
+
+        self.assertEqual(len(items), 2)
+        mock_executor.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

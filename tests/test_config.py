@@ -57,5 +57,23 @@ class TestEnableGmailDraftsDefault(unittest.TestCase):
             self.assertFalse(config._get_bool("ENABLE_GMAIL_DRAFTS", default=True))
 
 
+
+
+class TestGetInt(unittest.TestCase):
+    """``config._get_int``: 正の整数の環境変数取得（不正値は既定へ）。"""
+
+    def test_valid_value(self):
+        with patch.dict(os.environ, {"X_INT": "4"}):
+            self.assertEqual(config._get_int("X_INT", 1), 4)
+
+    def test_unset_returns_default(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("X_INT_UNSET", None)
+            self.assertEqual(config._get_int("X_INT_UNSET", 3), 3)
+
+    def test_invalid_values_return_default(self):
+        for bad in ("abc", "0", "-1", "", "4.5"):
+            with patch.dict(os.environ, {"X_INT": bad}):
+                self.assertEqual(config._get_int("X_INT", 2), 2, bad)
 if __name__ == "__main__":
     unittest.main()

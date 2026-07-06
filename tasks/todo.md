@@ -15,6 +15,7 @@ Phase 22（耐障害系）の次段。ユーザー優先領域「処理速度」
       の per-item エラー化 + JSONDecodeError の復旧手順つき RuntimeError）
 - [x] 6c: ENABLE_GMAIL_DRAFTS=false 時のディスク逐次解放（アップロード直後に
       サブディレクトリ削除。ON は従来通り、回帰テストで固定）
+- [x] PR #61 マージ済み（2026-07-06）
 - [x] pytest 719 → 725 件 pass / mypy clean
 - 検証済み・対処不要: ログローテ(100MB×5世代) / logs/上書き型 / キャッシュ有界 /
   メモリ(1000件で~115MB)
@@ -30,11 +31,16 @@ Phase 22（耐障害系）の次段。ユーザー優先領域「処理速度」
 - [x] pytest 704 → 712 件 pass / mypy clean
 - [x] PR #59 マージ済み（2026-07-04）
 
-### PR-2: 処理速度（未着手・PR-1マージ後）
-- [ ] 2a: step1 ダウンロード並列化（ThreadPoolExecutor、既定 workers=1 で現状維持、
-      env `STEP1_DOWNLOAD_WORKERS` で本番のみ ON）
-- [ ] 2b: Drive/Sheets サービスの thread-local キャッシュ（build+token refresh 削減）
-- [ ] 2c: `read_master_records` のプロセス内メモ化（step1/step4 二重読み解消）
+### PR-2: 処理速度（完了 2026-07-06）
+- [x] 2a: step1 ダウンロード並列化（ThreadPoolExecutor + executor.map で順序決定論、
+      既定 workers=1 = 従来逐次パス温存、本番 GHA は env `STEP1_DOWNLOAD_WORKERS: 4`。
+      RefreshError は fail-fast 伝播 + cancel_futures）
+- [x] 2b: Drive/Sheets サービスの thread-local キャッシュ（build+認証+リフレッシュを
+      呼び出しごと → プロセス/スレッドごと 1 回に。conftest autouse でテスト間リセット）
+- [x] 2c: `read_master_records` のプロセス内メモ化（step1 strict ガード + step4 の
+      二重読みを 1 読みに。空結果も同一オブジェクトでキャッシュ）
+- [x] config._get_int 新設（不正値は既定へ fail-soft）
+- [x] pytest 725 → 740 件 pass / mypy clean
 
 ### PR-3: 出力品質（完了）
 - [x] PR #60 マージ済み（2026-07-06）

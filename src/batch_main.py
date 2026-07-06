@@ -27,6 +27,7 @@ import re
 import shutil
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -205,9 +206,95 @@ def _resolve_items_for_step4(
     return reconstruct_items_from_drive(profile)
 
 
+def _prepare_one_target(pdf_file: dict) -> dict:
+    """メイン PDF 1 件のダウンロード + テキスト抽出を行い、結果タグ付きで返す。
+
+    並列実行（``ThreadPoolExecutor``）のワーカー。共有状態（カウンタ・
+    ``items`` / ``skipped_records``）には触れず、判定に必要な情報をすべて
+    戻り値に載せる（集計はメインスレッドの消費ループが行う）。
+
+    スレッド安全性: ``drive_client.download_pdf`` は呼び出しごとに
+    thread-local のサービスを使い（PR-2b）、``pdf_reader.extract_text`` は
+    bytes 入力のステートレス関数。共有可変状態は無い。
+
+    Returns:
+        ``{"status": "ok", "file_name", "item"}`` /
+        ``{"status": "empty_text", "file_id", "file_name"}`` /
+        ``{"status": "error", "file_id", "file_name", "error"}``
+
+    Raises:
+        RefreshError: Google 認証の恒久失敗。fail-fast 契約のため握らず
+            伝播させる（呼び出し側がランを即停止する）。
+    """
+    file_id = pdf_file["id"]
+    file_name = pdf_file["name"]
+    try:
+        pdf_data = drive_client.download_pdf(file_id)
+        pdf_text = pdf_reader.extract_text(pdf_data)
+    except RefreshError:
+        raise
+    except Exception as e:
+        return {
+            "status": "error",
+            "file_id": file_id,
+            "file_name": file_name,
+            "error": str(e),
+        }
+    if not pdf_text:
+        return {
+            "status": "empty_text",
+            "file_id": file_id,
+            "file_name": file_name,
+        }
+    return {
+        "status": "ok",
+        "file_name": file_name,
+        "item": {
+            # custom_id は Drive file id 由来の安定 ID。回収時の Drive 再走査
+            # でも同じ ID を再現でき batch_results.json と確実に突合できる
+            # （CB-4）。
+            "custom_id": _custom_id_for_file(file_id),
+            "pdf_data_id": file_id,  # 後でダウンロードし直す用
+            "pdf_file_name": file_name,
+            "pdf_text": pdf_text,
+        },
+    }
+
+
+def _consume_prepare_outcome(
+    outcome: dict,
+    items: list[dict],
+    skipped_records: list[dict],
+    logger: Any,
+) -> None:
+    """``_prepare_one_target`` の結果を items / skips に振り分ける（メインスレッド専用）。"""
+    if outcome["status"] == "ok":
+        items.append(outcome["item"])
+    elif outcome["status"] == "empty_text":
+        logger.warning(
+            f"テキスト抽出失敗（空テキスト）: {outcome['file_name']}"
+        )
+        skipped_records.append({
+            "file_id": outcome["file_id"],
+            "file_name": outcome["file_name"],
+            "reason": "empty_text_extraction",
+        })
+    else:  # "error"
+        logger.warning(
+            f"PDF処理失敗: {outcome['file_name']} - {outcome['error']}"
+        )
+        skipped_records.append({
+            "file_id": outcome["file_id"],
+            "file_name": outcome["file_name"],
+            "reason": "download_or_parse_error",
+            "error": outcome["error"],
+        })
+
+
 def step1_prepare(
     profile: ProfileConfig | RunConfig,
     test_count: int = 0,
+    download_workers: int | None = None,
 ) -> list[dict]:
     """Step 1: 準備 — PDF取得・重複判定・テキスト抽出。
 
@@ -234,6 +321,10 @@ def step1_prepare(
             と同じフィールドのみ参照する。
         test_count: 新規 PDF を N 件まで処理（0=全件処理）。重複・管理番号
             なしを除外した「処理対象の新規 PDF」に対して適用される。
+        download_workers: ダウンロード + テキスト抽出の並列度。None なら
+            ``config.STEP1_DOWNLOAD_WORKERS``（既定 1 = 従来の逐次実行）。
+            2 以上で ``ThreadPoolExecutor`` により並列化する（items の順序は
+            targets 順で決定的）。8 以下推奨（Drive quota への配慮）。
 
     Returns:
         Batch APIに投入可能なアイテムのリスト
@@ -323,52 +414,63 @@ def step1_prepare(
             "management_number": mgmt_num,
         })
 
-    items = []
+    items: list[dict] = []
     skip_extract_fail = 0  # M-2: テキスト抽出失敗を可視化
     skip_download_error = 0
-    for i, pdf_file in enumerate(targets, start=1):
-        file_id = pdf_file["id"]
-        file_name = pdf_file["name"]
-        logger.info(f"[{i}/{len(targets)}] {file_name}")
 
+    workers = (
+        download_workers if download_workers is not None
+        else config.STEP1_DOWNLOAD_WORKERS
+    )
+    if workers > 1 and len(targets) > 1:
+        # 並列パス: ダウンロード + 抽出は I/O バウンドで、逐次だと 1000 件で
+        # 15〜50 分かかる。``executor.map`` は **投入順に** 結果を yield する
+        # ため items の順序は targets 順で決定的（``plan_batch_chunks`` の
+        # チャンク境界が再走でも安定する）。カウンタ・skipped_records・items
+        # への追記はこの消費ループ（メインスレッド）でのみ行う（ロック不要）。
+        logger.info(f"Step 1: {workers} 並列でダウンロード + テキスト抽出")
+        executor = ThreadPoolExecutor(max_workers=workers)
         try:
-            pdf_data = drive_client.download_pdf(file_id)
-            pdf_text = pdf_reader.extract_text(pdf_data)
-            if not pdf_text:
-                logger.warning(f"テキスト抽出失敗（空テキスト）: {file_name}")
-                skip_extract_fail += 1
-                skipped_records.append({
-                    "file_id": file_id, "file_name": file_name,
-                    "reason": "empty_text_extraction",
-                })
-                continue
+            for i, outcome in enumerate(
+                executor.map(_prepare_one_target, targets), start=1,
+            ):
+                logger.info(f"[{i}/{len(targets)}] {outcome['file_name']}")
+                _consume_prepare_outcome(
+                    outcome, items, skipped_records, logger,
+                )
+                if outcome["status"] == "empty_text":
+                    skip_extract_fail += 1
+                elif outcome["status"] == "error":
+                    skip_download_error += 1
         except RefreshError:
             # Google 認証の恒久失敗（トークン失効/取り消し）。以降の全 item も
-            # 必ず同じエラーになるため、per-item fail-soft で 1000 回失敗ログを
-            # 吐き続けず即停止する（fail-fast、P-024 の Anthropic 版と同方針）。
+            # 必ず同じエラーになるため即停止する（fail-fast、P-024 と同方針）。
+            # 残りの未実行タスクはキャンセルして速やかに抜ける。
+            executor.shutdown(wait=False, cancel_futures=True)
             logger.error(
                 "Google 認証エラー（OAuth トークン失効の可能性）を検知。"
                 "GOOGLE_OAUTH_TOKEN_JSON を再発行して再実行してください。"
             )
             raise
-        except Exception as e:
-            logger.warning(f"PDF処理失敗: {file_name} - {e}")
-            skip_download_error += 1
-            skipped_records.append({
-                "file_id": file_id, "file_name": file_name,
-                "reason": "download_or_parse_error",
-                "error": str(e),
-            })
-            continue
-
-        items.append({
-            # custom_id は Drive file id 由来の安定 ID。回収時の Drive 再走査でも
-            # 同じ ID を再現でき batch_results.json と確実に突合できる（CB-4）。
-            "custom_id": _custom_id_for_file(file_id),
-            "pdf_data_id": file_id,  # 後でダウンロードし直す用
-            "pdf_file_name": file_name,
-            "pdf_text": pdf_text,
-        })
+        finally:
+            executor.shutdown(wait=True)
+    else:
+        # 逐次パス（既定）: 従来と同一の挙動・同一のログ形式。
+        for i, pdf_file in enumerate(targets, start=1):
+            logger.info(f"[{i}/{len(targets)}] {pdf_file['name']}")
+            try:
+                outcome = _prepare_one_target(pdf_file)
+            except RefreshError:
+                logger.error(
+                    "Google 認証エラー（OAuth トークン失効の可能性）を検知。"
+                    "GOOGLE_OAUTH_TOKEN_JSON を再発行して再実行してください。"
+                )
+                raise
+            _consume_prepare_outcome(outcome, items, skipped_records, logger)
+            if outcome["status"] == "empty_text":
+                skip_extract_fail += 1
+            elif outcome["status"] == "error":
+                skip_download_error += 1
 
     # 新規対象があるのに 1 件も準備できなかった場合は異常（ネットワーク断・
     # 権限剥奪・全 PDF 破損など系統的な障害の兆候）。「0 件投入 → 成功 0 件で

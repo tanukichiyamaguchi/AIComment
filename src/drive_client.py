@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+import threading
 import unicodedata
 from pathlib import Path
 from typing import Any
@@ -92,6 +93,32 @@ def get_drive_service() -> Any:
     return build("drive", "v3", credentials=creds)
 
 
+# ── サービスの thread-local キャッシュ ──
+# ``build()`` + 認証情報生成 + 初回トークンリフレッシュは 1 回あたり数百 ms の
+# コストがあり、従来は API 呼び出しのたびに実行していた（1000 件ランで
+# download + upload の 2000 回超）。プロセス内でキャッシュして排除する。
+# thread-local にする理由: googleapiclient のサービス（下層 httplib2）は
+# 非スレッドセーフのため、step1 の並列ダウンロード（PR-2a）ではスレッドごとに
+# 独立したサービスが必要。creds の期限切れは google-auth が呼び出し時に自動
+# リフレッシュするため、長時間ラン（5h ポーリング後の step4 等）でも安全。
+_SERVICE_TLS = threading.local()
+
+
+def _cached_drive_service() -> Any:
+    """thread-local にキャッシュした Drive サービスを返す（初回のみ構築）。"""
+    service = getattr(_SERVICE_TLS, "service", None)
+    if service is None:
+        service = get_drive_service()
+        _SERVICE_TLS.service = service
+    return service
+
+
+def reset_service_cache() -> None:
+    """サービスキャッシュをクリアする（テスト用）。"""
+    global _SERVICE_TLS
+    _SERVICE_TLS = threading.local()
+
+
 def list_pdfs(folder_id: str | None = None) -> list[dict]:
     """指定フォルダ内のPDFファイル一覧を取得する。共有ドライブ対応。
 
@@ -105,7 +132,7 @@ def list_pdfs(folder_id: str | None = None) -> list[dict]:
     if not folder_id:
         raise ValueError("DRIVE_FOLDER_IDが設定されていません")
 
-    service = get_drive_service()
+    service = _cached_drive_service()
     query = f"'{folder_id}' in parents and mimeType='application/pdf' and trashed=false"
 
     files = []
@@ -139,7 +166,7 @@ def download_pdf(file_id: str) -> bytes:
     Returns:
         PDFのバイナリデータ
     """
-    service = get_drive_service()
+    service = _cached_drive_service()
     request = service.files().get_media(
         fileId=file_id,
         supportsAllDrives=True,
@@ -201,7 +228,7 @@ def find_or_create_folder(
     if cached is not None:
         return cached
 
-    service = service or get_drive_service()
+    service = service or _cached_drive_service()
 
     # 親フォルダ配下のフォルダを全件取得し、正規化形で一致するものを再利用する。
     # 完全一致検索だと「医療法人 かがやき」と「医療法人かがやき」のような表記揺れで
@@ -331,7 +358,7 @@ def upload_pdf(
     if not folder_id:
         raise ValueError("folder_id が空です")
 
-    service = service or get_drive_service()
+    service = service or _cached_drive_service()
     upload_name = file_name or file_path.name
 
     # 重複アップロード防止（P-023）。同名ファイルが既存なら再アップロードしない。
@@ -418,7 +445,7 @@ def find_or_create_clinic_folder(
     if cached_clinic is not None:
         return cached_clinic
 
-    service = service or get_drive_service()
+    service = service or _cached_drive_service()
 
     # 親フォルダ配下のサブフォルダ一覧を取得（P-010、pageToken ループ必須。
     # 親フォルダに 1001 件以上のサブフォルダがあるとき、2 ページ目以降に存在
@@ -568,7 +595,7 @@ def upload_pdf_to_clinic_person(
         ``clinic_folder_id`` は医院フォルダの Drive ID で、呼び出し側が
         医院フォルダ URL を構築する（医院フォルダ URL シート記録に使う）。
     """
-    service = service or get_drive_service()
+    service = service or _cached_drive_service()
     clinic_folder_id = find_or_create_clinic_folder(
         clinic_number=clinic_number,
         clinic_name=clinic_name,
