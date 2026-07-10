@@ -2840,5 +2840,73 @@ class TestStep1ParallelDownload(unittest.TestCase):
         mock_executor.assert_not_called()
 
 
+class TestTeamCaseDistributionBatch(unittest.TestCase):
+    """チーム事例の全員配布 e2e（Phase 24・Batch step4）。"""
+
+    def _master(self, mgmt, clinic, person, team="A班"):
+        from src.sheets_client import MasterRecord as _MR
+        return _MR(
+            management_number=mgmt, clinic_name=clinic,
+            participant_name=person, venue="", email="", team=team,
+        )
+
+    @patch("src.batch_main.pdf_merger")
+    @patch("src.batch_main.pdf_creator")
+    @patch("src.batch_main.drive_client")
+    @patch("src.batch_main.sheets_client")
+    @patch("src.batch_main.ensure_fonts")
+    def test_team_item_distributed_before_sheet_record(
+        self, mock_fonts, mock_sheets, mock_drive, mock_creator, mock_merger,
+    ):
+        _install_step4_mocks(mock_drive, mock_merger, mock_sheets)
+        mock_sheets.get_processed_management_numbers.return_value = set()
+        reporter = self._master("001-01", "山田歯科", "田中太郎")
+        team = [
+            reporter,
+            self._master("002-01", "佐藤歯科", "佐藤花子"),
+            self._master("003-01", "鈴木歯科", "鈴木一郎"),
+        ]
+        mock_sheets.lookup_participant_by_management_number.return_value = reporter
+        mock_sheets.find_team_members.return_value = team
+
+        uploads_at_append: list[int] = []
+
+        def _append_probe(**kwargs):
+            uploads_at_append.append(
+                mock_drive.upload_pdf_to_clinic_person.call_count
+            )
+
+        mock_sheets.append_output_record.side_effect = _append_probe
+
+        items = _make_batch_items(["001-01-0【α】チーム実践_接遇改善.pdf"])
+        batch_main.step4_generate_pdfs(
+            _make_profile(), results=_make_batch_results(1), items=items,
+        )
+
+        # 報告者 1 + メンバー 2 = 3 回、シート記録は 1 回・配布完了後（P-031）
+        self.assertEqual(mock_drive.upload_pdf_to_clinic_person.call_count, 3)
+        mock_sheets.append_output_record.assert_called_once()
+        self.assertEqual(uploads_at_append, [3])
+
+    @patch("src.batch_main.pdf_merger")
+    @patch("src.batch_main.pdf_creator")
+    @patch("src.batch_main.drive_client")
+    @patch("src.batch_main.sheets_client")
+    @patch("src.batch_main.ensure_fonts")
+    def test_non_team_item_not_distributed(
+        self, mock_fonts, mock_sheets, mock_drive, mock_creator, mock_merger,
+    ):
+        _install_step4_mocks(mock_drive, mock_merger, mock_sheets)
+        mock_sheets.get_processed_management_numbers.return_value = set()
+
+        items = _make_batch_items(["001-01-0実践事例.pdf"])
+        batch_main.step4_generate_pdfs(
+            _make_profile(), results=_make_batch_results(1), items=items,
+        )
+
+        self.assertEqual(mock_drive.upload_pdf_to_clinic_person.call_count, 1)
+        mock_sheets.find_team_members.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -210,6 +210,98 @@ def resolve_case_via_master(
     return (record.clinic_number, record.clinic_name, person_name)
 
 
+def distribute_team_copies(
+    drive_module: Any,
+    sheets_module: Any,
+    logger: logging.Logger,
+    *,
+    master_records: list[Any],
+    reporter_mgmt_num: str,
+    file_path: Path,
+    file_name: str,
+    output_folder_id: str,
+) -> int:
+    """チーム事例のコメント入り PDF を、報告者と同じチームの全メンバーの
+    フォルダへ配布する。
+
+    ファイル名に ``チーム実践_`` / ``チームMTG_`` を含む PDF（``is_team_filename``
+    判定）の呼び出し専用。報告者の管理番号 → 参加者マスター行 → F 列
+    「所属チーム」→ 同チームの全行、の順に配布先を解決し、各メンバーの
+    ``<医院番号>_<医院名>/<参加者名>/`` へ同じファイル名でアップロードする。
+
+    設計上の要点:
+        - **報告者自身は除外**する（報告者分は呼び出し元の既存フローが直前に
+          アップロード済み。二重アップロードは ``upload_pdf`` の同名スキップで
+          無害だが、無駄な Drive クエリを避ける）。
+        - **メンバーへのアップロード失敗は raise で伝播**する（fail-soft に
+          しない）。呼び出し元の per-item try が捕捉して error 計上 → 出力
+          一覧シート未記録 → 再実行で配布からやり直しになる（アップロードは
+          冪等なので安全）。fail-soft にすると「一部メンバーだけ欠けたまま
+          シート記録済み = 恒久欠落」になる（P-031 の教訓）。
+        - 呼び出し元は本関数を ``append_output_record`` より **前** に呼ぶこと
+          （配布 → 記録の順序。逆にすると記録後クラッシュで配布漏れが恒久化）。
+        - 報告者がマスター未登録 / F 列が空の場合は WARNING を出して 0 件で
+          戻る（報告者のみ = 従来動作への自然なフォールバック。raise しない）。
+
+    Args:
+        drive_module: drive_client モジュール（依存注入、テストパッチ互換）
+        sheets_module: sheets_client モジュール
+        logger: ログ出力先
+        master_records: ``read_master_records`` のスナップショット
+        reporter_mgmt_num: 報告者 PDF の管理番号（ファイル名冒頭 ``NNN-NN-N``）
+        file_path: コメント結合済み PDF のローカルパス
+        file_name: Drive 上のファイル名（全メンバー共通・報告者分と同名）
+        output_folder_id: 出力ルートフォルダの Drive ID
+
+    Returns:
+        配布したメンバー数（報告者を除く）。フォールバック時は 0。
+    """
+    reporter = sheets_module.lookup_participant_by_management_number(
+        master_records, reporter_mgmt_num,
+    )
+    if reporter is None or not reporter.team:
+        logger.warning(
+            f"チーム事例ですが配布先を解決できません（参加者マスターに"
+            f"管理番号 {reporter_mgmt_num} の行が無いか、F 列「所属チーム」が"
+            f"空）: {file_name} → 報告者のフォルダのみに保存します"
+        )
+        return 0
+
+    members = sheets_module.find_team_members(master_records, reporter.team)
+    reporter_key = (
+        reporter.clinic_number,
+        # 報告者自身の行を除外する（find_team_members と同じ同一人物判定）
+        reporter.participant_name,
+    )
+    distributed = 0
+    for member in members:
+        if (member.clinic_number, member.participant_name) == reporter_key:
+            continue
+        if not member.clinic_name:
+            logger.warning(
+                f"チーム配布先の医院名が空のためスキップ "
+                f"(管理番号={member.management_number})"
+            )
+            continue
+        drive_module.upload_pdf_to_clinic_person(
+            file_path=file_path,
+            output_root_folder_id=output_folder_id,
+            clinic_number=member.clinic_number,
+            clinic_name=member.clinic_name,
+            person_name=member.participant_name or "unknown_person",
+            file_name=file_name,
+            # マスター由来の確定医院名なので既存フォルダ名の同期を許可
+            clinic_name_authoritative=True,
+        )
+        distributed += 1
+
+    logger.info(
+        f"チーム事例を配布: チーム={mask_name(reporter.team)} / "
+        f"報告者を除く {distributed} 名のフォルダへコピー ({file_name})"
+    )
+    return distributed
+
+
 def collect_draft_item(
     draft_items: list[dict[str, Any]],
     master_records: list[Any],

@@ -197,6 +197,32 @@ def is_attachment_filename(filename: str) -> bool:
     return _ATTACHMENT_MARKER in filename
 
 
+# チーム事例のファイル名マーカー。``XXX-YY-Z【α】チーム実践_タイトル.pdf`` /
+# ``XXX-YY-Z【α】チームMTG_タイトル.pdf`` のように、管理番号プレフィックスの
+# 後にこの語を含むファイルは「チーム全員のフォルダへ配布する」対象になる
+# （参加者マスター F 列「所属チーム」で配布先を解決する）。
+_TEAM_FILE_MARKERS = ("チーム実践_", "チームMTG_")
+
+
+def is_team_filename(filename: str) -> bool:
+    """ファイル名がチーム事例（全員配布の対象）を示すか判定する。
+
+    ファイル名に「チーム実践_」または「チームMTG_」を含む PDF は、報告者と
+    同じチーム（参加者マスター F 列）の全メンバーのフォルダへコメント入り
+    PDF をコピーする対象。ファイル名からチーム名自体は判別できないため、
+    配布先の解決はマスターの管理番号 → 所属チームの lookup で行う。
+
+    Args:
+        filename: PDF のファイル名
+
+    Returns:
+        ファイル名にチーム事例マーカーを含むなら True。
+    """
+    if not isinstance(filename, str):
+        filename = str(filename)
+    return any(marker in filename for marker in _TEAM_FILE_MARKERS)
+
+
 def normalize_name_for_match(name: str) -> str:
     """医院名・氏名のマッチング用に正規化する。
 

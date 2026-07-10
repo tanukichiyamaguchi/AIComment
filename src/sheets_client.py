@@ -15,7 +15,7 @@ from typing import Any
 
 from googleapiclient.discovery import build
 
-from src.utils import mask_name
+from src.utils import mask_name, normalize_name_for_match
 from src.config import (
     GOOGLE_API_NUM_RETRIES,
     GOOGLE_CREDENTIALS_JSON,
@@ -789,12 +789,18 @@ class MasterRecord:
         participant_name: C 列、参加者名（個人特定の突合キー）
         venue: D 列、申し込み会場（参照用）
         email: E 列、メールアドレス
+        team: F 列、所属チーム（任意）。チーム事例（ファイル名に
+            ``チーム実践_`` / ``チームMTG_`` を含む PDF）を、同じチームの
+            全メンバーのフォルダへ配布するための突合キー。空なら配布なし
+            （報告者のみ = 従来動作）。既存の 5 列タブは F が無いだけで
+            そのまま動く（後方互換）。
     """
     management_number: str
     clinic_name: str
     participant_name: str
     venue: str
     email: str
+    team: str = ""
 
     @property
     def clinic_number(self) -> str:
@@ -809,7 +815,7 @@ class MasterRecord:
 
 
 _MASTER_SHEET_HEADER = [
-    "管理番号", "医院名", "参加者名", "申し込み会場", "メールアドレス"
+    "管理番号", "医院名", "参加者名", "申し込み会場", "メールアドレス", "所属チーム"
 ]
 
 
@@ -1003,7 +1009,7 @@ def read_master_records(
 
     result = service.spreadsheets().values().get(
         spreadsheetId=spreadsheet_id,
-        range=f"{sheet_name}!A:E",
+        range=f"{sheet_name}!A:F",
     ).execute(num_retries=GOOGLE_API_NUM_RETRIES)
 
     rows = result.get("values", [])
@@ -1021,7 +1027,7 @@ def read_master_records(
     # ヘッダー行はスキップ（A1 はヘッダー）
     for i, row in enumerate(rows[1:], start=2):
         # 列が足りない場合は空文字で補完
-        while len(row) < 5:
+        while len(row) < 6:
             row.append("")
 
         management_number = (row[0] or "").strip()
@@ -1029,6 +1035,7 @@ def read_master_records(
         participant_name = (row[2] or "").strip()
         venue = (row[3] or "").strip()
         email = (row[4] or "").strip()
+        team = (row[5] or "").strip()
 
         # 管理番号も医院名も両方空の行は無視（空行 / コメント行扱い）
         if not management_number and not clinic_name:
@@ -1046,6 +1053,7 @@ def read_master_records(
             participant_name=participant_name,
             venue=venue,
             email=email,
+            team=team,
         ))
 
     if not records:
@@ -1113,6 +1121,49 @@ def lookup_clinic_name(
         ):
             return r.clinic_name
     return ""
+
+
+def find_team_members(
+    records: list[MasterRecord],
+    team: str,
+) -> list[MasterRecord]:
+    """指定チームに所属する参加者マスター行を全件返す。
+
+    チーム事例（``チーム実践_`` / ``チームMTG_``）を、報告者と同じチームの
+    全メンバーのフォルダへ配布するための配布先解決。チーム名の比較は
+    ``normalize_name_for_match``（NFKC + 全空白除去）で行い、全角/半角・
+    空白の表記揺れ（``A班`` と ``Ａ班`` 等）を吸収する（P-009: 比較は
+    正規化形・保持は元表記）。
+
+    Args:
+        records: ``read_master_records`` の戻り値
+        team: 報告者の所属チーム（F 列の値）
+
+    Returns:
+        同じチームの ``MasterRecord`` リスト（報告者自身も含む）。
+        ``team`` が空なら空リスト。同一人物とみなせる行
+        （医院番号 + 正規化参加者名が同じ）は 1 件に重複除去する。
+    """
+    if not team:
+        return []
+    target = normalize_name_for_match(team)
+
+    members: list[MasterRecord] = []
+    seen: set[tuple[str, str]] = set()
+    for record in records:
+        if not record.team:
+            continue
+        if normalize_name_for_match(record.team) != target:
+            continue
+        key = (
+            record.clinic_number,
+            normalize_name_for_match(record.participant_name),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        members.append(record)
+    return members
 
 
 def lookup_participant_by_management_number(
