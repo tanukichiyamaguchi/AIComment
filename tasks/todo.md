@@ -1,5 +1,29 @@
 # じっせん君コメントシステム - Task Tracker
 
+## Phase 24: チーム事例の全員配布（2026-07-06）
+
+### ゴール
+チーム実践事例・チームMTG実践レポート（ファイル名に `チーム実践_` / `チームMTG_`）の
+コメント入り PDF を、参加者マスター F 列「所属チーム」で解決したチーム全員のフォルダへ配布する。
+
+### ユーザー確定仕様
+- 判定: ファイル名マーカーの部分一致（`チーム実践_` / `チームMTG_`）
+- 出力一覧シートは報告者 1 行のみ / Gmail 下書きは報告者のみ（従来どおり）
+
+### タスク
+- [x] `utils.is_team_filename`（is_attachment_filename と同パターン）
+- [x] `MasterRecord.team`（末尾 default 付き = 後方互換）+ ヘッダー 6 列 +
+      `read_master_records` を A:F に拡張（既存 5 列タブは team="" で共存）
+- [x] `sheets_client.find_team_members`（正規化比較・空チーム除外・同一人物重複除去）
+- [x] `run_common.distribute_team_copies`（報告者除外・authoritative=True・
+      **メンバー失敗は raise 伝播 = P-031 契約**・マスター未登録/チーム空は WARNING +
+      0 件フォールバック・氏名ログは mask_name）
+- [x] main.py / batch_main.py step4 に配線（**配布 → append_output_record の順序**）
+- [x] tests: utils 5 / sheets 7 / run_common 5 / main e2e 3（順序契約含む）/ batch e2e 2
+- [x] pytest 745 → 767 件 pass / mypy clean
+- [x] README §4-4（6 列表）+ §4-5（チーム事例の全員配布）
+- [ ] ドラフト PR → ユーザーレビュー → マージ
+
 ## Phase 23: 処理速度 × 出力品質・正確性の改善（2026-07-02〜）
 
 ### ゴール

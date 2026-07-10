@@ -39,6 +39,7 @@ from src.utils import (
     ensure_fonts,
     extract_clinic_number,
     extract_management_number,
+    is_team_filename,
     mask_name,
 )
 from src import config
@@ -1008,6 +1009,20 @@ def step4_generate_pdfs(
                         # マスター由来の確定医院名なら既存フォルダ名も同期させる
                         clinic_name_authoritative=clinic_name_is_authoritative,
                     )
+
+                    # チーム事例（チーム実践_ / チームMTG_）は、同じチームの
+                    # 全メンバーのフォルダにも同じ PDF を配布する。シート記録
+                    # より **前** に行う（配布失敗 → 記録なし → 再実行で配布
+                    # からやり直し。逆順だと配布漏れが恒久化する、P-031）。
+                    if is_team_filename(pdf_file_name):
+                        run_common.distribute_team_copies(
+                            drive_client, sheets_client, logger,
+                            master_records=master_records,
+                            reporter_mgmt_num=mgmt_num,
+                            file_path=output_path,
+                            file_name=output_filename,
+                            output_folder_id=profile.output_folder_id,
+                        )
 
                     sheets_client.append_output_record(
                         management_number=mgmt_num,

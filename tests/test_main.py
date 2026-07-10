@@ -2183,5 +2183,167 @@ class TestTempDirCleanupOnException(unittest.TestCase):
         self.assertFalse(session_dir.exists())
 
 
+class TestTeamCaseDistribution(unittest.TestCase):
+    """チーム事例の全員配布 e2e（Phase 24・通常モード）。"""
+
+    def _master(self, mgmt, clinic, person, team="A班"):
+        from src.sheets_client import MasterRecord as _MR
+        return _MR(
+            management_number=mgmt, clinic_name=clinic,
+            participant_name=person, venue="", email="", team=team,
+        )
+
+    @patch("src.main.ensure_fonts")
+    @patch("src.main.pdf_merger")
+    @patch("src.main.pdf_creator")
+    @patch("src.main.pdf_reader")
+    @patch("src.main.comment_generator")
+    @patch("src.main.sheets_client")
+    @patch("src.main.drive_client")
+    @patch("src.discover.load_profile")
+    def test_team_file_distributed_to_all_members_before_sheet_record(
+        self,
+        mock_load_profile,
+        mock_drive_client,
+        mock_sheets_client,
+        mock_gen,
+        mock_reader,
+        mock_creator,
+        mock_merger,
+        mock_ensure_fonts,
+    ):
+        mock_load_profile.return_value = _make_profile()
+        mock_sheets_client.get_processed_management_numbers.return_value = set()
+        reporter = self._master("001-01", "山田歯科", "田中太郎")
+        team = [
+            reporter,
+            self._master("002-01", "佐藤歯科", "佐藤花子"),
+            self._master("003-01", "鈴木歯科", "鈴木一郎"),
+        ]
+        # distribute_team_copies が使う lookup / find をチーム構成で応答させる
+        mock_sheets_client.lookup_participant_by_management_number.return_value = (
+            reporter
+        )
+        mock_sheets_client.find_team_members.return_value = team
+        _install_run_mocks(
+            mock_drive_client, mock_gen, mock_reader, mock_creator, mock_merger,
+            mock_sheets_client=mock_sheets_client,
+            pdf_files=[
+                {"id": "id_1", "name": "001-01-0【α】チーム実践_接遇改善.pdf"},
+            ],
+        )
+
+        main_module.run(test_count=0, profile_name="jissen_default")
+
+        # 報告者 1 + メンバー 2（報告者除外）= 計 3 回アップロード
+        self.assertEqual(
+            mock_drive_client.upload_pdf_to_clinic_person.call_count, 3,
+        )
+        member_names = {
+            c.kwargs["person_name"]
+            for c in mock_drive_client.upload_pdf_to_clinic_person.call_args_list
+        }
+        self.assertEqual(member_names, {"田中太郎", "佐藤花子", "鈴木一郎"})
+        # シート記録は報告者の 1 行のみ
+        mock_sheets_client.append_output_record.assert_called_once()
+
+        # 順序契約（P-031）: 配布アップロードは全てシート記録より前
+        parent = MagicMock()
+        # attach_mock は事後では使えないため、呼び出し順を mock_calls の
+        # タイムライン比較で検証する（両 mock とも同一テスト内で記録済み）。
+        # ここでは「append 呼び出し時点で upload が 3 回済んでいた」ことを
+        # side_effect 検証で担保する代わりに、上の件数 assert +
+        # 実装位置（配線コード）で担保する。
+        del parent
+
+    @patch("src.main.ensure_fonts")
+    @patch("src.main.pdf_merger")
+    @patch("src.main.pdf_creator")
+    @patch("src.main.pdf_reader")
+    @patch("src.main.comment_generator")
+    @patch("src.main.sheets_client")
+    @patch("src.main.drive_client")
+    @patch("src.discover.load_profile")
+    def test_distribution_happens_before_sheet_record(
+        self,
+        mock_load_profile,
+        mock_drive_client,
+        mock_sheets_client,
+        mock_gen,
+        mock_reader,
+        mock_creator,
+        mock_merger,
+        mock_ensure_fonts,
+    ):
+        """append_output_record 呼び出し時点で配布 3 回が完了している（P-031）。"""
+        mock_load_profile.return_value = _make_profile()
+        mock_sheets_client.get_processed_management_numbers.return_value = set()
+        reporter = self._master("001-01", "山田歯科", "田中太郎")
+        team = [
+            reporter,
+            self._master("002-01", "佐藤歯科", "佐藤花子"),
+            self._master("003-01", "鈴木歯科", "鈴木一郎"),
+        ]
+        mock_sheets_client.lookup_participant_by_management_number.return_value = (
+            reporter
+        )
+        mock_sheets_client.find_team_members.return_value = team
+
+        uploads_at_append: list[int] = []
+
+        def _append_probe(**kwargs):
+            uploads_at_append.append(
+                mock_drive_client.upload_pdf_to_clinic_person.call_count
+            )
+
+        mock_sheets_client.append_output_record.side_effect = _append_probe
+        _install_run_mocks(
+            mock_drive_client, mock_gen, mock_reader, mock_creator, mock_merger,
+            mock_sheets_client=mock_sheets_client,
+            pdf_files=[
+                {"id": "id_1", "name": "001-01-0【α】チームMTG_月次.pdf"},
+            ],
+        )
+
+        main_module.run(test_count=0, profile_name="jissen_default")
+
+        self.assertEqual(uploads_at_append, [3])
+
+    @patch("src.main.ensure_fonts")
+    @patch("src.main.pdf_merger")
+    @patch("src.main.pdf_creator")
+    @patch("src.main.pdf_reader")
+    @patch("src.main.comment_generator")
+    @patch("src.main.sheets_client")
+    @patch("src.main.drive_client")
+    @patch("src.discover.load_profile")
+    def test_non_team_file_not_distributed(
+        self,
+        mock_load_profile,
+        mock_drive_client,
+        mock_sheets_client,
+        mock_gen,
+        mock_reader,
+        mock_creator,
+        mock_merger,
+        mock_ensure_fonts,
+    ):
+        """通常事例は配布されない（回帰）。"""
+        mock_load_profile.return_value = _make_profile()
+        mock_sheets_client.get_processed_management_numbers.return_value = set()
+        _install_run_mocks(
+            mock_drive_client, mock_gen, mock_reader, mock_creator, mock_merger,
+            mock_sheets_client=mock_sheets_client,
+            pdf_files=[{"id": "id_1", "name": "001-01-0実践事例.pdf"}],
+        )
+
+        main_module.run(test_count=0, profile_name="jissen_default")
+
+        self.assertEqual(
+            mock_drive_client.upload_pdf_to_clinic_person.call_count, 1,
+        )
+        mock_sheets_client.find_team_members.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -698,7 +698,7 @@ class TestReadMasterRecords(unittest.TestCase):
         service = _build_master_sheet_service(
             ["参加者マスター"],
             [
-                ["管理番号", "医院名", "参加者名", "申し込み会場", "メールアドレス"],
+                ["管理番号", "医院名", "参加者名", "申し込み会場", "メールアドレス", "所属チーム"],
                 ["101-01", "三浦歯科医院", "白川 蓮", "東京会場", "ren@example.com"],
                 ["101-02", "三浦歯科医院", "鈴木 一郎", "東京会場", "ichiro@example.com"],
                 ["102-01", "山本歯科", "田中 太郎", "大阪会場", "tanaka@example.com"],
@@ -739,10 +739,11 @@ class TestReadMasterRecords(unittest.TestCase):
             add_sheet_request["properties"]["title"], "参加者マスター"
         )
         update_call = service.spreadsheets.return_value.values.return_value.update.call_args
-        self.assertIn("参加者マスター!A1:E1", update_call.kwargs["range"])
+        # F 列「所属チーム」追加（Phase 24）でヘッダーは 6 列
+        self.assertIn("参加者マスター!A1:F1", update_call.kwargs["range"])
         self.assertEqual(
             update_call.kwargs["body"]["values"][0],
-            ["管理番号", "医院名", "参加者名", "申し込み会場", "メールアドレス"],
+            ["管理番号", "医院名", "参加者名", "申し込み会場", "メールアドレス", "所属チーム"],
         )
         self.assertEqual(records, [])
 
@@ -752,7 +753,7 @@ class TestReadMasterRecords(unittest.TestCase):
         service = _build_master_sheet_service(
             ["参加者マスター"],
             [
-                ["管理番号", "医院名", "参加者名", "申し込み会場", "メールアドレス"],
+                ["管理番号", "医院名", "参加者名", "申し込み会場", "メールアドレス", "所属チーム"],
                 ["101-01", "三浦歯科医院", "白川 蓮", "東京会場", "ren@example.com"],
                 ["", "", "", "", ""],  # 空行
                 ["102-01", "山本歯科", "田中 太郎", "大阪会場", "tanaka@example.com"],
@@ -774,7 +775,7 @@ class TestReadMasterRecords(unittest.TestCase):
         service = _build_master_sheet_service(
             ["参加者マスター"],
             [
-                ["管理番号", "医院名", "参加者名", "申し込み会場", "メールアドレス"],
+                ["管理番号", "医院名", "参加者名", "申し込み会場", "メールアドレス", "所属チーム"],
                 ["101-01", "三浦歯科", "白川 蓮", "東京会場", "not-an-email"],
             ],
         )
@@ -799,7 +800,7 @@ class TestReadMasterRecords(unittest.TestCase):
         service = _build_master_sheet_service(
             ["参加者マスター"],
             [
-                ["管理番号", "医院名", "参加者名", "申し込み会場", "メールアドレス"],
+                ["管理番号", "医院名", "参加者名", "申し込み会場", "メールアドレス", "所属チーム"],
                 ["101-01", "三浦歯科", "白川 蓮", "東京会場", "ren@example.com"],
             ],
         )
@@ -829,7 +830,7 @@ class TestReadMasterRecords(unittest.TestCase):
         service = _build_master_sheet_service(
             [sheets_client.MASTER_SHEET_NAME],
             [
-                ["管理番号", "医院名", "参加者名", "申し込み会場", "メールアドレス"],
+                ["管理番号", "医院名", "参加者名", "申し込み会場", "メールアドレス", "所属チーム"],
                 ["101-01", "A", "B", "東京", "b@example.com"],
             ],
         )
@@ -846,7 +847,7 @@ class TestReadMasterRecords(unittest.TestCase):
         service = _build_master_sheet_service(
             ["参加者マスター"],
             [
-                ["管理番号", "医院名", "参加者名", "申し込み会場", "メールアドレス"],
+                ["管理番号", "医院名", "参加者名", "申し込み会場", "メールアドレス", "所属チーム"],
             ],
         )
         mock_get_service.return_value = service
@@ -1941,6 +1942,93 @@ class TestMasterRecordsMemoization(unittest.TestCase):
         self.assertEqual(first, [])
         self.assertIs(first, second)
         self.assertEqual(mock_get_service.call_count, calls_after_first)
+
+
+class TestMasterRecordTeamColumn(unittest.TestCase):
+    """参加者マスター F 列「所属チーム」の読み取り（Phase 24・後方互換）。"""
+
+    def _service(self, rows: list[list[str]]) -> MagicMock:
+        service = MagicMock()
+        service.spreadsheets.return_value.get.return_value.execute.return_value = {
+            "sheets": [{"properties": {"title": "参加者マスター"}}]
+        }
+        service.spreadsheets.return_value.values.return_value.get.return_value \
+            .execute.return_value = {"values": rows}
+        return service
+
+    @patch("src.sheets_client.get_sheets_service")
+    def test_six_column_row_reads_team(self, mock_get_service):
+        mock_get_service.return_value = self._service([
+            ["管理番号", "医院名", "参加者名", "会場", "メール", "所属チーム"],
+            ["001-01", "山田歯科", "田中太郎", "東京", "a@example.com", "A班"],
+        ])
+        records = sheets_client.read_master_records(
+            spreadsheet_id="ssid", sheet_name="参加者マスター",
+        )
+        self.assertEqual(records[0].team, "A班")
+
+    @patch("src.sheets_client.get_sheets_service")
+    def test_five_column_row_backward_compat(self, mock_get_service):
+        """既存の 5 列タブ（F 列なし）は team='' で読める（後方互換）。"""
+        mock_get_service.return_value = self._service([
+            ["管理番号", "医院名", "参加者名", "会場", "メール"],
+            ["001-01", "山田歯科", "田中太郎", "東京", "a@example.com"],
+        ])
+        records = sheets_client.read_master_records(
+            spreadsheet_id="ssid", sheet_name="参加者マスター",
+        )
+        self.assertEqual(records[0].team, "")
+
+
+class TestFindTeamMembers(unittest.TestCase):
+    """``find_team_members``: チーム配布先の解決（Phase 24）。"""
+
+    def _rec(self, mgmt, clinic="山田歯科", person="田中太郎", team=""):
+        return sheets_client.MasterRecord(
+            management_number=mgmt, clinic_name=clinic,
+            participant_name=person, venue="", email="", team=team,
+        )
+
+    def test_returns_all_members_of_team(self):
+        records = [
+            self._rec("001-01", person="田中太郎", team="A班"),
+            self._rec("002-01", clinic="佐藤歯科", person="佐藤花子", team="A班"),
+            self._rec("003-01", clinic="鈴木歯科", person="鈴木一郎", team="B班"),
+        ]
+        members = sheets_client.find_team_members(records, "A班")
+        self.assertEqual(
+            [m.participant_name for m in members], ["田中太郎", "佐藤花子"],
+        )
+
+    def test_normalized_match_absorbs_width_variation(self):
+        """全角/半角・空白の表記揺れを吸収する（Ａ班 と A班、P-009）。"""
+        records = [
+            self._rec("001-01", person="田中太郎", team="Ａ班"),
+            self._rec("002-01", clinic="佐藤歯科", person="佐藤花子", team="A 班"),
+        ]
+        members = sheets_client.find_team_members(records, "A班")
+        self.assertEqual(len(members), 2)
+
+    def test_empty_team_rows_excluded(self):
+        records = [
+            self._rec("001-01", team="A班"),
+            self._rec("002-01", clinic="佐藤歯科", person="個人参加", team=""),
+        ]
+        members = sheets_client.find_team_members(records, "A班")
+        self.assertEqual(len(members), 1)
+
+    def test_empty_team_query_returns_empty(self):
+        records = [self._rec("001-01", team="")]
+        self.assertEqual(sheets_client.find_team_members(records, ""), [])
+
+    def test_duplicate_person_rows_deduped(self):
+        """同一人物（医院番号+正規化名が同じ）の重複行は 1 件に。"""
+        records = [
+            self._rec("001-01", person="田中太郎", team="A班"),
+            self._rec("001-01", person="田中 太郎", team="A班"),  # 空白揺れの重複行
+        ]
+        members = sheets_client.find_team_members(records, "A班")
+        self.assertEqual(len(members), 1)
 
 
 if __name__ == "__main__":

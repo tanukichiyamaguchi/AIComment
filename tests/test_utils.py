@@ -13,6 +13,7 @@ from src.utils import (
     mask_email,
     normalize_name_for_match,
     sanitize_filename,
+    is_team_filename,
     mask_name,
 )
 
@@ -456,6 +457,31 @@ class TestMaskName(unittest.TestCase):
 
     def test_ascii_name(self):
         self.assertEqual(mask_name("Taro"), "T＊＊＊")
+
+
+class TestIsTeamFilename(unittest.TestCase):
+    """``is_team_filename``: チーム事例（全員配布対象）の判定（Phase 24）。"""
+
+    def test_team_practice_marker(self):
+        self.assertTrue(
+            is_team_filename("001-01-0【α】チーム実践_接遇改善.pdf")
+        )
+
+    def test_team_mtg_marker(self):
+        self.assertTrue(
+            is_team_filename("012-03-4【β】チームMTG_月次振り返り.pdf")
+        )
+
+    def test_normal_case_is_false(self):
+        self.assertFalse(is_team_filename("001-01-0実践事例タイトル.pdf"))
+
+    def test_similar_words_without_underscore_are_false(self):
+        # 「チーム」を含むだけ（マーカー末尾の _ が無い）は対象外
+        self.assertFalse(is_team_filename("001-01-0チームワーク向上事例.pdf"))
+        self.assertFalse(is_team_filename("001-01-0チームMTGまとめ.pdf"))
+
+    def test_non_string_input(self):
+        self.assertFalse(is_team_filename(None))
 
 
 if __name__ == "__main__":

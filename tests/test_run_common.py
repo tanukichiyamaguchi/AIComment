@@ -182,5 +182,131 @@ class TestResolveCaseViaMaster(unittest.TestCase):
         self.assertEqual(case, ("001", "山田歯科", "unknown_person"))
 
 
+class TestDistributeTeamCopies(unittest.TestCase):
+    """``distribute_team_copies``: チーム全員のフォルダへの配布（Phase 24）。"""
+
+    def _rec(self, mgmt, clinic="山田歯科", person="田中太郎", team="A班"):
+        return MasterRecord(
+            management_number=mgmt, clinic_name=clinic,
+            participant_name=person, venue="", email="", team=team,
+        )
+
+    def _sheets_with(self, records, reporter):
+        sheets = MagicMock()
+        sheets.lookup_participant_by_management_number.return_value = reporter
+        sheets.find_team_members.side_effect = (
+            lambda recs, team: [r for r in records if r.team == team]
+        )
+        return sheets
+
+    def test_distributes_to_all_members_except_reporter(self):
+        reporter = self._rec("001-01", person="田中太郎")
+        records = [
+            reporter,
+            self._rec("002-01", clinic="佐藤歯科", person="佐藤花子"),
+            self._rec("003-01", clinic="鈴木歯科", person="鈴木一郎"),
+        ]
+        drive = MagicMock()
+        sheets = self._sheets_with(records, reporter)
+
+        count = run_common.distribute_team_copies(
+            drive, sheets, _logger,
+            master_records=records,
+            reporter_mgmt_num="001-01-0",
+            file_path=Path("/tmp/out.pdf"),
+            file_name="チーム実践_接遇.pdf",
+            output_folder_id="root_x",
+        )
+
+        self.assertEqual(count, 2)
+        self.assertEqual(drive.upload_pdf_to_clinic_person.call_count, 2)
+        kwargs_list = [
+            c.kwargs for c in drive.upload_pdf_to_clinic_person.call_args_list
+        ]
+        self.assertEqual(
+            {k["person_name"] for k in kwargs_list}, {"佐藤花子", "鈴木一郎"},
+        )
+        # マスター由来の確定名なのでフォルダ名同期を許可
+        self.assertTrue(all(k["clinic_name_authoritative"] for k in kwargs_list))
+        # 全員に同じファイル名で配布
+        self.assertTrue(
+            all(k["file_name"] == "チーム実践_接遇.pdf" for k in kwargs_list)
+        )
+
+    def test_reporter_not_in_master_falls_back_with_warning(self):
+        drive = MagicMock()
+        sheets = MagicMock()
+        sheets.lookup_participant_by_management_number.return_value = None
+
+        with self.assertLogs("jissen_comment", level="WARNING") as log_ctx:
+            count = run_common.distribute_team_copies(
+                drive, sheets, _logger,
+                master_records=[],
+                reporter_mgmt_num="999-99-9",
+                file_path=Path("/tmp/out.pdf"),
+                file_name="チームMTG_議事.pdf",
+                output_folder_id="root_x",
+            )
+
+        self.assertEqual(count, 0)
+        drive.upload_pdf_to_clinic_person.assert_not_called()
+        self.assertIn("配布先を解決できません", "\n".join(log_ctx.output))
+
+    def test_reporter_with_empty_team_falls_back(self):
+        reporter = self._rec("001-01", team="")
+        drive = MagicMock()
+        sheets = MagicMock()
+        sheets.lookup_participant_by_management_number.return_value = reporter
+
+        count = run_common.distribute_team_copies(
+            drive, sheets, _logger,
+            master_records=[reporter],
+            reporter_mgmt_num="001-01-0",
+            file_path=Path("/tmp/out.pdf"),
+            file_name="チーム実践_x.pdf",
+            output_folder_id="root_x",
+        )
+
+        self.assertEqual(count, 0)
+        drive.upload_pdf_to_clinic_person.assert_not_called()
+
+    def test_member_upload_failure_propagates(self):
+        """メンバーへの配布失敗は raise（fail-soft にしない、P-031 契約）。"""
+        reporter = self._rec("001-01")
+        records = [reporter, self._rec("002-01", person="佐藤花子")]
+        drive = MagicMock()
+        drive.upload_pdf_to_clinic_person.side_effect = OSError("drive down")
+        sheets = self._sheets_with(records, reporter)
+
+        with self.assertRaises(OSError):
+            run_common.distribute_team_copies(
+                drive, sheets, _logger,
+                master_records=records,
+                reporter_mgmt_num="001-01-0",
+                file_path=Path("/tmp/out.pdf"),
+                file_name="チーム実践_x.pdf",
+                output_folder_id="root_x",
+            )
+
+    def test_member_without_clinic_name_skipped_with_warning(self):
+        reporter = self._rec("001-01")
+        records = [reporter, self._rec("002-01", clinic="", person="医院名なし")]
+        drive = MagicMock()
+        sheets = self._sheets_with(records, reporter)
+
+        with self.assertLogs("jissen_comment", level="WARNING") as log_ctx:
+            count = run_common.distribute_team_copies(
+                drive, sheets, _logger,
+                master_records=records,
+                reporter_mgmt_num="001-01-0",
+                file_path=Path("/tmp/out.pdf"),
+                file_name="チーム実践_x.pdf",
+                output_folder_id="root_x",
+            )
+
+        self.assertEqual(count, 0)
+        self.assertIn("医院名が空", "\n".join(log_ctx.output))
+
+
 if __name__ == "__main__":
     unittest.main()
