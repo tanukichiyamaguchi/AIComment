@@ -1,5 +1,36 @@
 # じっせん君コメントシステム - Task Tracker
 
+## Phase 26: CDC 医院見学レポート（XXX-YY 2 セグメント）の出力対応（2026-07-14）
+
+### 背景
+ユーザー報告:「CDC の医院見学レポートが出力されない。通常の `XXX-YY-Z` ではなく
+`XXX-YY` の表記」。根本原因は `utils._MANAGEMENT_NUMBER_PATTERN` が
+`^(\d{3,5})-\d{2}-\d`（3 セグメント固定）で、`XXX-YY`（2 セグメント）だと
+`extract_management_number` が空文字列を返し、`select_new_targets` で
+「管理番号なしスキップ」されていたこと。
+
+### 設計
+- パターンの 3 番目のセグメントを任意化: `^(\d{3,5})-\d{2}(?:-\d)?`。
+  - `(?:-\d)?` は貪欲（既定）なので `001-01-0` は従来どおり `001-01-0` を返す
+    （2 セグメントで止めない = 既存の 3 セグメント抽出は完全に不変）。
+  - `001-01医院見学.pdf` は `001-01` を返す（CDC 対応）。
+- CDC レポートは専用マーカー（`チーム実践_` / `【添付資料】` のような）を持たず、
+  純粋に管理番号の形で判別される。2 セグメント管理番号はマスターの
+  `NNN-NN`（個人単位）と**完全一致**するため、`lookup_participant_by_management_number`
+  / `lookup_email_by_clinic_and_person` / `lookup_clinic_name` は無改修で機能する。
+- 重複判定（`get_processed_management_numbers`、A 列の値の有無のみ）も無改修。
+- 警告ログの「NNN-NN-N 形式でない」を「NNN-NN-N / NNN-NN 形式でない」に更新。
+
+### タスク
+- [x] `utils._MANAGEMENT_NUMBER_PATTERN` を 2 セグメント対応（3 番目を任意化）+
+      両関数の docstring 更新
+- [x] main.py / batch_main.py / run_common.py の警告文言を両形式対応に更新
+- [x] tests/test_utils.py に CDC 2 セグメントケース追加（mgmt 5 / clinic 1）+
+      3 セグメント非退行の回帰テスト
+- [x] pytest 767 → 773 件 pass / mypy clean（既存 18 ケースは全て検算済み・不変）
+- [x] README §4（増分処理）+ 出力一覧 A 列定義を両形式対応に更新
+- [ ] commit + push（PR #65 に追記）
+
 ## Phase 25: チーム配布メンバーも出力一覧シートに記録（2026-07-14）
 
 ### 背景

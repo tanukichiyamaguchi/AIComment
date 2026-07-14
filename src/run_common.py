@@ -119,7 +119,7 @@ def select_new_targets(
         if not mgmt_num:
             logger.warning(
                 f"管理番号をファイル名から抽出できないためスキップ"
-                f"（先頭が NNN-NN-N 形式でない / 重複検知不可）: {file_name}"
+                f"（先頭が NNN-NN-N / NNN-NN 形式でない / 重複検知不可）: {file_name}"
             )
             skip_no_number += 1
             if skipped_records is not None:

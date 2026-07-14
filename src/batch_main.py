@@ -402,7 +402,7 @@ def step1_prepare(
         if not mgmt_num:
             logger.warning(
                 f"管理番号をファイル名から抽出できないため添付資料をスキップ"
-                f"（先頭が NNN-NN-N 形式でない）: {file_name}"
+                f"（先頭が NNN-NN-N / NNN-NN 形式でない）: {file_name}"
             )
             continue
         if f"【添付資料】{file_name}" in recorded_attachments:
@@ -934,7 +934,7 @@ def step4_generate_pdfs(
             if not mgmt_num:
                 logger.warning(
                     f"管理番号をファイル名から抽出できません"
-                    f"（先頭が NNN-NN-N 形式でない）: {pdf_file_name}"
+                    f"（先頭が NNN-NN-N / NNN-NN 形式でない）: {pdf_file_name}"
                 )
 
             # CB-3: Step4 開始時のスナップショットに mgmt_num が含まれていれば

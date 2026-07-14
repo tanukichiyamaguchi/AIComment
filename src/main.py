@@ -445,7 +445,7 @@ def run(
             if not mgmt_num:
                 logger.warning(
                     f"管理番号をファイル名から抽出できないため添付資料をスキップ"
-                    f"（先頭が NNN-NN-N 形式でない）: {file_name}"
+                    f"（先頭が NNN-NN-N / NNN-NN 形式でない）: {file_name}"
                 )
                 stats["skip_no_number"] += 1
                 continue
