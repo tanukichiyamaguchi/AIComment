@@ -220,7 +220,7 @@ def distribute_team_copies(
     file_path: Path,
     file_name: str,
     output_folder_id: str,
-) -> int:
+) -> list[dict[str, str]]:
     """チーム事例のコメント入り PDF を、報告者と同じチームの全メンバーの
     フォルダへ配布する。
 
@@ -240,7 +240,7 @@ def distribute_team_copies(
           シート記録済み = 恒久欠落」になる（P-031 の教訓）。
         - 呼び出し元は本関数を ``append_output_record`` より **前** に呼ぶこと
           （配布 → 記録の順序。逆にすると記録後クラッシュで配布漏れが恒久化）。
-        - 報告者がマスター未登録 / F 列が空の場合は WARNING を出して 0 件で
+        - 報告者がマスター未登録 / F 列が空の場合は WARNING を出して空リストで
           戻る（報告者のみ = 従来動作への自然なフォールバック。raise しない）。
 
     Args:
@@ -254,7 +254,10 @@ def distribute_team_copies(
         output_folder_id: 出力ルートフォルダの Drive ID
 
     Returns:
-        配布したメンバー数（報告者を除く）。フォールバック時は 0。
+        配布した各メンバー（報告者を除く）の
+        ``{"clinic_name", "person_name", "drive_url"}`` 辞書のリスト。
+        呼び出し側はこれを使って出力一覧シートにもメンバー分の行を追記できる。
+        フォールバック時は空リスト。
     """
     reporter = sheets_module.lookup_participant_by_management_number(
         master_records, reporter_mgmt_num,
@@ -265,7 +268,7 @@ def distribute_team_copies(
             f"管理番号 {reporter_mgmt_num} の行が無いか、F 列「所属チーム」が"
             f"空）: {file_name} → 報告者のフォルダのみに保存します"
         )
-        return 0
+        return []
 
     members = sheets_module.find_team_members(master_records, reporter.team)
     reporter_key = (
@@ -273,7 +276,7 @@ def distribute_team_copies(
         # 報告者自身の行を除外する（find_team_members と同じ同一人物判定）
         reporter.participant_name,
     )
-    distributed = 0
+    distributed: list[dict[str, str]] = []
     for member in members:
         if (member.clinic_number, member.participant_name) == reporter_key:
             continue
@@ -283,21 +286,26 @@ def distribute_team_copies(
                 f"(管理番号={member.management_number})"
             )
             continue
-        drive_module.upload_pdf_to_clinic_person(
+        member_person_name = member.participant_name or "unknown_person"
+        upload_result = drive_module.upload_pdf_to_clinic_person(
             file_path=file_path,
             output_root_folder_id=output_folder_id,
             clinic_number=member.clinic_number,
             clinic_name=member.clinic_name,
-            person_name=member.participant_name or "unknown_person",
+            person_name=member_person_name,
             file_name=file_name,
             # マスター由来の確定医院名なので既存フォルダ名の同期を許可
             clinic_name_authoritative=True,
         )
-        distributed += 1
+        distributed.append({
+            "clinic_name": member.clinic_name,
+            "person_name": member_person_name,
+            "drive_url": upload_result["webViewLink"],
+        })
 
     logger.info(
         f"チーム事例を配布: チーム={mask_name(reporter.team)} / "
-        f"報告者を除く {distributed} 名のフォルダへコピー ({file_name})"
+        f"報告者を除く {len(distributed)} 名のフォルダへコピー ({file_name})"
     )
     return distributed
 

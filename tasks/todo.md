@@ -1,5 +1,38 @@
 # じっせん君コメントシステム - Task Tracker
 
+## Phase 25: チーム配布メンバーも出力一覧シートに記録（2026-07-14）
+
+### 背景
+Phase 24 本番投入後のユーザー報告:「出力フォルダにはチーム全員のフォルダが生成されましたが、
+出力一覧シートには提出者（報告者）しかリスト化されなかった」。Phase 24 時点ではユーザー自身が
+「出力一覧シートは報告者 1 行のみでよい」と明確に回答していたが、実運用で確認した結果、
+メンバー分も見えるようにしてほしいという要望に変わったための追加対応。
+
+### 設計
+- `run_common.distribute_team_copies` の戻り値を `int`（配布件数）から
+  `list[dict[str, str]]`（各メンバーの `clinic_name` / `person_name` / 自分のコピーの
+  `drive_url`）に変更。メンバーへのアップロード結果（`webViewLink`）をそのまま返す。
+- 呼び出し側（main.py / batch_main.py）は戻り値を使い、配布成功後（P-031 の順序どおり
+  配布 → 記録を維持）にメンバーごと `append_output_record` を追加で呼ぶ。
+- メンバー行は**報告者と同じ管理番号**を使う（添付資料 `passthrough_attachment` が
+  `【添付資料】<元名>` マーカーで報告者と同じ管理番号を共有する既存パターンを踏襲）。
+  実践事例名を `【チーム配布】<実践事例名>` にして報告者本人の行と区別する。
+- 既存の重複判定（`get_processed_management_numbers` は A 列の管理番号のみ見る）は
+  無変更。ファイル全体の処理済み判定は従来どおり報告者の管理番号 1 つで行われるため、
+  メンバー行の追加は増分処理のスキップ判定に影響しない。
+
+### タスク
+- [x] `run_common.distribute_team_copies`: 戻り値を `list[dict]` 化（アップロード結果の
+      `webViewLink` を捕捉）
+- [x] main.py / batch_main.py: 戻り値を使ってメンバー分も `append_output_record`
+      （報告者と同じ管理番号 + `【チーム配布】` マーカー）
+- [x] tests/test_run_common.py: `TestDistributeTeamCopies` を新戻り値契約に更新
+- [x] tests/test_main.py・tests/test_batch_main.py: e2e テストの `append_output_record`
+      呼び出し回数・内容アサーションを更新
+- [x] pytest 767 件 pass（件数は不変、既存テストの契約更新のみ）/ mypy clean
+- [x] README §4-5 をメンバー行記録ありの記述に更新
+- [ ] commit + push + draft PR → ユーザーレビュー → マージ
+
 ## Phase 24: チーム事例の全員配布（2026-07-06）
 
 ### ゴール
@@ -22,7 +55,7 @@
 - [x] tests: utils 5 / sheets 7 / run_common 5 / main e2e 3（順序契約含む）/ batch e2e 2
 - [x] pytest 745 → 767 件 pass / mypy clean
 - [x] README §4-4（6 列表）+ §4-5（チーム事例の全員配布）
-- [ ] ドラフト PR → ユーザーレビュー → マージ
+- [x] ドラフト PR → ユーザーレビュー → マージ（PR #64、2026-07-14）
 
 ## Phase 23: 処理速度 × 出力品質・正確性の改善（2026-07-02〜）
 

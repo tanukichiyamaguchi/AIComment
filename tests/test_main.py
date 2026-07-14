@@ -2244,8 +2244,24 @@ class TestTeamCaseDistribution(unittest.TestCase):
             for c in mock_drive_client.upload_pdf_to_clinic_person.call_args_list
         }
         self.assertEqual(member_names, {"田中太郎", "佐藤花子", "鈴木一郎"})
-        # シート記録は報告者の 1 行のみ
-        mock_sheets_client.append_output_record.assert_called_once()
+        # シート記録は報告者 1 行 + メンバー 2 行（報告者除外）= 計 3 行
+        self.assertEqual(mock_sheets_client.append_output_record.call_count, 3)
+        record_person_names = {
+            c.kwargs["person_name"]
+            for c in mock_sheets_client.append_output_record.call_args_list
+        }
+        self.assertEqual(
+            record_person_names, {"田中太郎", "佐藤花子", "鈴木一郎"},
+        )
+        # メンバー分は報告者と同じ管理番号・【チーム配布】マーカー付き
+        member_records = [
+            c.kwargs for c in mock_sheets_client.append_output_record.call_args_list
+            if c.kwargs["person_name"] != "田中太郎"
+        ]
+        self.assertEqual(len(member_records), 2)
+        for kwargs in member_records:
+            self.assertEqual(kwargs["management_number"], "001-01-0")
+            self.assertTrue(kwargs["sample_name"].startswith("【チーム配布】"))
 
         # 順序契約（P-031）: 配布アップロードは全てシート記録より前
         parent = MagicMock()
@@ -2307,7 +2323,9 @@ class TestTeamCaseDistribution(unittest.TestCase):
 
         main_module.run(test_count=0, profile_name="jissen_default")
 
-        self.assertEqual(uploads_at_append, [3])
+        # メンバー 2 行 + 報告者 1 行 = 計 3 回の append_output_record 呼び出し。
+        # いずれの時点でもアップロードは既に 3 回完了している（P-031）。
+        self.assertEqual(uploads_at_append, [3, 3, 3])
 
     @patch("src.main.ensure_fonts")
     @patch("src.main.pdf_merger")
