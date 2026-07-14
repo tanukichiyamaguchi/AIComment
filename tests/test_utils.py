@@ -136,9 +136,12 @@ class TestNormalizeNameForMatch(unittest.TestCase):
 class TestExtractManagementNumber(unittest.TestCase):
     """PDFファイル名先頭からの管理番号抽出のテスト。
 
-    実践事例 PDF はファイル名先頭に ``NNN-NN-N``（先頭セグメント 3〜5桁 -
-    数字2 - 数字1）形式の管理番号が埋め込まれている。先頭セグメント
-    （= 医院番号）が 3〜5 桁可変なので、管理番号全体は 7〜9 文字になる。
+    2 形式に対応する:
+    - 実践事例 PDF: ``NNN-NN-N``（先頭セグメント 3〜5桁 - 数字2 - 数字1、
+      3 セグメント。全体 7〜9 文字）
+    - CDC 医院見学レポート: ``NNN-NN``（3 番目のセグメントが無い 2 セグメント。
+      全体 6〜8 文字）
+    先頭セグメント（= 医院番号）が 3〜5 桁可変。
     """
 
     def test_extracts_from_title_directly_after_code(self):
@@ -233,6 +236,41 @@ class TestExtractManagementNumber(unittest.TestCase):
         """先頭ゼロを含む ``000-00-0実践.pdf`` → ``000-00-0``。"""
         self.assertEqual(extract_management_number("000-00-0実践.pdf"), "000-00-0")
 
+    def test_extracts_two_segment_cdc_report(self):
+        """CDC 医院見学レポート ``001-01医院見学レポート.pdf`` → ``001-01``。
+
+        3 番目のセグメント（``-N``）が無い 2 セグメント形式。従来は空文字列を
+        返してスキップされていたが、CDC の医院見学レポートを出力対象にするため
+        2 セグメントも管理番号として拾う。
+        """
+        self.assertEqual(
+            extract_management_number("001-01医院見学レポート.pdf"), "001-01"
+        )
+
+    def test_extracts_two_segment_bare(self):
+        """2 セグメントのみ・拡張子なし ``001-01`` → ``001-01``。"""
+        self.assertEqual(extract_management_number("001-01"), "001-01")
+
+    def test_extracts_two_segment_with_underscore(self):
+        """区切りがアンダースコア ``001-01_見学.pdf`` → ``001-01``。"""
+        self.assertEqual(extract_management_number("001-01_見学.pdf"), "001-01")
+
+    def test_extracts_two_segment_five_digit_clinic(self):
+        """5 桁医院番号の 2 セグメント ``00123-45CDC.pdf`` → ``00123-45``。"""
+        self.assertEqual(
+            extract_management_number("00123-45CDC.pdf"), "00123-45"
+        )
+
+    def test_three_segment_not_truncated_to_two(self):
+        """3 セグメント ``001-01-0実践.pdf`` は ``001-01`` で止めず ``001-01-0``。
+
+        3 番目のセグメントを任意化しても、ある場合は貪欲に取り込むことを固定する
+        （2 セグメント対応で既存の 3 セグメント抽出が退行しないことの回帰テスト）。
+        """
+        self.assertEqual(
+            extract_management_number("001-01-0実践.pdf"), "001-01-0"
+        )
+
 
 class TestExtractClinicNumber(unittest.TestCase):
     """PDFファイル名先頭の管理番号からの医院番号抽出のテスト。
@@ -258,6 +296,15 @@ class TestExtractClinicNumber(unittest.TestCase):
     def test_extracts_when_separated_by_underscore(self):
         """区切りがアンダースコア ``012-03-4_別の事例.pdf`` → ``012``。"""
         self.assertEqual(extract_clinic_number("012-03-4_別の事例.pdf"), "012")
+
+    def test_extracts_from_two_segment_cdc_report(self):
+        """CDC 医院見学レポート ``001-01医院見学レポート.pdf`` → ``001``。
+
+        3 番目のセグメントが無い 2 セグメント形式でも医院番号を抽出できる。
+        """
+        self.assertEqual(
+            extract_clinic_number("001-01医院見学レポート.pdf"), "001"
+        )
 
     def test_returns_empty_when_no_management_number(self):
         """先頭が管理番号でない ``実践事例.pdf`` → 空文字列。"""

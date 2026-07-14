@@ -326,7 +326,7 @@ def run(
                     # より **前** に行う（配布失敗 → 記録なし → 再実行で配布
                     # からやり直し。逆順だと配布漏れが恒久化する、P-031）。
                     if is_team_filename(file_name):
-                        run_common.distribute_team_copies(
+                        team_members = run_common.distribute_team_copies(
                             drive_client, sheets_client, logger,
                             master_records=master_records,
                             reporter_mgmt_num=mgmt_num,
@@ -334,6 +334,18 @@ def run(
                             file_name=output_filename,
                             output_folder_id=cfg.output_folder_id,
                         )
+                        # メンバー分も出力一覧シートに記録する（報告者と同じ
+                        # 管理番号・sample_name に【チーム配布】マーカーを付与し、
+                        # 添付資料の【添付資料】マーカーと同じ見分け方にする）。
+                        for member in team_members:
+                            sheets_client.append_output_record(
+                                management_number=mgmt_num,
+                                clinic_name=member["clinic_name"],
+                                person_name=member["person_name"],
+                                sample_name=f"【チーム配布】{sample_title}",
+                                drive_url=member["drive_url"],
+                                sheet_name=cfg.output_sheet_name,
+                            )
 
                     # 管理番号は処理対象選定時に抽出・検証済み（空でないことが保証される）。
                     sheets_client.append_output_record(
@@ -433,7 +445,7 @@ def run(
             if not mgmt_num:
                 logger.warning(
                     f"管理番号をファイル名から抽出できないため添付資料をスキップ"
-                    f"（先頭が NNN-NN-N 形式でない）: {file_name}"
+                    f"（先頭が NNN-NN-N / NNN-NN 形式でない）: {file_name}"
                 )
                 stats["skip_no_number"] += 1
                 continue

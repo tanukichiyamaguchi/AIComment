@@ -209,7 +209,12 @@ class TestDistributeTeamCopies(unittest.TestCase):
         drive = MagicMock()
         sheets = self._sheets_with(records, reporter)
 
-        count = run_common.distribute_team_copies(
+        drive.upload_pdf_to_clinic_person.return_value = {
+            "webViewLink": "https://drive.example/x",
+            "clinic_folder_id": "folder_x",
+        }
+
+        result = run_common.distribute_team_copies(
             drive, sheets, _logger,
             master_records=records,
             reporter_mgmt_num="001-01-0",
@@ -218,7 +223,13 @@ class TestDistributeTeamCopies(unittest.TestCase):
             output_folder_id="root_x",
         )
 
-        self.assertEqual(count, 2)
+        self.assertEqual(len(result), 2)
+        self.assertEqual(
+            {m["person_name"] for m in result}, {"佐藤花子", "鈴木一郎"},
+        )
+        self.assertTrue(
+            all(m["drive_url"] == "https://drive.example/x" for m in result)
+        )
         self.assertEqual(drive.upload_pdf_to_clinic_person.call_count, 2)
         kwargs_list = [
             c.kwargs for c in drive.upload_pdf_to_clinic_person.call_args_list
@@ -239,7 +250,7 @@ class TestDistributeTeamCopies(unittest.TestCase):
         sheets.lookup_participant_by_management_number.return_value = None
 
         with self.assertLogs("jissen_comment", level="WARNING") as log_ctx:
-            count = run_common.distribute_team_copies(
+            result = run_common.distribute_team_copies(
                 drive, sheets, _logger,
                 master_records=[],
                 reporter_mgmt_num="999-99-9",
@@ -248,7 +259,7 @@ class TestDistributeTeamCopies(unittest.TestCase):
                 output_folder_id="root_x",
             )
 
-        self.assertEqual(count, 0)
+        self.assertEqual(result, [])
         drive.upload_pdf_to_clinic_person.assert_not_called()
         self.assertIn("配布先を解決できません", "\n".join(log_ctx.output))
 
@@ -258,7 +269,7 @@ class TestDistributeTeamCopies(unittest.TestCase):
         sheets = MagicMock()
         sheets.lookup_participant_by_management_number.return_value = reporter
 
-        count = run_common.distribute_team_copies(
+        result = run_common.distribute_team_copies(
             drive, sheets, _logger,
             master_records=[reporter],
             reporter_mgmt_num="001-01-0",
@@ -267,7 +278,7 @@ class TestDistributeTeamCopies(unittest.TestCase):
             output_folder_id="root_x",
         )
 
-        self.assertEqual(count, 0)
+        self.assertEqual(result, [])
         drive.upload_pdf_to_clinic_person.assert_not_called()
 
     def test_member_upload_failure_propagates(self):
@@ -295,7 +306,7 @@ class TestDistributeTeamCopies(unittest.TestCase):
         sheets = self._sheets_with(records, reporter)
 
         with self.assertLogs("jissen_comment", level="WARNING") as log_ctx:
-            count = run_common.distribute_team_copies(
+            result = run_common.distribute_team_copies(
                 drive, sheets, _logger,
                 master_records=records,
                 reporter_mgmt_num="001-01-0",
@@ -304,7 +315,7 @@ class TestDistributeTeamCopies(unittest.TestCase):
                 output_folder_id="root_x",
             )
 
-        self.assertEqual(count, 0)
+        self.assertEqual(result, [])
         self.assertIn("医院名が空", "\n".join(log_ctx.output))
 
 

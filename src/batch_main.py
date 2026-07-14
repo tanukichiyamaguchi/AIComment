@@ -402,7 +402,7 @@ def step1_prepare(
         if not mgmt_num:
             logger.warning(
                 f"管理番号をファイル名から抽出できないため添付資料をスキップ"
-                f"（先頭が NNN-NN-N 形式でない）: {file_name}"
+                f"（先頭が NNN-NN-N / NNN-NN 形式でない）: {file_name}"
             )
             continue
         if f"【添付資料】{file_name}" in recorded_attachments:
@@ -934,7 +934,7 @@ def step4_generate_pdfs(
             if not mgmt_num:
                 logger.warning(
                     f"管理番号をファイル名から抽出できません"
-                    f"（先頭が NNN-NN-N 形式でない）: {pdf_file_name}"
+                    f"（先頭が NNN-NN-N / NNN-NN 形式でない）: {pdf_file_name}"
                 )
 
             # CB-3: Step4 開始時のスナップショットに mgmt_num が含まれていれば
@@ -1015,7 +1015,7 @@ def step4_generate_pdfs(
                     # より **前** に行う（配布失敗 → 記録なし → 再実行で配布
                     # からやり直し。逆順だと配布漏れが恒久化する、P-031）。
                     if is_team_filename(pdf_file_name):
-                        run_common.distribute_team_copies(
+                        team_members = run_common.distribute_team_copies(
                             drive_client, sheets_client, logger,
                             master_records=master_records,
                             reporter_mgmt_num=mgmt_num,
@@ -1023,6 +1023,18 @@ def step4_generate_pdfs(
                             file_name=output_filename,
                             output_folder_id=profile.output_folder_id,
                         )
+                        # メンバー分も出力一覧シートに記録する(報告者と同じ
+                        # 管理番号・sample_name に【チーム配布】マーカーを付与し、
+                        # 添付資料の【添付資料】マーカーと同じ見分け方にする)。
+                        for member in team_members:
+                            sheets_client.append_output_record(
+                                management_number=mgmt_num,
+                                clinic_name=member["clinic_name"],
+                                person_name=member["person_name"],
+                                sample_name=f"【チーム配布】{sample_title}",
+                                drive_url=member["drive_url"],
+                                sheet_name=profile.output_sheet_name,
+                            )
 
                     sheets_client.append_output_record(
                         management_number=mgmt_num,

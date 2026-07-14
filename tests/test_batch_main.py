@@ -2883,10 +2883,11 @@ class TestTeamCaseDistributionBatch(unittest.TestCase):
             _make_profile(), results=_make_batch_results(1), items=items,
         )
 
-        # 報告者 1 + メンバー 2 = 3 回、シート記録は 1 回・配布完了後（P-031）
+        # 報告者 1 + メンバー 2 = 3 回アップロード。
+        # シート記録はメンバー 2 行 + 報告者 1 行 = 計 3 回、いずれも配布完了後（P-031）。
         self.assertEqual(mock_drive.upload_pdf_to_clinic_person.call_count, 3)
-        mock_sheets.append_output_record.assert_called_once()
-        self.assertEqual(uploads_at_append, [3])
+        self.assertEqual(mock_sheets.append_output_record.call_count, 3)
+        self.assertEqual(uploads_at_append, [3, 3, 3])
 
     @patch("src.batch_main.pdf_merger")
     @patch("src.batch_main.pdf_creator")
