@@ -337,6 +337,10 @@ def run(
                         # メンバー分も出力一覧シートに記録する（報告者と同じ
                         # 管理番号・sample_name に【チーム配布】マーカーを付与し、
                         # 添付資料の【添付資料】マーカーと同じ見分け方にする）。
+                        # あわせてメンバーの医院フォルダも医院フォルダURLシート
+                        # に記録する（配布で新規作成された医院フォルダの URL が
+                        # どのシートにも残らない欠落の解消。同一医院は
+                        # ClinicFolderRecorder が 1 行にデデュープする）。
                         for member in team_members:
                             sheets_client.append_output_record(
                                 management_number=mgmt_num,
@@ -345,6 +349,11 @@ def run(
                                 sample_name=f"【チーム配布】{sample_title}",
                                 drive_url=member["drive_url"],
                                 sheet_name=cfg.output_sheet_name,
+                            )
+                            clinic_recorder.record(
+                                member["clinic_number"],
+                                member["clinic_name"],
+                                member["clinic_folder_id"],
                             )
 
                     # 管理番号は処理対象選定時に抽出・検証済み（空でないことが保証される）。

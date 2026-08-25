@@ -2860,6 +2860,7 @@ class TestTeamCaseDistributionBatch(unittest.TestCase):
     ):
         _install_step4_mocks(mock_drive, mock_merger, mock_sheets)
         mock_sheets.get_processed_management_numbers.return_value = set()
+        mock_sheets.get_recorded_clinic_numbers.return_value = set()
         reporter = self._master("001-01", "山田歯科", "田中太郎")
         team = [
             reporter,
@@ -2888,6 +2889,15 @@ class TestTeamCaseDistributionBatch(unittest.TestCase):
         self.assertEqual(mock_drive.upload_pdf_to_clinic_person.call_count, 3)
         self.assertEqual(mock_sheets.append_output_record.call_count, 3)
         self.assertEqual(uploads_at_append, [3, 3, 3])
+        # 医院フォルダURLシートには報告者の医院 + 配布先メンバーの医院も記録
+        # される（Phase 27）。
+        clinic_rows = [
+            c.kwargs
+            for c in mock_sheets.append_clinic_folder_record.call_args_list
+        ]
+        self.assertEqual(
+            {r["clinic_number"] for r in clinic_rows}, {"001", "002", "003"},
+        )
 
     @patch("src.batch_main.pdf_merger")
     @patch("src.batch_main.pdf_creator")

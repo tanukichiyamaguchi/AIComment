@@ -1,5 +1,40 @@
 # じっせん君コメントシステム - Task Tracker
 
+## Phase 27: チーム配布メンバーの医院フォルダURLを_医院シートに記録（2026-08-25）
+
+### 背景
+ユーザー報告（経営塾ベーシックのチーム宿題）:「チーム全員分のフォルダは作成されて
+いるが、その URL がリストに反映されない」。GHA run #116(7/31)/#117(8/5)/#118(8/25)
+のログを調査した結果、出力一覧シートへの【チーム配布】メンバー行は Phase 25 どおり
+正常に追記されている（52 行/回）一方、**医院フォルダURLシート（`<出力シート名>_医院`）
+には提出者の医院 8 件しか記録されず**、配布で新規作成された約 25 医院のメンバー医院
+フォルダの URL がどのシートにも残っていなかった。根本原因は `ClinicFolderRecorder.record`
+が報告者の医院のみを対象にしており、`distribute_team_copies` の配布先医院が記録経路を
+持たなかったこと。
+
+### 設計
+- `distribute_team_copies` の戻り値メンバー辞書に `clinic_number`（マスター行の
+  医院番号プロパティ）と `clinic_folder_id`（`upload_pdf_to_clinic_person` の戻り値）
+  を追加。
+- main.py / batch_main.py のメンバー行追記ループで `clinic_recorder.record(...)` を
+  呼ぶ。既存の ClinicFolderRecorder が医院番号キーで実行内・実行間デデュープするため、
+  複数チーム事例・複数メンバーで同じ医院が来ても 1 医院 1 行のまま。
+- 副次修正: `requirements.txt` の anthropic を `<1.0` に上限ピン。SDK 1.0.0 は
+  `messages.create()` から `temperature` 引数を削除（httpx2 移行も伴う）しており、
+  通常モード（src.main）の同期呼び出しが TypeError で即死 + mypy が
+  typeddict-unknown-key で落ちる（CI は今日以降の fresh install で 1.0.0 を解決する）。
+  1.x 移行は temperature の extra_body 化を含む専用フェーズで行う。
+
+### タスク
+- [x] `distribute_team_copies` 戻り値に clinic_number / clinic_folder_id 追加
+- [x] main.py / batch_main.py メンバーループで clinic_recorder.record
+- [x] ClinicFolderRecorder 単体テスト新設（デデュープ 4 ケース）+ 配布戻り値の
+      新キー assert + main/batch の _医院 シート記録 assert
+- [x] anthropic を >=0.40.0,<1.0 にピン（0.125.0 で全テスト + mypy green 確認）
+- [x] README §4-3 / §4-5 更新
+- [x] pytest 778 件 pass / mypy clean
+- [ ] commit + push + ドラフト PR
+
 ## Phase 26: CDC 医院見学レポート（XXX-YY 2 セグメント）の出力対応（2026-07-14）
 
 ### 背景

@@ -255,8 +255,11 @@ def distribute_team_copies(
 
     Returns:
         配布した各メンバー（報告者を除く）の
-        ``{"clinic_name", "person_name", "drive_url"}`` 辞書のリスト。
-        呼び出し側はこれを使って出力一覧シートにもメンバー分の行を追記できる。
+        ``{"clinic_number", "clinic_name", "person_name", "drive_url",
+        "clinic_folder_id"}`` 辞書のリスト。呼び出し側はこれを使って
+        出力一覧シートへのメンバー行追記と、医院フォルダ URL シート
+        （``ClinicFolderRecorder``）へのメンバー医院の記録ができる
+        （``clinic_folder_id`` は配布先メンバーの医院フォルダの Drive ID）。
         フォールバック時は空リスト。
     """
     reporter = sheets_module.lookup_participant_by_management_number(
@@ -298,9 +301,11 @@ def distribute_team_copies(
             clinic_name_authoritative=True,
         )
         distributed.append({
+            "clinic_number": member.clinic_number,
             "clinic_name": member.clinic_name,
             "person_name": member_person_name,
             "drive_url": upload_result["webViewLink"],
+            "clinic_folder_id": upload_result["clinic_folder_id"],
         })
 
     logger.info(
