@@ -1,5 +1,9 @@
 # AI Comment Generation
-anthropic>=0.40.0
+# 上限ピン: anthropic 1.x は messages.create() から temperature 引数を削除して
+# おり（httpx2 移行も伴う破壊的変更）、通常モード（src.main）の同期呼び出しが
+# TypeError で即死する + mypy が typeddict-unknown-key で落ちる。1.x への移行は
+# temperature の extra_body 化を含む専用フェーズで行う（tasks/todo.md 参照）。
+anthropic>=0.40.0,<1.0
 
 # PDF Processing
 pdfplumber>=0.11.0

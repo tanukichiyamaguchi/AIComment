@@ -2214,6 +2214,7 @@ class TestTeamCaseDistribution(unittest.TestCase):
     ):
         mock_load_profile.return_value = _make_profile()
         mock_sheets_client.get_processed_management_numbers.return_value = set()
+        mock_sheets_client.get_recorded_clinic_numbers.return_value = set()
         reporter = self._master("001-01", "山田歯科", "田中太郎")
         team = [
             reporter,
@@ -2262,6 +2263,26 @@ class TestTeamCaseDistribution(unittest.TestCase):
         for kwargs in member_records:
             self.assertEqual(kwargs["management_number"], "001-01-0")
             self.assertTrue(kwargs["sample_name"].startswith("【チーム配布】"))
+
+        # 医院フォルダURLシートには報告者の医院 + 配布先メンバーの医院も記録
+        # される（Phase 27: 配布で作られた医院フォルダの URL がどのシートにも
+        # 残らない欠落の解消）。
+        clinic_rows = [
+            c.kwargs
+            for c in mock_sheets_client.append_clinic_folder_record.call_args_list
+        ]
+        self.assertEqual(
+            {r["clinic_number"] for r in clinic_rows}, {"001", "002", "003"},
+        )
+
+        # チーム別フォルダにも 1 部保存され（チーム別/<チーム名>/ 直下に PDF
+        # 直置き）、チームフォルダURLシートに記録される（Phase 28）。
+        team_parent_call = mock_drive_client.find_or_create_folder.call_args_list[0]
+        self.assertEqual(team_parent_call.args[0], "チーム別")
+        self.assertEqual(mock_drive_client.upload_pdf.call_count, 1)
+        team_row = mock_sheets_client.append_team_folder_record.call_args.kwargs
+        self.assertEqual(team_row["team_name"], "A班")
+        self.assertEqual(team_row["sheet_name"], "出力一覧_チーム")
 
         # 順序契約（P-031）: 配布アップロードは全てシート記録より前
         parent = MagicMock()
