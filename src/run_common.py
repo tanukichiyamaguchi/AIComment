@@ -20,7 +20,7 @@ import logging
 
 from src import config
 from src.utils import extract_management_number, is_attachment_filename, setup_logging
-from src.utils import mask_name
+from src.utils import mask_name, normalize_name_for_match
 
 
 class MasterSheetEmptyError(RuntimeError):
@@ -315,6 +315,84 @@ def distribute_team_copies(
     return distributed
 
 
+# チーム別フォルダの親フォルダ名。出力ルート直下に
+# ``チーム別/<所属チーム>/`` の階層を作り、チーム事例のコメント入り PDF を
+# 1 部ずつ保存する（医院/個人フォルダへの配布とは独立の「チーム軸」の出力面）。
+_TEAM_PARENT_FOLDER_NAME = "チーム別"
+
+
+def distribute_to_team_folder(
+    drive_module: Any,
+    sheets_module: Any,
+    logger: logging.Logger,
+    *,
+    master_records: list[Any],
+    reporter_mgmt_num: str,
+    file_path: Path,
+    file_name: str,
+    output_folder_id: str,
+) -> dict[str, str] | None:
+    """チーム事例のコメント入り PDF を ``チーム別/<所属チーム>/`` フォルダへ
+    1 部保存する（Phase 28）。
+
+    医院/個人フォルダへの配布（``distribute_team_copies``）とは別の「チーム軸」
+    の出力面。報告者の管理番号 → 参加者マスター行 → F 列「所属チーム」で
+    チームを解決し、出力ルート直下の ``チーム別`` 親フォルダ配下にチーム名の
+    フォルダを find_or_create して、PDF をそのままのファイル名で保存する
+    （サブフォルダは作らない = チーム内は PDF 直置き）。
+
+    設計上の要点:
+        - ``distribute_team_copies`` と同じ ``is_team_filename`` ブロック内で、
+          シート記録より **前** に呼ぶこと（配布 → 記録の順序、P-031）。
+        - アップロード失敗は raise で伝播する（fail-soft にしない）。呼び出し元の
+          per-item try が捕捉して error 計上 → シート未記録 → 再実行でやり直し
+          （``upload_pdf`` は同名スキップで冪等なので安全）。
+        - 報告者がマスター未登録 / F 列が空なら None を返す（チーム別保存なし =
+          従来動作へのフォールバック）。警告ログは直前に呼ばれる
+          ``distribute_team_copies`` が同条件で出すため、ここでは重複して出さない。
+
+    Args:
+        drive_module: drive_client モジュール（依存注入、テストパッチ互換)
+        sheets_module: sheets_client モジュール
+        logger: ログ出力先
+        master_records: ``read_master_records`` のスナップショット
+        reporter_mgmt_num: 報告者 PDF の管理番号（ファイル名冒頭）
+        file_path: コメント結合済み PDF のローカルパス
+        file_name: Drive 上のファイル名（報告者分と同名）
+        output_folder_id: 出力ルートフォルダの Drive ID
+
+    Returns:
+        ``{"team_name", "team_folder_id", "drive_url"}``。呼び出し側はこれを
+        使ってチームフォルダURLシート（``TeamFolderRecorder``）に記録できる。
+        フォールバック時（マスター未登録 / チーム空）は None。
+    """
+    reporter = sheets_module.lookup_participant_by_management_number(
+        master_records, reporter_mgmt_num,
+    )
+    if reporter is None or not reporter.team:
+        return None
+
+    team_name = reporter.team.strip()
+    parent_id = drive_module.find_or_create_folder(
+        _TEAM_PARENT_FOLDER_NAME, output_folder_id,
+    )
+    team_folder_id = drive_module.find_or_create_folder(team_name, parent_id)
+    upload_result = drive_module.upload_pdf(
+        file_path=file_path,
+        folder_id=team_folder_id,
+        file_name=file_name,
+    )
+    logger.info(
+        f"チーム別フォルダへ保存: {_TEAM_PARENT_FOLDER_NAME}/"
+        f"{mask_name(team_name)}/ ({file_name})"
+    )
+    return {
+        "team_name": team_name,
+        "team_folder_id": team_folder_id,
+        "drive_url": upload_result["webViewLink"],
+    }
+
+
 def collect_draft_item(
     draft_items: list[dict[str, Any]],
     master_records: list[Any],
@@ -563,6 +641,53 @@ class ClinicFolderRecorder:
             sheet_name=self.clinic_sheet_name,
         )
         self._recorded_this_run.add(clinic_number)
+
+
+class TeamFolderRecorder:
+    """チームフォルダURLシート（``<出力シート名>_チーム``）への記録（重複防止込み）。
+
+    ``ClinicFolderRecorder`` のチーム版。記録済みチーム名を実行開始時
+    （コンストラクタ）に 1 回スナップショットし、同一実行内で記録したチームも
+    追跡して、両方に無いチームだけ追記する（同一チームをシートに重複追加
+    しない）。チーム名は全角/半角・空白の表記揺れを吸収するため、比較は
+    ``normalize_name_for_match`` の正規化キーで行う（``find_team_members``
+    と同じ思想）。シートに書く値は元の表記のまま。
+    """
+
+    def __init__(self, sheets_module: Any, output_sheet_name: str) -> None:
+        self._sheets = sheets_module
+        self.team_sheet_name = f"{output_sheet_name}_チーム"
+        self._recorded: set[str] = {
+            _normalize_team_key(name)
+            for name in sheets_module.get_recorded_team_names(
+                sheet_name=self.team_sheet_name,
+            )
+        }
+        self._recorded_this_run: set[str] = set()
+
+    def record(self, team_name: str, team_folder_id: str) -> None:
+        """チームを 1 行記録する。チーム名が空なら記録しない。"""
+        key = _normalize_team_key(team_name)
+        if not key:
+            return
+        if key in self._recorded:
+            return
+        if key in self._recorded_this_run:
+            return
+        team_folder_url = (
+            f"https://drive.google.com/drive/folders/{team_folder_id}"
+        )
+        self._sheets.append_team_folder_record(
+            team_name=team_name,
+            team_folder_url=team_folder_url,
+            sheet_name=self.team_sheet_name,
+        )
+        self._recorded_this_run.add(key)
+
+
+def _normalize_team_key(team_name: str) -> str:
+    """チーム名の重複判定キー（全角/半角・空白の揺れ吸収）を返す。"""
+    return normalize_name_for_match(team_name or "")
 
 
 def append_completion_marker_safe(

@@ -134,6 +134,12 @@ def run(
         sheets_client, cfg.output_sheet_name,
     )
 
+    # チームフォルダURLシート（``<出力シート名>_チーム``）への記録は
+    # TeamFolderRecorder が担う（チーム事例の「チーム別」フォルダ保存、Phase 28）。
+    team_recorder = run_common.TeamFolderRecorder(
+        sheets_client, cfg.output_sheet_name,
+    )
+
     # 参加者マスターシートをループ開始前に 1 回だけ読み込む。医院名の標準化
     # （フォルダ命名・各種シート列）と Gmail 下書きの TO ルックアップを兼ねる
     # スナップショット。シート未作成なら自動作成（ヘッダーのみ）+ 空リストを
@@ -334,6 +340,22 @@ def run(
                             file_name=output_filename,
                             output_folder_id=cfg.output_folder_id,
                         )
+                        # 医院/個人フォルダとは別に「チーム別/<所属チーム>/」
+                        # フォルダにも 1 部保存し、チームフォルダURLシートに
+                        # 記録する（チーム軸の出力面、Phase 28）。
+                        team_result = run_common.distribute_to_team_folder(
+                            drive_client, sheets_client, logger,
+                            master_records=master_records,
+                            reporter_mgmt_num=mgmt_num,
+                            file_path=output_path,
+                            file_name=output_filename,
+                            output_folder_id=cfg.output_folder_id,
+                        )
+                        if team_result is not None:
+                            team_recorder.record(
+                                team_result["team_name"],
+                                team_result["team_folder_id"],
+                            )
                         # メンバー分も出力一覧シートに記録する（報告者と同じ
                         # 管理番号・sample_name に【チーム配布】マーカーを付与し、
                         # 添付資料の【添付資料】マーカーと同じ見分け方にする）。

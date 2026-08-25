@@ -1,5 +1,41 @@
 # じっせん君コメントシステム - Task Tracker
 
+## Phase 28: チーム事例を「チーム別/<所属チーム>/」フォルダにも保存（2026-08-25）
+
+### 背景
+Phase 27 の PR 作成後、ユーザーから認識合わせの指摘:「参加者マスター F 列に
+所属チームがある場合、所属チームごとにもフォルダを分けてほしい。現在は医院のみの
+振り分けなので、医院と所属チームの 2 パターンで振り分けてほしい」。
+AskUserQuestion で確定した仕様:
+- 対象はチーム宿題のみ（`チーム実践_` / `チームMTG_` マーカー付きファイル）
+- チームフォルダ内は PDF 直置き（サブフォルダなし）
+- 設置場所は出力ルート直下の「チーム別」親フォルダ配下
+- `<出力シート名>_チーム` タブ（チーム名 / チームフォルダURL の 2 列）も自動記録
+
+### 設計
+- `run_common.distribute_to_team_folder`: 報告者の管理番号 → マスター F 列で
+  チーム解決 → `チーム別/<チーム名>/` を find_or_create → `upload_pdf`（同名
+  スキップで冪等）。マスター未登録/チーム空は None（警告は直前の
+  distribute_team_copies が同条件で出すため重複させない）。失敗は raise
+  （P-031: 配布 → 記録の順序契約）。
+- `run_common.TeamFolderRecorder`: ClinicFolderRecorder のチーム版。
+  `<出力シート名>_チーム` タブへ 1 チーム 1 行。重複判定キーは
+  normalize_name_for_match（find_team_members と同じ揺れ吸収）。
+- `sheets_client.append_team_folder_record` / `get_recorded_team_names` /
+  `_ensure_team_sheet`（2 列ヘッダー、既存の医院シート実装をミラー）。
+- main.py / batch_main.py の is_team_filename ブロックで distribute_team_copies
+  の直後に呼ぶ。
+
+### タスク
+- [x] sheets_client: _チーム シート 3 部品（append / get / ensure）
+- [x] run_common: distribute_to_team_folder + TeamFolderRecorder
+- [x] main.py / batch_main.py 配線（team_recorder 初期化 + チームブロック）
+- [x] テスト 16 件追加（run_common 9 / sheets_client 7）+ main/batch e2e に
+      チーム別保存・_チーム記録アサート追加
+- [x] README §4-5・Drive 出力構造更新
+- [x] pytest 778 → 794 件 pass / mypy clean
+- [ ] commit + push（PR #66 に追記、タイトル・本文更新）
+
 ## Phase 27: チーム配布メンバーの医院フォルダURLを_医院シートに記録（2026-08-25）
 
 ### 背景

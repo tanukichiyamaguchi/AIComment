@@ -2275,6 +2275,15 @@ class TestTeamCaseDistribution(unittest.TestCase):
             {r["clinic_number"] for r in clinic_rows}, {"001", "002", "003"},
         )
 
+        # チーム別フォルダにも 1 部保存され（チーム別/<チーム名>/ 直下に PDF
+        # 直置き）、チームフォルダURLシートに記録される（Phase 28）。
+        team_parent_call = mock_drive_client.find_or_create_folder.call_args_list[0]
+        self.assertEqual(team_parent_call.args[0], "チーム別")
+        self.assertEqual(mock_drive_client.upload_pdf.call_count, 1)
+        team_row = mock_sheets_client.append_team_folder_record.call_args.kwargs
+        self.assertEqual(team_row["team_name"], "A班")
+        self.assertEqual(team_row["sheet_name"], "出力一覧_チーム")
+
         # 順序契約（P-031）: 配布アップロードは全てシート記録より前
         parent = MagicMock()
         # attach_mock は事後では使えないため、呼び出し順を mock_calls の

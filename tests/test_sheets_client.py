@@ -569,6 +569,133 @@ class TestGetRecordedClinicNumbers(unittest.TestCase):
         )
 
 
+class TestAppendTeamFolderRecord(unittest.TestCase):
+    """``append_team_folder_record``（チームフォルダURLシートへの 1 行追記、Phase 28）。"""
+
+    @patch("src.sheets_client.get_sheets_service")
+    def test_creates_sheet_and_writes_two_column_header_when_missing(
+        self, mock_get_service
+    ):
+        """チームシート未作成なら作成し、2 列ヘッダーを書き込む。"""
+        service = _build_service_with_sheets(["Sheet1"])
+        mock_get_service.return_value = service
+
+        sheets_client.append_team_folder_record(
+            team_name="大阪4班",
+            team_folder_url="https://drive.google.com/drive/folders/team_abc",
+            spreadsheet_id="sheet_id_xxx",
+            sheet_name="出力一覧_チーム",
+        )
+
+        # addSheet が呼ばれた
+        batch_update_call = service.spreadsheets.return_value.batchUpdate.call_args
+        add_sheet = batch_update_call.kwargs["body"]["requests"][0]["addSheet"]
+        self.assertEqual(add_sheet["properties"]["title"], "出力一覧_チーム")
+
+        # ヘッダーは 2 列（チーム名 / チームフォルダURL）、range は A1:B1
+        update_call = service.spreadsheets.return_value.values.return_value.update.call_args
+        self.assertIn("出力一覧_チーム!A1:B1", update_call.kwargs["range"])
+        self.assertEqual(
+            update_call.kwargs["body"]["values"][0],
+            ["チーム名", "チームフォルダURL"],
+        )
+
+        # データ行は A:B に append、RAW で書き込む
+        append_call = service.spreadsheets.return_value.values.return_value.append.call_args
+        self.assertIn("出力一覧_チーム!A:B", append_call.kwargs["range"])
+        self.assertEqual(
+            append_call.kwargs["body"]["values"][0],
+            ["大阪4班", "https://drive.google.com/drive/folders/team_abc"],
+        )
+        self.assertEqual(append_call.kwargs["valueInputOption"], "RAW")
+
+    @patch("src.sheets_client.get_sheets_service")
+    def test_skips_sheet_creation_when_already_exists(self, mock_get_service):
+        """チームシートが既にありヘッダーもあれば addSheet / ヘッダー書き込みなし。"""
+        service = _build_service_with_sheets(["Sheet1", "出力一覧_チーム"])
+        service.spreadsheets.return_value.values.return_value.get.return_value.execute.return_value = {
+            "values": [["チーム名", "チームフォルダURL"]]
+        }
+        mock_get_service.return_value = service
+
+        sheets_client.append_team_folder_record(
+            team_name="大阪7班",
+            team_folder_url="https://drive.google.com/drive/folders/team_def",
+            spreadsheet_id="sid",
+            sheet_name="出力一覧_チーム",
+        )
+
+        service.spreadsheets.return_value.batchUpdate.assert_not_called()
+        service.spreadsheets.return_value.values.return_value.update.assert_not_called()
+        service.spreadsheets.return_value.values.return_value.append.assert_called_once()
+
+    def test_raises_when_spreadsheet_id_missing(self):
+        """``SPREADSHEET_ID`` 未設定なら ValueError。"""
+        with patch.object(sheets_client, "SPREADSHEET_ID", ""):
+            with self.assertRaises(ValueError):
+                sheets_client.append_team_folder_record(
+                    team_name="大阪4班",
+                    team_folder_url="url",
+                )
+
+
+class TestGetRecordedTeamNames(unittest.TestCase):
+    """``get_recorded_team_names``（チームシート重複防止のキー取得、Phase 28）。"""
+
+    @patch("src.sheets_client.get_sheets_service")
+    def test_returns_set_of_team_names(self, mock_get_service):
+        """複数行の A列からチーム名の集合を返す（strip 済み）。"""
+        service = TestGetRecordedClinicNumbers._build_service(
+            ["出力一覧_チーム"],
+            [["大阪4班"], ["大阪7班 "], ["大阪1班"]],
+        )
+        mock_get_service.return_value = service
+
+        result = sheets_client.get_recorded_team_names(
+            spreadsheet_id="sid", sheet_name="出力一覧_チーム",
+        )
+
+        self.assertEqual(result, {"大阪4班", "大阪7班", "大阪1班"})
+        get_call = service.spreadsheets.return_value.values.return_value.get.call_args
+        self.assertEqual(get_call.kwargs["range"], "出力一覧_チーム!A2:A")
+
+    @patch("src.sheets_client.get_sheets_service")
+    def test_returns_empty_set_when_sheet_not_created(self, mock_get_service):
+        """チームシートが未作成なら空集合（values.get を呼ばない）。"""
+        service = TestGetRecordedClinicNumbers._build_service(["Sheet1"], None)
+        mock_get_service.return_value = service
+
+        result = sheets_client.get_recorded_team_names(
+            spreadsheet_id="sid", sheet_name="出力一覧_チーム",
+        )
+
+        self.assertEqual(result, set())
+        service.spreadsheets.return_value.values.return_value.get.assert_not_called()
+
+    @patch("src.sheets_client.get_sheets_service")
+    def test_excludes_empty_cells_and_handles_missing_values_key(
+        self, mock_get_service
+    ):
+        """空セル除外 + ``values`` キー欠落でも KeyError にしない。"""
+        service = TestGetRecordedClinicNumbers._build_service(
+            ["出力一覧_チーム"],
+            [["大阪4班"], [""], []],
+        )
+        mock_get_service.return_value = service
+        self.assertEqual(
+            sheets_client.get_recorded_team_names(
+                spreadsheet_id="sid", sheet_name="出力一覧_チーム",
+            ),
+            {"大阪4班"},
+        )
+
+    def test_raises_when_spreadsheet_id_missing(self):
+        """``SPREADSHEET_ID`` 未設定なら ValueError。"""
+        with patch.object(sheets_client, "SPREADSHEET_ID", ""):
+            with self.assertRaises(ValueError):
+                sheets_client.get_recorded_team_names()
+
+
 class TestGoogleApiRetry(unittest.TestCase):
     """Sheets API 呼び出しが ``num_retries`` 付きで ``execute()`` されることを検証する。
 

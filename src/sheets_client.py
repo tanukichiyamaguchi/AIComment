@@ -250,6 +250,11 @@ _OUTPUT_HEADER = ["管理番号", "医院名", "個人名", "実践事例名", "
 # 医院ごとに 1 行、医院フォルダの Drive URL を記録する。
 _CLINIC_SHEET_HEADER = ["医院番号", "医院名", "医院フォルダURL"]
 
+# チームフォルダURLシート（``<出力シート名>_チーム``）のヘッダー（2列）。
+# チーム事例をチーム別フォルダ（``チーム別/<所属チーム>/``）へも保存する
+# Phase 28 で、チームフォルダの URL を運用者が一覧できるようにする。
+_TEAM_SHEET_HEADER = ["チーム名", "チームフォルダURL"]
+
 
 def _ensure_sheet_with_header(
     service: Any,
@@ -353,6 +358,17 @@ def _ensure_clinic_sheet(
     """医院フォルダURLシート（3列）が無ければ作成し、ヘッダー行を書き込む。"""
     _ensure_sheet_with_header(
         service, spreadsheet_id, sheet_name, _CLINIC_SHEET_HEADER
+    )
+
+
+def _ensure_team_sheet(
+    service: Any,
+    spreadsheet_id: str,
+    sheet_name: str,
+) -> None:
+    """チームフォルダURLシート（2列）が無ければ作成し、ヘッダー行を書き込む。"""
+    _ensure_sheet_with_header(
+        service, spreadsheet_id, sheet_name, _TEAM_SHEET_HEADER
     )
 
 
@@ -768,6 +784,111 @@ def append_clinic_folder_record(
     logger.info(
         f"Sheets: 医院フォルダURLシートに追加 "
         f"({clinic_number} / {clinic_name} / {clinic_folder_url})"
+    )
+
+
+def get_recorded_team_names(
+    spreadsheet_id: str | None = None,
+    sheet_name: str | None = None,
+) -> set[str]:
+    """チームフォルダURLシートの A列（チーム名）から記録済みチーム名の集合を返す。
+
+    重複記録防止に使う。チームフォルダURLシートに既に行があるチームは、
+    同じ実行内・後続実行で再度追記しないための事前スナップショット。
+    値はそのまま（strip のみ）返す。表記揺れの正規化は呼び出し側
+    （``run_common.TeamFolderRecorder``）の責務。
+
+    Args:
+        spreadsheet_id: スプレッドシートID（省略時は設定値 ``SPREADSHEET_ID``）
+        sheet_name: チームシート名（``<出力シート名>_チーム``）。
+            省略時は設定値 ``OUTPUT_SHEET_NAME``。
+
+    Returns:
+        記録済みチーム名の集合。空セル・ヘッダー行は除外する。
+        シートが未作成（``_ensure_team_sheet`` 前）の場合や
+        ``values`` キーが無い場合は空集合を返す。
+    """
+    spreadsheet_id = spreadsheet_id or SPREADSHEET_ID
+    if not spreadsheet_id:
+        raise ValueError("SPREADSHEET_IDが設定されていません")
+    sheet_name = sheet_name or OUTPUT_SHEET_NAME
+
+    service = _cached_sheets_service()
+
+    # チームシートがまだ作成されていない（初回実行）場合、A2:A の取得は
+    # 400 エラーになる。シート一覧を先に確認し、未作成なら空集合で返す。
+    meta = service.spreadsheets().get(
+        spreadsheetId=spreadsheet_id
+    ).execute(num_retries=GOOGLE_API_NUM_RETRIES)
+    existing_titles = [s["properties"]["title"] for s in meta.get("sheets", [])]
+    if sheet_name not in existing_titles:
+        logger.info(
+            f"Sheets: チームフォルダURLシート未作成のため記録済みチームは0件 "
+            f"({sheet_name})"
+        )
+        return set()
+
+    result = service.spreadsheets().values().get(
+        spreadsheetId=spreadsheet_id,
+        range=f"{sheet_name}!A2:A",
+    ).execute(num_retries=GOOGLE_API_NUM_RETRIES)
+
+    rows = result.get("values", [])
+    recorded = {
+        row[0].strip()
+        for row in rows
+        if row and row[0] and row[0].strip()
+    }
+    logger.info(
+        f"Sheets: 記録済みチーム {len(recorded)}件を取得 ({sheet_name})"
+    )
+    return recorded
+
+
+def append_team_folder_record(
+    team_name: str,
+    team_folder_url: str,
+    spreadsheet_id: str | None = None,
+    sheet_name: str | None = None,
+) -> None:
+    """チームフォルダURLシートに1行追加する（チーム名 / チームフォルダURL）。
+
+    シートが無ければヘッダー付きで自動作成する。重複記録の防止は呼び出し側の
+    責務（``get_recorded_team_names`` で事前スナップショットを取る）。
+
+    Args:
+        team_name: 所属チーム名（参加者マスター F 列の表記そのまま）
+        team_folder_url: チームフォルダ（``チーム別/<チーム名>/``）の Drive 閲覧 URL
+        spreadsheet_id: スプレッドシートID（省略時は設定値）
+        sheet_name: チームシート名（``<出力シート名>_チーム``）。
+            省略時は設定値 ``OUTPUT_SHEET_NAME``。
+    """
+    spreadsheet_id = spreadsheet_id or SPREADSHEET_ID
+    if not spreadsheet_id:
+        raise ValueError("SPREADSHEET_IDが設定されていません")
+    sheet_name = sheet_name or OUTPUT_SHEET_NAME
+
+    service = _cached_sheets_service()
+    _ensure_team_sheet(service, spreadsheet_id, sheet_name)
+
+    _throttle_sheets_write()
+    service.spreadsheets().values().append(
+        spreadsheetId=spreadsheet_id,
+        range=f"{sheet_name}!A:B",
+        # RAW: 各値を入力された文字列のまま格納する（チーム名や URL が
+        # 数式・数値に解釈されないようにする）。
+        valueInputOption="RAW",
+        insertDataOption="INSERT_ROWS",
+        body={
+            "values": [
+                [team_name, team_folder_url]
+            ]
+        },
+    ).execute(num_retries=GOOGLE_API_NUM_RETRIES)
+
+    logger.info(
+        f"Sheets: チームフォルダURLシートに追加 "
+        f"({mask_name(team_name)} / {team_folder_url})"
     )
 
 
